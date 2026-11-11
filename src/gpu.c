@@ -1,9 +1,29 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
+ * network and processes on Linux
+ * Copyright (C) 2026  Yormask
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /* gpu.c - GPU load, memory, clocks, temperature and power.
  *
  *   Intel  (i915): engine busy % via the i915 perf PMU (same source as
  *                  intel_gpu_top), clocks from sysfs, iGPU power from RAPL
  *   AMD  (amdgpu): gpu_busy_percent, VRAM, hwmon temp/power/clock/fan
- *   NVIDIA       : NVML, loaded at runtime with dlopen() so LHS builds and
+ *   NVIDIA       : NVML, loaded at runtime with dlopen() so the program builds and
  *                  runs without the NVIDIA driver installed
  *   others       : whatever the driver's hwmon exposes (nouveau, xe, ...)
  */
@@ -106,7 +126,7 @@ static void nvml_sample(gpu_t *g)
 /* ------------------------------------------------------ PCI name lookup */
 static int pci_name(unsigned vendor, unsigned device, char *out, size_t n)
 {
-    const char *files[] = { secure_getenv("LHS_PCI_IDS"), "/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
+    const char *files[] = { secure_getenv("HWSTATS_PCI_IDS"), "/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
                             "/usr/share/pci.ids", "/usr/local/share/pci.ids" };
     FILE *f = NULL;
     for (size_t i = 0; i < sizeof files / sizeof files[0] && !f; i++)

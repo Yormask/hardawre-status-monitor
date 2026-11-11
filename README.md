@@ -1,6 +1,6 @@
-# LHS — Linux Hardware Stats
+# hardware-stats
 
-A fast, lightweight terminal monitor for Linux, written in C. It shows everything your machine is doing on one screen: CPU, GPU, memory, power draw, disk and network throughput, temperatures, fans, and every process with its CPU, memory and disk I/O.
+A fast, lightweight hardware and process monitor for the Linux terminal, written in C. It shows everything your machine is doing on one screen: CPU, GPU, memory, power draw, disk and network throughput, temperatures, fans, and every process with its CPU, memory and disk I/O.
 
 * **Fast**: reads `/proc` and `/sys` directly. It never spawns helper programs or parses tool output. One full sample of every subsystem takes about 0.3 ms.
 * **Small**: about 130 KB binary, about 4 MB RAM, about 0.1% CPU at a 1 s refresh.
@@ -24,7 +24,7 @@ A fast, lightweight terminal monitor for Linux, written in C. It shows everythin
 
 | Vendor | How | Notes |
 |---|---|---|
-| Intel (i915) | engine busy % (3D / Video / Blit) from the i915 perf counters, the same source `intel_gpu_top` uses. Clocks from sysfs. iGPU power from RAPL "uncore". | Exact load needs root or `CAP_PERFMON`. Without it, LHS estimates load from the GPU's RC6 sleep time (shown as `Load~`). |
+| Intel (i915) | engine busy % (3D / Video / Blit) from the i915 perf counters, the same source `intel_gpu_top` uses. Clocks from sysfs. iGPU power from RAPL "uncore". | Exact load needs root or `CAP_PERFMON`. Without it, hardware-stats estimates load from the GPU's RC6 sleep time (shown as `Load~`). |
 | AMD (amdgpu) | `gpu_busy_percent`, VRAM, plus hwmon temperature, power, clocks and fan | Works as a normal user. |
 | NVIDIA (proprietary) | NVML (`libnvidia-ml.so`), loaded with `dlopen()` at startup | Works as a normal user. Nothing is needed at build time. |
 | Others (nouveau, xe, ...) | whatever the driver exposes through hwmon | Load isn't available for these yet. |
@@ -43,23 +43,27 @@ sudo pacman -S --needed base-devel ncurses
 # openSUSE
 sudo zypper install gcc make ncurses-devel pkg-config
 
+git clone https://github.com/Yormask/linux-hardware-stats
+cd linux-hardware-stats
 make
-./lhs                     # run from the build folder
-sudo make install         # installs to /usr/local/bin/lhs
+./hardware-stats          # run from the build folder
+sudo make install         # installs to /usr/local/bin/hardware-stats
 ```
+
+After installing, run `hardware-stats` from anywhere. Use `sudo hardware-stats` to also see power and exact Intel GPU load (see [Permissions](#permissions-what-needs-root)).
 
 `make debug` builds with AddressSanitizer and UBSan for development. `make uninstall` removes the installed binary.
 
 ## Usage
 
 ```
-lhs [options]
+hardware-stats [options]
   -d, --delay SEC   refresh interval in seconds (default 1, min 0.1)
   -1, --once        print one plain-text snapshot and exit (good for scripts / ssh)
   -n, --top N       processes listed by --once (default 15)
   -a, --ascii       plain ASCII drawing for terminals without Unicode
   -h, --help        help
-  -v, --version     version
+  -v, --version     version, copyright and license
 ```
 
 ### Views and keys
@@ -84,11 +88,11 @@ Most things work as a normal user. Three readings are restricted by the kernel:
 
 | Reading | Why | Options |
 |---|---|---|
-| CPU / DRAM / iGPU power (RAPL) | `energy_uj` is root-only since Linux 5.10 (PLATYPUS power side channel, CVE-2020-8694) | Run `sudo lhs`. See below for a permanent change. |
-| Exact Intel GPU engine load | system-wide perf counters need `CAP_PERFMON` or `perf_event_paranoid <= 0` | Run `sudo lhs`, or `sudo setcap cap_perfmon=ep /usr/local/bin/lhs`. Without either, LHS falls back to the RC6 estimate. |
-| Disk I/O of other users' processes | `/proc/PID/io` is protected like ptrace | Run `sudo lhs`. Your own processes always show I/O. |
+| CPU / DRAM / iGPU power (RAPL) | `energy_uj` is root-only since Linux 5.10 (PLATYPUS power side channel, CVE-2020-8694) | Run `sudo hardware-stats`. See below for a permanent change. |
+| Exact Intel GPU engine load | system-wide perf counters need `CAP_PERFMON` or `perf_event_paranoid <= 0` | Run `sudo hardware-stats`, or `sudo setcap cap_perfmon=ep /usr/local/bin/hardware-stats`. Without either, it falls back to the RC6 estimate. |
+| Disk I/O of other users' processes | `/proc/PID/io` is protected like ptrace | Run `sudo hardware-stats`. Your own processes always show I/O. |
 
-**Making RAPL readable permanently (optional, single-user machines only).** This re-opens the side channel the kernel restriction closes, so only do it on a machine where you are the only user. Create `/etc/tmpfiles.d/lhs-rapl.conf`:
+**Making RAPL readable permanently (optional, single-user machines only).** This re-opens the side channel the kernel restriction closes, so only do it on a machine where you are the only user. Create `/etc/tmpfiles.d/hardware-stats-rapl.conf`:
 
 ```
 z /sys/class/powercap/intel-rapl:*/energy_uj   0444 - - -
@@ -127,7 +131,7 @@ Every collector keeps its own previous counters and turns them into rates using 
 
 ### Testing against fake hardware
 
-For development, `LHS_SYSFS`, `LHS_PROCFS` and `LHS_PCI_IDS` point LHS at a different `/sys`, `/proc` or `pci.ids`. That lets you test GPU, RAPL, battery and sensor code on machines without that hardware. These variables are ignored when the binary runs setuid or with file capabilities.
+For development, `HWSTATS_SYSFS`, `HWSTATS_PROCFS` and `HWSTATS_PCI_IDS` point the program at a different `/sys`, `/proc` or `pci.ids`. That lets you test GPU, RAPL, battery and sensor code on machines without that hardware. These variables are ignored when the binary runs setuid or with file capabilities.
 
 ## Ideas for later
 
@@ -137,3 +141,11 @@ For development, `LHS_SYSFS`, `LHS_PROCFS` and `LHS_PCI_IDS` point LHS at a diff
 * Intel `xe` driver and ARM (Mali / Adreno devfreq) GPU load
 * CSV / JSON logging mode
 * configurable colour themes
+
+## License
+
+Copyright (C) 2026  Yormask
+
+hardware-stats is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+It is distributed in the hope that it will be useful, but **without any warranty**; without even the implied warranty of merchantability or fitness for a particular purpose. See the [LICENSE](LICENSE) file for the full text.

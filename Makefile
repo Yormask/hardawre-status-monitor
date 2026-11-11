@@ -1,4 +1,6 @@
-# LHS - Linux Hardware Stats
+# hardware-stats - live hardware and process monitor for Linux
+# Copyright (C) 2026  Yormask - GPL-3.0-or-later (see LICENSE)
+BIN     := hardware-stats
 CC      ?= cc
 PREFIX  ?= /usr/local
 CFLAGS  ?= -O2 -pipe
@@ -12,9 +14,9 @@ SRC := $(wildcard src/*.c)
 OBJ := $(SRC:src/%.c=build/%.o)
 HDR := $(wildcard src/*.h)
 
-all: lhs
+all: $(BIN)
 
-lhs: $(OBJ)
+$(BIN): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
 build/%.o: src/%.c $(HDR) | build
@@ -26,15 +28,15 @@ build:
 # Build with AddressSanitizer + UBSan for development
 debug: CFLAGS = -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -std=gnu11 -Wall -Wextra -Wshadow -Wno-unused-parameter
 debug: LDFLAGS += -fsanitize=address,undefined
-debug: clean lhs
+debug: clean $(BIN)
 
-install: lhs
-	install -Dm755 lhs $(DESTDIR)$(PREFIX)/bin/lhs
+install: $(BIN)
+	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/lhs
+	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN)
 
 clean:
-	rm -rf build lhs
+	rm -rf build $(BIN)
 
 .PHONY: all debug install uninstall clean

@@ -1,4 +1,24 @@
-/* main.c - LHS (Linux Hardware Stats): argument parsing and the main loop */
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
+ * network and processes on Linux
+ * Copyright (C) 2026  Yormask
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/* main.c - argument parsing and the main loop */
 #define _GNU_SOURCE
 #include "ui.h"
 
@@ -24,9 +44,8 @@ static void on_signal(int sig)
 static void usage(FILE *f)
 {
     fprintf(f,
-            "LHS %s - Linux Hardware Stats\n"
-            "Live monitor for CPU, GPU, memory, power, disk and network activity.\n\n"
-            "Usage: lhs [options]\n"
+            "%s %s - live monitor for CPU, GPU, memory, power, disk and network activity\n\n"
+            "Usage: %s [options]\n"
             "  -d, --delay SEC   refresh interval in seconds (default 1, min 0.1)\n"
             "  -1, --once        print one plain-text snapshot and exit\n"
             "  -n, --top N       processes listed by --once (default 15)\n"
@@ -35,9 +54,11 @@ static void usage(FILE *f)
             "  -v, --version     show version\n\n"
             "Keys: 1/2/3 views, c/m/d/p/n/t sort, / filter, k kernel threads,\n"
             "      +/- interval, space pause, ? help, q quit\n\n"
-            "Run as root (sudo lhs) to see CPU power (RAPL), Intel GPU load and\n"
-            "per-process disk I/O of other users.\n",
-            LHS_VERSION);
+            "Run as root (sudo %s) to see CPU power (RAPL), exact Intel GPU load\n"
+            "and per-process disk I/O of other users.\n\n"
+            "%s. This program comes with ABSOLUTELY NO WARRANTY.\n"
+            "It is free software under the GNU GPL v3 or later; see the LICENSE file.\n",
+            APP_NAME, APP_VERSION, APP_NAME, APP_NAME, APP_COPYRIGHT);
 }
 
 static void sleep_sec(double s)
@@ -68,10 +89,14 @@ int main(int argc, char **argv)
             usage(stdout);
             return 0;
         } else if (!strcmp(a, "-v") || !strcmp(a, "--version")) {
-            printf("lhs %s\n", LHS_VERSION);
+            printf("%s %s\n%s\n"
+                   "License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.\n"
+                   "This is free software: you are free to change and redistribute it.\n"
+                   "There is NO WARRANTY, to the extent permitted by law.\n",
+                   APP_NAME, APP_VERSION, APP_COPYRIGHT);
             return 0;
         } else {
-            fprintf(stderr, "lhs: unknown option '%s'\n\n", a);
+            fprintf(stderr, "%s: unknown option '%s'\n\n", APP_NAME, a);
             usage(stderr);
             return 2;
         }
@@ -81,12 +106,12 @@ int main(int argc, char **argv)
     if (interval > 60)
         interval = 60;
 
-    /* Test hooks. secure_getenv() ignores them when lhs runs setuid or with
+    /* Test hooks. secure_getenv() ignores them when the program runs setuid or with
      * file capabilities, so they can't be used to read arbitrary files. */
     const char *e;
-    if ((e = secure_getenv("LHS_SYSFS")) && *e)
+    if ((e = secure_getenv("HWSTATS_SYSFS")) && *e)
         g_sysfs = e;
-    if ((e = secure_getenv("LHS_PROCFS")) && *e)
+    if ((e = secure_getenv("HWSTATS_PROCFS")) && *e)
         g_procfs = e;
 
     struct sigaction sa;
@@ -109,7 +134,7 @@ int main(int argc, char **argv)
         return 0;
     }
     if (!isatty(STDOUT_FILENO)) {
-        fprintf(stderr, "lhs: stdout is not a terminal (use --once for a text snapshot)\n");
+        fprintf(stderr, "%s: stdout is not a terminal (use --once for a text snapshot)\n", APP_NAME);
         sys_free(&S);
         return 1;
     }

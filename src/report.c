@@ -1,4 +1,24 @@
-/* report.c - one-shot plain-text snapshot (lhs --once), handy for scripts,
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
+ * network and processes on Linux
+ * Copyright (C) 2026  Yormask
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/* report.c - one-shot plain-text snapshot (hardware-stats --once), handy for scripts,
  * bug reports and ssh sessions without a full terminal */
 #define _GNU_SOURCE
 #include "ui.h"
@@ -21,7 +41,7 @@ void report_print(sys_t *s, int nproc)
     mem_t *m = &s->mem;
 
     fmt_duration(cp->uptime, a, sizeof a);
-    printf("LHS %s  %s | %s | kernel %s (%s) | up %s\n", LHS_VERSION, s->host, s->os, s->kernel, s->arch, a);
+    printf("%s %s  %s | %s | kernel %s (%s) | up %s\n", APP_NAME, APP_VERSION, s->host, s->os, s->kernel, s->arch, a);
 
     printf("\nCPU         %s, %d cores / %d threads\n", cp->model, cp->cores, cp->threads);
     printf("  usage     %.1f%%  (user %.1f%%, system %.1f%%, iowait %.1f%%, steal %.1f%%)\n", cp->total, cp->user,

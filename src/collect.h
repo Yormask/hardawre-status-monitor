@@ -1,10 +1,30 @@
-/* collect.h - data collectors for every subsystem LHS monitors.
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
+ * network and processes on Linux
+ * Copyright (C) 2026  Yormask
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/* collect.h - data collectors for every subsystem hardware-stats monitors.
  *
  * Every collector reads directly from /proc and /sys (no external tools, no
  * helper processes), keeps the previous raw counters itself and turns them
  * into rates using the real elapsed time `dt` passed in by the caller. */
-#ifndef LHS_COLLECT_H
-#define LHS_COLLECT_H
+#ifndef HWSTATS_COLLECT_H
+#define HWSTATS_COLLECT_H
 
 #include "util.h"
 #include <sys/types.h>

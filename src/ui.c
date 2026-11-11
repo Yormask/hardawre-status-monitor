@@ -1,3 +1,23 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
+ * network and processes on Linux
+ * Copyright (C) 2026  Yormask
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /* ui.c - ncurses dashboard, process table and hardware view */
 #define _GNU_SOURCE
 #include "ui.h"
@@ -1189,7 +1209,7 @@ static void hw_power(sys_t *s, lc_t *c)
     }
     if (p->rapl_denied && geteuid() != 0) {
         lc_text(c, CP(C_WARN), "RAPL energy counters are root-only since Linux 5.10.");
-        lc_text(c, CP(C_WARN), "Run 'sudo lhs' to see CPU / DRAM / iGPU power.");
+        lc_text(c, CP(C_WARN), "Run 'sudo hardware-stats' to see CPU / DRAM / iGPU power.");
     }
     if (!p->nrapl)
         lc_text(c, A_GRAY, "No RAPL power domains (/sys/class/powercap)");
@@ -1460,7 +1480,7 @@ static void dashboard(sys_t *s, ui_state_t *u)
 static void header(sys_t *s, ui_state_t *u)
 {
     int x = 0;
-    x += put(0, x, COLS - x, CP(C_HDR) | A_BOLD, " LHS ");
+    x += put(0, x, COLS - x, CP(C_HDR) | A_BOLD, " %s ", APP_NAME);
     x += 1;
     for (int v = 0; v < VIEW_COUNT; v++) {
         attr_t a = v == u->view ? CP(C_TITLE) | A_BOLD | A_REVERSE : A_GRAY;
@@ -1528,17 +1548,19 @@ static void help_overlay(void)
         { "q, F10", "quit" },
     };
     int n = (int)(sizeof L / sizeof L[0]);
-    int w = MIN(76, COLS), h = MIN(n + 7, LINES);
+    int w = MIN(76, COLS), h = MIN(n + 9, LINES);
     int y = MAX(0, (LINES - h) / 2), x = MAX(0, (COLS - w) / 2);
     for (int r = 0; r < h; r++)
         fill(y + r, x, w, A_NORMAL);
-    box_(y, x, h, w, "Help", "LHS " LHS_VERSION " - Linux Hardware Stats");
-    for (int i = 0; i < n && 2 + i < h - 3; i++) {
+    box_(y, x, h, w, "Help", APP_NAME " " APP_VERSION "  (any key closes)");
+    for (int i = 0; i < n && 2 + i < h - 6; i++) {
         put(y + 2 + i, x + 3, 18, CP(C_INFO) | A_BOLD, "%s", L[i][0]);
         put(y + 2 + i, x + 22, w - 25, A_NORMAL, "%s", L[i][1]);
     }
-    put(y + h - 3, x + 3, w - 6, A_GRAY, "Run as root for CPU power (RAPL), Intel GPU load and");
-    put(y + h - 2, x + 3, w - 6, A_GRAY, "disk I/O of other users' processes.  Any key closes.");
+    put(y + h - 5, x + 3, w - 6, A_GRAY, "Run as root for CPU power (RAPL), exact Intel GPU load and");
+    put(y + h - 4, x + 3, w - 6, A_GRAY, "disk I/O of other users' processes.");
+    put(y + h - 3, x + 3, w - 6, A_BOLD, "%s  %s", APP_NAME, APP_COPYRIGHT);
+    put(y + h - 2, x + 3, w - 6, A_GRAY, "ABSOLUTELY NO WARRANTY. Free software: GPL v3 or later (see LICENSE).");
 }
 
 /* ================================================================= main */

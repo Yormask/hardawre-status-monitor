@@ -1,19 +1,41 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
+ * network and processes on Linux
+ * Copyright (C) 2026  Yormask
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /* util.h - small helpers shared by every module */
-#ifndef LHS_UTIL_H
-#define LHS_UTIL_H
+#ifndef HWSTATS_UTIL_H
+#define HWSTATS_UTIL_H
 
 #include <stddef.h>
 #include <sys/types.h>
 
-#define LHS_VERSION "1.0.0"
+#define APP_NAME "hardware-stats"
+#define APP_VERSION "1.0.0"
+#define APP_COPYRIGHT "Copyright (C) 2026 Yormask"
 #define PATHBUF 512
 
 #define CLAMP(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-/* Roots of the kernel pseudo-filesystems. Overridable with the LHS_SYSFS /
- * LHS_PROCFS environment variables, which is handy for testing against a
+/* Roots of the kernel pseudo-filesystems. Overridable with the HWSTATS_SYSFS /
+ * HWSTATS_PROCFS environment variables, which is handy for testing against a
  * captured or fake tree. */
 extern const char *g_sysfs;
 extern const char *g_procfs;
