@@ -50,6 +50,24 @@ static const char *const SINGLE_KEY[SINGLE_COUNT] = {
     "cyan", "blue", "green", "yellow", "red", "magenta", "white",
     "bright-cyan", "bright-blue", "bright-green", "bright-yellow", "bright-red", "bright-magenta", "bright-white",
 };
+const char *const BG_NAME[BG_COUNT] = {
+    "Terminal default", "Black", "Dark gray", "Blue", "Magenta", "Red", "Green", "Cyan", "Yellow", "White", "Bright white",
+};
+const short BG_COLOR[BG_COUNT] = { -1, 0, 8, 4, 5, 1, 2, 6, 3, 7, 15 };
+static const char *const BG_KEY[BG_COUNT] = {
+    "default", "black", "dark-gray", "blue", "magenta", "red", "green", "cyan", "yellow", "white", "bright-white",
+};
+const char *const TXT_NAME[TXT_COUNT] = {
+    "Automatic", "Black",       "Dark gray",    "White",         "Bright white",  "Cyan",
+    "Blue",      "Green",       "Yellow",       "Red",           "Magenta",       "Bright cyan",
+    "Bright blue", "Bright green", "Bright yellow", "Bright red", "Bright magenta",
+};
+const short TXT_COLOR[TXT_COUNT] = { -1, 0, 8, 7, 15, 6, 4, 2, 3, 1, 5, 14, 12, 10, 11, 9, 13 };
+static const char *const TXT_KEY[TXT_COUNT] = {
+    "auto",        "black",        "dark-gray",     "white",      "bright-white",   "cyan",
+    "blue",        "green",        "yellow",        "red",        "magenta",        "bright-cyan",
+    "bright-blue", "bright-green", "bright-yellow", "bright-red", "bright-magenta",
+};
 const char *const BAR_NAME[BAR_COUNT] = { "Blocks", "Squares", "Line", "Classic" };
 const char *const GRAPH_NAME[GRAPH_COUNT] = { "Blocks", "Braille (fine)", "Off" };
 const char *const COLOR_NAME[COLOR_COUNT] = { "By value", "Gradient", "Single colour", "Monochrome" };
@@ -358,6 +376,14 @@ int config_load(ui_state_t *u)
             u->show_kthreads = parse_bool(v);
         } else if (!strcmp(k, "single_color") && (i = find_key(SINGLE_KEY, SINGLE_COUNT, v)) >= 0) {
             l->single_color = i;
+        } else if (!strcmp(k, "highlight") && (i = find_key(SINGLE_KEY, SINGLE_COUNT, v)) >= 0) {
+            l->highlight = i;
+        } else if (!strcmp(k, "background") && (i = find_key(BG_KEY, BG_COUNT, v)) >= 0) {
+            l->background = i;
+        } else if (!strcmp(k, "selected_text") && (i = find_key(TXT_KEY, TXT_COUNT, v)) >= 0) {
+            l->sel_text = i;
+        } else if (!strcmp(k, "titles") && (i = find_key(TXT_KEY, TXT_COUNT, v)) >= 0) {
+            l->title_color = i;
         } else if (!strcmp(k, "log_dir")) {
             str_copy(u->log_dir, sizeof u->log_dir, strcasecmp(v, "default") ? v : "");
         } else if (!strcmp(k, "log_every")) {
@@ -452,7 +478,9 @@ int config_save(const ui_state_t *u)
                 if (l->cpu_bars & (1 << b))
                     fprintf(f, "%s %s", k++ ? "," : "", CPUBAR_KEY[b]);
             fprintf(f, "\n");
-            fprintf(f, "single_color = %s\n", SINGLE_KEY[l->single_color]);
+            fprintf(f, "single_color = %s\nhighlight = %s\nselected_text = %s\ntitles = %s\nbackground = %s\n",
+                    SINGLE_KEY[l->single_color], SINGLE_KEY[l->highlight], TXT_KEY[l->sel_text],
+                    TXT_KEY[l->title_color], BG_KEY[l->background]);
             fprintf(f, "\ninterval = %g\nsort = %s\nreverse = %s\nkernel_threads = %s\n", u->interval,
                     SORT_KEY[u->sort], u->reverse ? "on" : "off", u->show_kthreads ? "on" : "off");
             fprintf(f, "\n# Logging (view 5): folder, seconds between rows (refresh = every update),\n"

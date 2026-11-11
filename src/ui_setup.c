@@ -30,11 +30,12 @@
 #include <string.h>
 
 enum {
-    OPT_PROCS, OPT_BARS, OPT_GRAPHS, OPT_LEFTW, OPT_COLORS, OPT_SINGLE,
-    OPT_CPU_USAGE, OPT_CPU_CLOCK, OPT_CPU_TEMP, OPT_INTERVAL, OPT_KTHREADS, OPT_COUNT
+    OPT_PROCS, OPT_BARS, OPT_GRAPHS, OPT_LEFTW, OPT_COLORS, OPT_SINGLE, OPT_HIGHLIGHT, OPT_SELTEXT,
+    OPT_TITLES, OPT_BACKGROUND, OPT_CPU_USAGE, OPT_CPU_CLOCK, OPT_CPU_TEMP, OPT_INTERVAL, OPT_KTHREADS, OPT_COUNT
 };
 static const char *const OPT_LABEL[OPT_COUNT] = {
-    "Process list", "Bar style",   "Graphs",      "Left column width", "Colours",  "  Colour",
+    "Process list", "Bar style",   "Graphs",      "Left column width", "Bars & values",  "  Colour",
+    "Highlight",    "Selected text", "Titles",    "Background",
     "Usage",        "Clock speed", "Temperature", "Refresh interval",  "Kernel threads",
 };
 enum { ACT_RESET_ALL };
@@ -70,9 +71,15 @@ static int build_rows(const ui_state_t *u, row_t *r)
     ROW(K_OPT, OPT_BARS);
     ROW(K_OPT, OPT_GRAPHS);
     ROW(K_OPT, OPT_LEFTW);
+    BLANK();
+    HEAD("Colours");
     ROW(K_OPT, OPT_COLORS);
     if (u->lay.color_mode == COLOR_SINGLE) /* which colour */
         ROW(K_OPT, OPT_SINGLE);
+    ROW(K_OPT, OPT_HIGHLIGHT);
+    ROW(K_OPT, OPT_SELTEXT);
+    ROW(K_OPT, OPT_TITLES);
+    ROW(K_OPT, OPT_BACKGROUND);
     BLANK();
     HEAD("CPU core bars: any combination");
     ROW(K_OPT, OPT_CPU_USAGE);
@@ -137,6 +144,10 @@ static void opt_value(const ui_state_t *u, int o, char *out, size_t n)
     case OPT_GRAPHS: str_copy(out, n, GRAPH_NAME[l->graph_style]); break;
     case OPT_COLORS: str_copy(out, n, COLOR_NAME[l->color_mode]); break;
     case OPT_SINGLE: str_copy(out, n, SINGLE_NAME[l->single_color]); break;
+    case OPT_HIGHLIGHT: str_copy(out, n, SINGLE_NAME[l->highlight]); break;
+    case OPT_BACKGROUND: str_copy(out, n, BG_NAME[l->background]); break;
+    case OPT_SELTEXT: str_copy(out, n, TXT_NAME[l->sel_text]); break;
+    case OPT_TITLES: str_copy(out, n, l->title_color ? TXT_NAME[l->title_color] : "Automatic (cyan)"); break;
     case OPT_CPU_USAGE:
     case OPT_CPU_CLOCK:
     case OPT_CPU_TEMP: str_copy(out, n, (l->cpu_bars & cpu_bit(o)) ? "On" : "Off"); break;
@@ -169,6 +180,20 @@ static void opt_change(ui_state_t *u, int o, int dir)
     case OPT_SINGLE: /* bright colours only where the terminal has them */
         l->single_color = cyc(l->single_color, dir, COLORS >= 16 ? SINGLE_COUNT : 7);
         break;
+    case OPT_HIGHLIGHT: l->highlight = cyc(l->highlight, dir, COLORS >= 16 ? SINGLE_COUNT : 7); break;
+    case OPT_BACKGROUND:
+        do /* skip dark gray / bright white on 8-colour terminals */
+            l->background = cyc(l->background, dir, BG_COUNT);
+        while (COLORS < 16 && BG_COLOR[l->background] >= 8);
+        break;
+    case OPT_SELTEXT:
+    case OPT_TITLES: {
+        int *v = o == OPT_SELTEXT ? &l->sel_text : &l->title_color;
+        do /* bright colours only where the terminal has them */
+            *v = cyc(*v, dir, TXT_COUNT);
+        while (COLORS < 16 && TXT_COLOR[*v] >= 8);
+        break;
+    }
     case OPT_CPU_USAGE:
     case OPT_CPU_CLOCK:
     case OPT_CPU_TEMP:
@@ -354,6 +379,12 @@ static void option_row(ui_state_t *u, int o, int y, int x, int w, int sel)
     int sw = MIN(room, 20);
     if (o == OPT_BARS || o == OPT_COLORS || o == OPT_SINGLE) {
         bar(y, xx, sw, 68, 0);
+    } else if (o == OPT_HIGHLIGHT || o == OPT_SELTEXT) {
+        put(y, xx, sw, CP(C_SEL) | A_BOLD, " %-*s", sw - 1, "selected row");
+    } else if (o == OPT_TITLES) {
+        put(y, xx, room, CP(C_TITLE) | A_BOLD, "Dashboard panels  Sensors");
+    } else if (o == OPT_BACKGROUND && u->lay.background == 0) {
+        put(y, xx, room, A_GRAY, "same as your terminal");
     } else if (o == OPT_GRAPHS) {
         static hist_t demo;
         sample_hist(&demo);

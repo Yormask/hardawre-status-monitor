@@ -1,11 +1,11 @@
 # hsm — hardware status monitor
 
-A fast, lightweight hardware and process monitor for the Linux terminal, written in C. It shows everything your machine is doing on one screen: CPU, GPU, memory, power draw, disk and network throughput, temperatures, fans, and every process with its CPU, memory and disk I/O. You choose which panels appear, arrange them, and pick how bars and graphs look. Colours are your terminal's standard ones, so they follow your terminal's theme. It can also **log** any sensor, or single processes, to CSV files, so a crash caused by heat or overload can be traced afterwards.
+A fast, lightweight hardware and process monitor for the Linux terminal, written in C. It shows everything your machine is doing on one screen: CPU, GPU, memory, power draw, disk and network throughput, temperatures, fans, and every process with its CPU, memory and disk I/O. You choose which panels appear, arrange them, and pick how bars and graphs look. Colours are your terminal's standard ones, so they follow your terminal's theme, and you can pick the background, the selection colour and the text colours from them. It can also **log** any sensor, or single processes, to CSV files, so a crash caused by heat or overload can be traced afterwards.
 
 * **Fast**: reads `/proc` and `/sys` directly. It never spawns helper programs or parses tool output. One full sample of every subsystem takes about 0.3 ms.
 * **Small**: about 250 KB binary, about 4 MB RAM, about 0.1% CPU at a 1 s refresh.
 * **Logging**: record temperatures, load, clocks, power, fans, disk and network to a CSV file, and follow individual processes in their own files. It works from the screen or headless (`hsm --log`).
-* **Customizable**: show, hide and rearrange panels; choose bar style, graph style and colour mode. Settings are saved automatically.
+* **Customizable**: show, hide and rearrange panels; choose bar style, graph style, colour mode, selection and title colours, and the background. Settings are saved automatically.
 * **No hard dependencies** beyond ncurses. NVIDIA support is loaded at runtime only if the driver is installed.
 
 ## What it shows
@@ -124,11 +124,24 @@ A live **Preview** shows where every panel will go. If a column ends up empty, t
 | Process list | shown / hidden below the panels |
 | Bar style | Blocks `████▌···`, Squares `■■■■■■`, Line `━━━━──`, Classic `[|||   ]` |
 | Graphs | Blocks, Braille (twice the detail), Off (more room for everything else) |
-| Colours | By value (green / yellow / red), Gradient (colour changes along the bar), Single colour, Monochrome |
-| Colour | only in Single colour mode: cyan, blue, green, yellow, red, magenta, white, or the bright version of each (the bright ones need a 16-colour terminal) |
 | Left column width | Automatic or 35% to 70% |
 | Refresh interval | 0.25 s to 10 s |
 | Kernel threads | shown / hidden in the process list |
+
+**Colours** (the Colours section of the settings list, same keys):
+
+| Option | What it colours | Choices |
+|---|---|---|
+| Bars & values | bars, graphs and numbers | By value (green / yellow / red), Gradient (colour changes along the bar), Single colour, Monochrome |
+| Colour | only in Single colour mode: the one colour used | cyan, blue, green, yellow, red, magenta, white, or the bright version of each |
+| Highlight | the selection bar (process list, Setup, Logging), the active tab, the `hsm` badge and the key hints | same as Colour |
+| Selected text | the text on that highlight | Automatic (black or white, whichever reads better), black, dark gray, white, bright white, cyan, blue, green, yellow, red, magenta, or a bright version |
+| Titles | panel and box titles ("CPU", "Dashboard panels", "Sensors"...) and the group headings in the Logging view | Automatic (cyan) or any of the Selected text colours |
+| Background | the whole screen | Terminal default (whatever your terminal uses), black, dark gray, blue, magenta, red, green, cyan, yellow, white or bright white |
+
+Bright colours, dark gray and bright white need a 16-colour terminal; with `TERM=xterm` (8 colours) they are skipped.
+
+On a coloured background, hsm adjusts the text so it stays readable: light text on dark backgrounds (with the bright versions of cyan, magenta and so on, so nothing disappears into blue or red), black text on light ones. Anything that would end up the same colour as the background, such as a cyan highlight on a cyan background, is drawn the other way round, and selected text that matches the highlight falls back to black or white.
 
 **CPU core bars**: switch each kind on or off independently, so a core can show one, two or all three bars side by side:
 
@@ -160,6 +173,11 @@ colors = gradient      # value | gradient | single | mono
 cpu_bars = usage, temp # any of: usage, clock, temp  (or: all)
 single_color = green   # used by colors = single; cyan blue green yellow red magenta white,
                        # or bright-cyan, bright-blue, ... bright-white
+highlight = cyan       # selection bar, active tab, key hints; same colour names
+selected_text = auto   # auto black dark-gray white bright-white cyan blue green yellow red magenta,
+                       # or bright-cyan, bright-blue, ... bright-magenta
+titles = auto          # auto (cyan) or any selected_text colour
+background = default   # default black dark-gray blue magenta red green cyan yellow white bright-white
 interval = 1
 sort = cpu
 reverse = off
@@ -294,11 +312,11 @@ src/sensors.c     hwmon temperatures, fans, power; per-core temperature lookup
 src/gpu.c         Intel i915 (perf PMU + RC6), AMD amdgpu, NVIDIA NVML via dlopen, generic hwmon
 src/power.c       RAPL powercap zones, batteries, AC adapter
 src/ui.c          header, footer, help, signal dialog, keys, view switching
-src/ui_prim.c     drawing primitives: text, boxes, bar styles, block/braille graphs, colour modes
+src/ui_prim.c     drawing primitives: text, boxes, bar styles, block/braille graphs, colours and background
 src/ui_panels.c   dashboard panels and the two-column layout engine
 src/ui_procs.c    process table: sorting, filtering, selection
 src/ui_hw.c       Hardware view
-src/ui_setup.c    Setup screen: panels, styles, CPU bars, single colour, reset
+src/ui_setup.c    Setup screen: panels, styles, colours, CPU bars, reset
 src/ui_log.c      Logging view: choose values, start / stop logs, process logs
 src/log.c         logging: the list of values, CSV system and process logs (sudo-safe)
 src/report.c      --once plain-text snapshot

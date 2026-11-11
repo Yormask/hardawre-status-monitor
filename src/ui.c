@@ -50,7 +50,7 @@ static void header(sys_t *s, ui_state_t *u)
     x += 1;
     static const char *const SHORT[VIEW_COUNT] = { "Dash", "Procs", "HW", "Setup", "Log" };
     for (int v = 0; v < VIEW_COUNT; v++) {
-        attr_t a = v == u->view ? CP(C_TITLE) | A_BOLD | A_REVERSE : A_GRAY;
+        attr_t a = v == u->view ? CP(C_HDR) | A_BOLD : A_GRAY;
         x += put(0, x, COLS - x, a, " %d %s ", v + 1, COLS < 100 ? SHORT[v] : VIEW_NAMES[v]);
     }
     x += 2;

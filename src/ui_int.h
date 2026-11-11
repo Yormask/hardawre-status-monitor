@@ -38,7 +38,7 @@ extern const char *const VIEW_NAMES[];
  * write+upload, C_B* = bars, C_G* = graphs */
 enum {
     C_TITLE = 1, C_BORDER, C_OK, C_WARN, C_CRIT, C_GRAY, C_HDR, C_THEAD, C_SEL, C_ACC, C_INFO, C_KEY,
-    C_IN, C_OUT, C_BLO, C_BMID, C_BHI, C_TRACK, C_GLO, C_GMID, C_GHI, C_SINGLE
+    C_IN, C_OUT, C_BLO, C_BMID, C_BHI, C_TRACK, C_GLO, C_GMID, C_GHI, C_SINGLE, C_BASE
 };
 attr_t cp(int pair);
 attr_t gray_attr(void);

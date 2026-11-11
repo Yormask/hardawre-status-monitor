@@ -45,6 +45,14 @@ extern const char *const COLOR_NAME[COLOR_COUNT];
 #define SINGLE_COUNT 14
 extern const char *const SINGLE_NAME[SINGLE_COUNT];
 extern const short SINGLE_COLOR[SINGLE_COUNT]; /* ncurses colour number */
+/* the selection highlight uses the same list; the background has its own */
+#define BG_COUNT 11
+extern const char *const BG_NAME[BG_COUNT];
+extern const short BG_COLOR[BG_COUNT]; /* -1 = the terminal's own background */
+/* text colours (selected text, titles); entry 0 = automatic */
+#define TXT_COUNT 17
+extern const char *const TXT_NAME[TXT_COUNT];
+extern const short TXT_COLOR[TXT_COUNT];
 void cpubar_desc(int mask, char *out, size_t n); /* "usage + temperature" */
 
 typedef struct {
@@ -55,6 +63,10 @@ typedef struct {
     int bar_style, graph_style, color_mode;
     int cpu_bars;     /* CPUBAR_* bits */
     int single_color; /* index into SINGLE_NAME / SINGLE_COLOR */
+    int highlight;    /* selection bar, active tab, key hints: index into SINGLE_* */
+    int background;   /* index into BG_NAME / BG_COLOR, 0 = terminal default */
+    int sel_text;     /* text on the highlight: index into TXT_*, 0 = automatic */
+    int title_color;  /* box titles and section headings: index into TXT_*, 0 = cyan */
 } layout_t;
 
 typedef struct {

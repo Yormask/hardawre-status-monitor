@@ -972,7 +972,7 @@ void dashboard_preview(const layout_t *l, int y, int x, int h, int w, int hl)
     for (int c = 0; c < 2; c++)
         for (int i = 0; i < n[c] && i * per < h - ph; i++) {
             int p = ids[c][i];
-            attr_t a = p == hl ? CP(C_THEAD) | A_BOLD : CP(C_BORDER) | A_REVERSE;
+            attr_t a = p == hl ? CP(C_THEAD) | A_BOLD : CP(C_GRAY) | A_REVERSE;
             for (int r = 0; r < sh; r++)
                 fill(y + i * per + r, xs[c], ws[c] - 1, a);
             put(y + i * per, xs[c] + 1, ws[c] - 2, a, "%s", PANEL_NAME[p]);

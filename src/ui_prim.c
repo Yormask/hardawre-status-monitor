@@ -40,7 +40,6 @@ const char *const VIEW_NAMES[] = { "Dashboard", "Processes", "Hardware", "Setup"
 static const char *const BLK[9] = { " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
 static const char *const HB[8] = { "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };
 
-static void init_colors(void);
 
 /* ================================================================ setup */
 
@@ -62,7 +61,6 @@ int ui_init(int utf8)
         start_color();
         use_default_colors();
     }
-    init_colors();
     return 0;
 }
 
@@ -74,46 +72,103 @@ void ui_end(void)
 /* =============================================================== colours */
 
 /* All colours are the terminal's standard ones, so they follow whatever
- * colour theme the terminal itself uses. */
-static void init_colors(void)
+ * colour theme the terminal itself uses. The user can pick the background,
+ * the selection highlight and the "Single colour" from that same palette. */
+static short g_bg = -1, g_fg = -1; /* background, and the text colour that suits it */
+static int g_bright;               /* coloured dark background: use the bright text colours */
+static int g_plain;                /* the same, but the terminal has only 8 colours */
+
+static short fit(short c) /* no bright colours: use the normal one */
 {
-    if (!g_colors)
-        return;
-    short gray = COLORS >= 16 ? 8 : COLOR_WHITE;
-    init_pair(C_TITLE, COLOR_CYAN, -1);
-    init_pair(C_BORDER, COLORS >= 16 ? 8 : COLOR_BLUE, -1);
-    init_pair(C_OK, COLOR_GREEN, -1);
-    init_pair(C_WARN, COLOR_YELLOW, -1);
-    init_pair(C_CRIT, COLOR_RED, -1);
-    init_pair(C_GRAY, gray, -1);
-    init_pair(C_HDR, COLOR_BLACK, COLOR_CYAN);
-    init_pair(C_THEAD, COLOR_BLACK, COLOR_GREEN);
-    init_pair(C_SEL, COLOR_BLACK, COLOR_CYAN);
-    init_pair(C_ACC, COLOR_MAGENTA, -1);
-    init_pair(C_INFO, COLOR_CYAN, -1);
-    init_pair(C_KEY, COLOR_BLACK, COLOR_CYAN);
-    init_pair(C_IN, COLOR_CYAN, -1);
-    init_pair(C_OUT, COLOR_MAGENTA, -1);
-    init_pair(C_BLO, COLOR_GREEN, -1);
-    init_pair(C_BMID, COLOR_YELLOW, -1);
-    init_pair(C_BHI, COLOR_RED, -1);
-    init_pair(C_TRACK, gray, -1);
-    init_pair(C_GLO, COLOR_GREEN, -1);
-    init_pair(C_GMID, COLOR_YELLOW, -1);
-    init_pair(C_GHI, COLOR_RED, -1);
-    init_pair(C_SINGLE, COLOR_CYAN, -1);
+    return (c >= 8 && COLORS < 16) ? (short)(c - 8) : c;
 }
 
+static int is_dark(short c) /* black, dark gray, blue, magenta, red: light text on top */
+{
+    return c == COLOR_BLACK || c == 8 || c == COLOR_BLUE || c == COLOR_MAGENTA || c == COLOR_RED;
+}
+
+/* coloured text on the background; text that would vanish into it uses the normal text colour */
+static void text_pair(short n, short fg)
+{
+    if (g_bright && fg > COLOR_BLACK && fg < 8) /* cyan on blue etc. is hard to read */
+        fg = (short)(fg + 8);
+    if (g_plain && (fg == COLOR_CYAN || fg == COLOR_BLUE || fg == COLOR_MAGENTA || (fg == COLOR_RED && g_bg == COLOR_MAGENTA)))
+        fg = COLOR_WHITE; /* no bright colours to switch to */
+    fg = fit(fg);
+    init_pair(n, (g_bg >= 0 && fg == g_bg) ? g_fg : fg, g_bg);
+}
+
+/* a solid bar (selection, header, key hint) with text in colour fg (-1: black or
+ * white, whichever reads better); turned inside out if it matches the background */
+static void block_pair(short n, short bg, short fg)
+{
+    bg = fit(bg);
+    int chosen = fg >= 0;
+    if (chosen)
+        fg = fit(fg);
+    if (g_bg >= 0 && bg == g_bg) { /* the bar would vanish: draw it in the screen's text colour */
+        init_pair(n, (chosen && fg != g_fg) ? fg : bg, g_fg);
+        return;
+    }
+    if (!chosen || fg == bg) /* text the same colour as the bar would vanish too */
+        fg = is_dark(bg) ? (COLORS >= 16 ? 15 : COLOR_WHITE) : COLOR_BLACK;
+    init_pair(n, fg, bg);
+}
+
+static void init_colors(const layout_t *l)
+{
+    g_bg = fit(BG_COLOR[CLAMP(l->background, 0, BG_COUNT - 1)]);
+    int dark = g_bg >= 0 && is_dark(g_bg), coloured = dark && g_bg != COLOR_BLACK;
+    g_bright = coloured && COLORS >= 16;
+    g_plain = coloured && COLORS < 16;
+    /* text: the terminal's own on its own background, light on dark, black on light */
+    g_fg = g_bg < 0 ? -1 : !dark ? COLOR_BLACK : g_bright ? 15 : COLOR_WHITE;
+    /* secondary text, borders: dark gray normally, a lighter shade on coloured backgrounds */
+    short gray = coloured ? COLOR_WHITE : COLORS >= 16 ? 8 : COLOR_WHITE;
+    short border = !coloured ? (COLORS >= 16 ? 8 : COLOR_BLUE) : g_bright && g_bg < 8 ? (short)(g_bg + 8) : COLOR_WHITE;
+    if (border == g_bg)
+        border = g_fg;
+    short hl = SINGLE_COLOR[CLAMP(l->highlight, 0, SINGLE_COUNT - 1)];
+    short st = TXT_COLOR[CLAMP(l->sel_text, 0, TXT_COUNT - 1)];
+    short tt = TXT_COLOR[CLAMP(l->title_color, 0, TXT_COUNT - 1)];
+    text_pair(C_TITLE, tt < 0 ? COLOR_CYAN : tt);
+    init_pair(C_BORDER, border, g_bg);
+    text_pair(C_OK, COLOR_GREEN);
+    text_pair(C_WARN, COLOR_YELLOW);
+    text_pair(C_CRIT, COLOR_RED);
+    init_pair(C_GRAY, gray, g_bg);
+    block_pair(C_HDR, hl, st);
+    block_pair(C_THEAD, COLOR_GREEN, -1);
+    block_pair(C_SEL, hl, st);
+    text_pair(C_ACC, COLOR_MAGENTA);
+    text_pair(C_INFO, COLOR_CYAN);
+    block_pair(C_KEY, hl, st);
+    text_pair(C_IN, COLOR_CYAN);
+    text_pair(C_OUT, COLOR_MAGENTA);
+    text_pair(C_BLO, COLOR_GREEN);
+    text_pair(C_BMID, COLOR_YELLOW);
+    text_pair(C_BHI, COLOR_RED);
+    init_pair(C_TRACK, gray, g_bg);
+    text_pair(C_GLO, COLOR_GREEN);
+    text_pair(C_GMID, COLOR_YELLOW);
+    text_pair(C_GHI, COLOR_RED);
+    text_pair(C_SINGLE, SINGLE_COLOR[CLAMP(l->single_color, 0, SINGLE_COUNT - 1)]);
+    init_pair(C_BASE, g_fg, g_bg);
+    bkgd(COLOR_PAIR(C_BASE) | ' '); /* plain text and empty space take the background */
+}
+
+/* (re)build the colour pairs when the colour settings change */
 void colors_sync(const layout_t *l)
 {
-    static int last = -1;
-    if (!g_colors || l->single_color == last)
+    static int last[5] = { -1 };
+    if (!g_colors)
         return;
-    last = l->single_color;
-    short c = SINGLE_COLOR[CLAMP(last, 0, SINGLE_COUNT - 1)];
-    if (c >= 8 && COLORS < 16) /* no bright colours: use the normal one */
-        c = (short)(c - 8);
-    init_pair(C_SINGLE, c, -1);
+    int key[5] = { l->single_color, l->highlight, l->background, l->sel_text, l->title_color };
+    if (!memcmp(key, last, sizeof key))
+        return;
+    memcpy(last, key, sizeof key);
+    init_colors(l);
 }
 
 static int mono(void)
