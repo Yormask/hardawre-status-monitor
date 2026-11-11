@@ -33,10 +33,20 @@ extern const layout_t *g_lay; /* active appearance + layout settings */
 extern const char *const SORT_NAMES[];
 extern const char *const VIEW_NAMES[];
 
-/* colour pairs; use CP(), which also handles monochrome mode */
-enum { C_TITLE = 1, C_BORDER, C_OK, C_WARN, C_CRIT, C_GRAY, C_HDR, C_THEAD, C_SEL, C_ACC, C_INFO, C_KEY };
+/* colour pairs (the terminal's standard colours); use CP(), which also
+ * handles monochrome mode. C_INFO = labels, C_IN / C_OUT = read+download /
+ * write+upload, C_B* = bars, C_G* = graphs */
+enum {
+    C_TITLE = 1, C_BORDER, C_OK, C_WARN, C_CRIT, C_GRAY, C_HDR, C_THEAD, C_SEL, C_ACC, C_INFO, C_KEY,
+    C_IN, C_OUT, C_BLO, C_BMID, C_BHI, C_TRACK, C_GLO, C_GMID, C_GHI, C_SINGLE
+};
 attr_t cp(int pair);
 attr_t gray_attr(void);
+void colors_sync(const layout_t *l); /* apply the chosen "Single colour" */
+int gradient_on(void);
+attr_t bar_attr(double pct);    /* bar colour for a 0-100 value  */
+attr_t bar_temp_attr(double c); /* bar colour for a temperature   */
+attr_t graph_attr(double pct);  /* graph colour for a 0-100 height */
 #define CP(n) cp(n)
 #define A_GRAY gray_attr()
 
@@ -62,5 +72,9 @@ void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full);
 void hardware(sys_t *s, ui_state_t *u);
 void setup_view(sys_t *s, ui_state_t *u);
 int setup_key(ui_state_t *u, int ch); /* 1 when the key was used */
+void log_view(sys_t *s, ui_state_t *u);
+int log_view_key(sys_t *s, ui_state_t *u, int ch);
+void log_toggle_system(sys_t *s, ui_state_t *u);  /* key l */
+void log_toggle_process(sys_t *s, ui_state_t *u); /* key L */
 
 #endif

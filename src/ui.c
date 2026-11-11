@@ -19,6 +19,7 @@
  */
 /* ui.c - header, footer, help, the signal dialog, key handling and view dispatch */
 #define _GNU_SOURCE
+#include "log.h"
 #include "ui_int.h"
 
 #include <errno.h>
@@ -47,23 +48,35 @@ static void header(sys_t *s, ui_state_t *u)
     int x = 0;
     x += put(0, x, COLS - x, CP(C_HDR) | A_BOLD, " %s ", APP_NAME);
     x += 1;
+    static const char *const SHORT[VIEW_COUNT] = { "Dash", "Procs", "HW", "Setup", "Log" };
     for (int v = 0; v < VIEW_COUNT; v++) {
         attr_t a = v == u->view ? CP(C_TITLE) | A_BOLD | A_REVERSE : A_GRAY;
-        x += put(0, x, COLS - x, a, " %d %s ", v + 1, VIEW_NAMES[v]);
+        x += put(0, x, COLS - x, a, " %d %s ", v + 1, COLS < 100 ? SHORT[v] : VIEW_NAMES[v]);
     }
     x += 2;
-    char clock[16], up[24];
+    char rec[40] = "", clock[16], up[24];
+    if (g_log.f || g_log.nplog) { /* recording indicator, kept next to the clock */
+        char r[24] = "";
+        if (g_log.f && g_log.nplog)
+            sfmt(r, sizeof r, " +%d", g_log.nplog);
+        else if (!g_log.f)
+            sfmt(r, sizeof r, " %d proc", g_log.nplog);
+        sfmt(rec, sizeof rec, " %s REC%s ", U ? "●" : "*", r);
+    }
+    int rw = utf8_cols(rec);
     time_t t = time(NULL);
     struct tm tm;
     localtime_r(&t, &tm);
     strftime(clock, sizeof clock, "%H:%M:%S", &tm);
-    int cw = (int)strlen(clock), xm = COLS - cw - 2;
+    int cw = (int)strlen(clock), xm = COLS - cw - 2 - (rw ? rw + 1 : 0);
     fmt_duration(s->cpu.uptime, up, sizeof up);
     kv(0, &x, xm, A_BOLD, "", "%s", s->host);
     kv(0, &x, xm, A_NORMAL, "", "%s", s->os);
     kv(0, &x, xm, A_NORMAL, "kernel", "%s", s->kernel);
     kv(0, &x, xm, A_NORMAL, "up", "%s", up);
-    put(0, COLS - cw - 1, cw, A_BOLD, "%s", clock);
+    if (rw)
+        put(0, COLS - cw - 2 - rw, rw, CP(C_CRIT) | A_BOLD | A_REVERSE, "%s", rec);
+    put(0, COLS - cw - 2, cw + 2, A_BOLD, " %s ", clock);
 }
 
 static void footer(ui_state_t *u)
@@ -89,16 +102,23 @@ static void footer(ui_state_t *u)
     }
 
     static const char *const keys[][2] = {
-        { "q", "Quit" },  { "?", "Help" },        { "s", "Setup" },    { "x", "Kill" },
-        { "1-4", "View" }, { "c/m/d/p/n/t", "Sort" }, { "/", "Filter" }, { "b", "CPU bars" },
-        { "k", "Kthreads" }, { "f", "Follow" },  { "+/-", "Interval" }, { "Spc", "Pause" },
+        { "q", "Quit" },     { "?", "Help" },     { "s", "Setup" },       { "l", "Log" },
+        { "L", "Log proc" }, { "x", "Kill" },     { "1-5", "View" },      { "c/m/d/p/n/t", "Sort" },
+        { "/", "Filter" },   { "b", "CPU bars" }, { "k", "Kthreads" },    { "f", "Follow" },
+        { "+/-", "Interval" }, { "Spc", "Pause" },
+    };
+    static const char *const lkeys[][2] = {
+        { "l", "Start/stop" }, { "Space", "Select" }, { "a", "All" }, { "n", "None" },
+        { "i", "Interval" },   { "L", "Log process (view 2)" }, { "q", "Quit" },
     };
     static const char *const skeys[][2] = {
-        { "Up/Dn", "Select" }, { "Space", "Show/hide" }, { "Left/Right", "Column / value" },
-        { "[ ]", "Move" },     { "R", "Defaults" },      { "Esc", "Back" },  { "q", "Quit" },
+        { "Up/Dn", "Select" }, { "Enter", "Toggle" }, { "Left/Right", "Column / value" },
+        { "[ ]", "Move" },     { "R", "Reset all" },     { "Esc", "Back" },  { "q", "Quit" },
     };
-    const char *const(*k)[2] = u->view == VIEW_SETUP ? skeys : keys;
-    size_t nk = u->view == VIEW_SETUP ? sizeof skeys / sizeof skeys[0] : sizeof keys / sizeof keys[0];
+    const char *const(*k)[2] = u->view == VIEW_SETUP ? skeys : u->view == VIEW_LOG ? lkeys : keys;
+    size_t nk = u->view == VIEW_SETUP ? sizeof skeys / sizeof skeys[0]
+              : u->view == VIEW_LOG   ? sizeof lkeys / sizeof lkeys[0]
+                                      : sizeof keys / sizeof keys[0];
     for (size_t i = 0; i < nk && x < xm; i++) {
         int need = (int)strlen(k[i][0]) + (int)strlen(k[i][1]) + 3;
         if (x + need > xm)
@@ -111,18 +131,17 @@ static void footer(ui_state_t *u)
 static void help_overlay(void)
 {
     static const char *const L[][2] = {
-        { "1 2 3 4, Tab", "Dashboard / Processes / Hardware / Setup" },
+        { "1 - 5, Tab", "Dashboard / Processes / Hardware / Setup / Logging" },
         { "s, F2", "Setup: choose, arrange and style the panels" },
-        { "Up Down PgUp PgDn", "move the selection or scroll" },
-        { "Home End", "jump to top / bottom" },
+        { "Up Down PgUp PgDn", "move the selection or scroll (Home / End too)" },
+        { "l", "start / stop logging sensors to a CSV file" },
+        { "L", "start / stop logging the selected process" },
         { "x, F9", "send a signal to (kill) the selected process" },
-        { "c m d p n t", "sort: CPU, memory, disk I/O, PID, name, time" },
-        { "", "(press the same key again to reverse)" },
-        { "/", "filter by name, command, user or PID" },
-        { "Esc", "clear the filter" },
+        { "c m d p n t", "sort: CPU mem I/O PID name time (twice: reverse)" },
+        { "/", "filter by name, command, user or PID (Esc clears)" },
         { "f", "selection sticks to the process, not the row" },
         { "k", "show / hide kernel threads" },
-        { "b", "CPU core bars: usage / clock / temperature" },
+        { "b", "CPU core bars: usage, clock, temperature, or a mix" },
         { "+ -", "slower / faster refresh" },
         { "Space", "pause / resume sampling" },
         { "q, F10", "quit" },
@@ -243,6 +262,7 @@ static void kill_key(ui_state_t *u, int ch)
 void ui_draw(sys_t *s, ui_state_t *u)
 {
     g_lay = &u->lay;
+    colors_sync(&u->lay);
     erase();
     if (COLS < 60 || LINES < 16) {
         put(0, 0, COLS, A_BOLD, "Terminal too small (%dx%d), need at least 60x16", COLS, LINES);
@@ -250,8 +270,18 @@ void ui_draw(sys_t *s, ui_state_t *u)
         return;
     }
     header(s, u);
+    static int last_view = -1;
+    if (u->view == VIEW_LOG && last_view != VIEW_LOG && !g_log.f) /* pick up new disks / interfaces */
+        log_build_channels(s, u->log_skip);
+    last_view = u->view;
+    g_log.every = u->log_every;
+    if (g_log.note_new) { /* e.g. a logged process exited */
+        ui_message(u, g_log.note_err, "%s", g_log.note);
+        g_log.note_new = 0;
+    }
     switch (u->view) {
     case VIEW_DASH: dashboard(s, u); break;
+    case VIEW_LOG: log_view(s, u); break;
     case VIEW_PROCS: draw_procs(s, u, 1, 0, LINES - 2, COLS, 1); break;
     case VIEW_HW: hardware(s, u); break;
     case VIEW_SETUP: setup_view(s, u); break;
@@ -274,7 +304,7 @@ static void set_sort(ui_state_t *u, int s)
     }
 }
 
-int ui_key(ui_state_t *u, int ch)
+int ui_key(sys_t *s, ui_state_t *u, int ch)
 {
     if (u->filter_edit) {
         size_t len = strlen(u->filter);
@@ -303,6 +333,8 @@ int ui_key(ui_state_t *u, int ch)
     }
     if (u->view == VIEW_SETUP && setup_key(u, ch))
         return 1;
+    if (u->view == VIEW_LOG && log_view_key(s, u, ch))
+        return 1;
 
     static const double steps[] = { 0.25, 0.5, 1, 2, 3, 5, 10 };
     int nsteps = (int)(sizeof steps / sizeof steps[0]), si = 0;
@@ -320,14 +352,26 @@ int ui_key(ui_state_t *u, int ch)
     case '4':
     case 's':
     case KEY_F(2): u->view = VIEW_SETUP; break;
+    case '5': u->view = VIEW_LOG; break;
+    case 'l': log_toggle_system(s, u); break;
+    case 'L': log_toggle_process(s, u); break;
     case '\t': u->view = (u->view + 1) % VIEW_COUNT; break;
     case KEY_BTAB: u->view = (u->view + VIEW_COUNT - 1) % VIEW_COUNT; break;
     case 'x':
     case KEY_F(9): kill_open(u); break;
-    case 'b':
-        u->lay.cpu_bars = (u->lay.cpu_bars + 1) % CPUBAR_COUNT;
-        ui_message(u, 0, "CPU core bars: %s", CPUBAR_NAME[u->lay.cpu_bars]);
+    case 'b': { /* cycle through every combination of CPU core bars */
+        static const int combos[] = { CPUBAR_USAGE, CPUBAR_CLOCK, CPUBAR_TEMP,
+                                      CPUBAR_USAGE | CPUBAR_CLOCK, CPUBAR_USAGE | CPUBAR_TEMP,
+                                      CPUBAR_CLOCK | CPUBAR_TEMP, CPUBAR_ALL };
+        int i = 0, nc = (int)(sizeof combos / sizeof combos[0]);
+        while (i < nc && combos[i] != u->lay.cpu_bars)
+            i++;
+        u->lay.cpu_bars = combos[i < nc ? (i + 1) % nc : 0];
+        char d[48];
+        cpubar_desc(u->lay.cpu_bars, d, sizeof d);
+        ui_message(u, 0, "CPU core bars: %s", d);
         break;
+    }
     case 'c': set_sort(u, SORT_CPU); break;
     case 'm': set_sort(u, SORT_MEM); break;
     case 'd': set_sort(u, SORT_IO); break;
@@ -347,7 +391,11 @@ int ui_key(ui_state_t *u, int ch)
     case '=': u->interval = steps[MIN(si + 1, nsteps - 1)]; break;
     case '-':
     case '_': u->interval = steps[MAX(si - 1, 0)]; break;
-    case ' ': u->paused ^= 1; break;
+    case ' ':
+        u->paused ^= 1;
+        if (u->paused && (g_log.f || g_log.nplog))
+            ui_message(u, 1, "Paused: logging is paused too until you press Space again");
+        break;
     case '?':
     case 'h':
     case KEY_F(1): u->help = 1; break;

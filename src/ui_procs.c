@@ -19,6 +19,7 @@
  */
 /* ui_procs.c - process table: sorting, filtering, selection */
 #define _GNU_SOURCE
+#include "log.h"
 #include "ui_int.h"
 
 #include <stdarg.h>
@@ -136,7 +137,7 @@ static void cell_text(proc_t *p, int k, long hz, char *o, size_t n, attr_t *a)
             *a = A_GRAY;
         } else {
             fmt_rate(v, o, n);
-            *a = (k == K_RD ? CP(C_INFO) : CP(C_ACC)) | A_BOLD;
+            *a = (k == K_RD ? CP(C_IN) : CP(C_OUT)) | A_BOLD;
         }
         break;
     }
@@ -149,6 +150,11 @@ static void draw_cmd(int y, int x, int w, proc_t *p, int full, attr_t base, int 
 {
     if (w <= 0)
         return;
+    if (g_log.nplog && log_proc_find(p->pid, p->start) >= 0) { /* being logged */
+        int m = put(y, x, w, sel ? base | A_BOLD : CP(C_CRIT) | A_BOLD, "%s ", U ? "●" : "*");
+        x += m;
+        w -= m;
+    }
     const char *cmd = p->kthread ? "" : proc_cmdline(p);
     if (!*cmd) {
         put(y, x, w, sel ? base : A_GRAY, "[%s]", p->comm);

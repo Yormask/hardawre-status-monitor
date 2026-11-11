@@ -23,7 +23,7 @@
 
 #include "collect.h"
 
-enum { VIEW_DASH, VIEW_PROCS, VIEW_HW, VIEW_SETUP, VIEW_COUNT };
+enum { VIEW_DASH, VIEW_PROCS, VIEW_HW, VIEW_SETUP, VIEW_LOG, VIEW_COUNT };
 enum { SORT_CPU, SORT_MEM, SORT_IO, SORT_PID, SORT_NAME, SORT_TIME, SORT_COUNT };
 
 /* dashboard panels */
@@ -32,21 +32,29 @@ enum { P_CPU, P_GPU, P_MEM, P_POWER, P_DISK, P_NET, P_TEMPS, P_FANS, P_FS, P_COU
 enum { BAR_BLOCKS, BAR_SQUARES, BAR_LINE, BAR_CLASSIC, BAR_COUNT };
 enum { GRAPH_BLOCKS, GRAPH_BRAILLE, GRAPH_OFF, GRAPH_COUNT };
 enum { COLOR_VALUE, COLOR_GRADIENT, COLOR_SINGLE, COLOR_MONO, COLOR_COUNT };
-enum { CPUBAR_USAGE, CPUBAR_CLOCK, CPUBAR_TEMP, CPUBAR_COUNT };
+/* per-core CPU bars: any combination of these bits */
+enum { CPUBAR_USAGE = 1, CPUBAR_CLOCK = 2, CPUBAR_TEMP = 4, CPUBAR_ALL = 7 };
+
 
 extern const char *const PANEL_KEY[P_COUNT];  /* names used in the config file */
 extern const char *const PANEL_NAME[P_COUNT]; /* names shown on screen */
 extern const char *const BAR_NAME[BAR_COUNT];
 extern const char *const GRAPH_NAME[GRAPH_COUNT];
 extern const char *const COLOR_NAME[COLOR_COUNT];
-extern const char *const CPUBAR_NAME[CPUBAR_COUNT];
+/* colours offered for "Single colour" mode: the terminal's standard ones */
+#define SINGLE_COUNT 14
+extern const char *const SINGLE_NAME[SINGLE_COUNT];
+extern const short SINGLE_COLOR[SINGLE_COUNT]; /* ncurses colour number */
+void cpubar_desc(int mask, char *out, size_t n); /* "usage + temperature" */
 
 typedef struct {
     int col[2][P_COUNT], ncol[2]; /* panel order in the left [0] / right [1] column */
     int on[P_COUNT];              /* shown on the dashboard */
     int show_procs;               /* process list below the panels */
     int left_pct;                 /* left column width in %, 0 = automatic */
-    int bar_style, graph_style, color_mode, cpu_bars;
+    int bar_style, graph_style, color_mode;
+    int cpu_bars;     /* CPUBAR_* bits */
+    int single_color; /* index into SINGLE_NAME / SINGLE_COLOR */
 } layout_t;
 
 typedef struct {
@@ -65,7 +73,15 @@ typedef struct {
     int hw_scroll, hw_max;
 
     layout_t lay;
-    int setup_sel;
+    int setup_sel, setup_scroll;
+    int confirm; /* reset waiting for a second Enter, -1 = none */
+
+    /* logging (view 5) */
+    char log_dir[PATHBUF]; /* "" = default folder */
+    double log_every;      /* seconds between log rows, 0 = every refresh */
+    char log_skip[4096];   /* channels switched off, comma separated ids */
+    int log_sel, log_scroll;
+    double confirm_until;
 
     /* signal dialog */
     int kill_open, kill_sel, kill_kthread;
@@ -79,19 +95,25 @@ typedef struct {
     int msg_err;
 } ui_state_t;
 
-void ui_init(int utf8);
+int ui_init(int utf8); /* -1 when the terminal type is unknown */
 void ui_end(void);
 void ui_draw(sys_t *s, ui_state_t *u);
-int ui_key(ui_state_t *u, int ch); /* returns 0 when the user wants to quit */
+int ui_key(sys_t *s, ui_state_t *u, int ch); /* returns 0 when the user wants to quit */
 void ui_message(ui_state_t *u, int err, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 
 /* config.c */
 void layout_defaults(layout_t *l);
 void config_defaults(ui_state_t *u);
+void config_reset_all(ui_state_t *u); /* everything back to defaults */
 int config_load(ui_state_t *u); /* 0 = loaded, -1 = no file (defaults kept) */
 int config_save(const ui_state_t *u);
 int config_changed(const ui_state_t *u); /* differs from what was loaded / last saved */
 const char *config_path(void);
+const char *config_log_dir(const ui_state_t *u); /* folder logs are written to */
+int config_as_user(void);         /* act as the real (sudo) user: 1 switched, 0 no need, -1 failed */
+void config_as_root(int changed); /* undo config_as_user */
+int config_mkdir_p(const char *dir);
+void config_pretty_path(const char *path, char *out, size_t n); /* home -> ~ */
 
 void report_print(sys_t *s, int nproc);
 

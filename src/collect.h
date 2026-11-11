@@ -172,6 +172,7 @@ void sensors_init(sensors_t *s);
 void sensors_sample(sensors_t *s);
 double sensors_cpu_temp(const sensors_t *s);
 double sensors_core_temp(const sensors_t *s, int pkg, int core); /* coretemp "Core N", -1 */
+void sensors_chip_name(const char *chip, char *out, size_t n); /* "nvme#2" -> "NVMe 2" */
 
 /* ------------------------------------------------------------------ GPU */
 #define MAX_GPUS 8

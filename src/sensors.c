@@ -248,3 +248,25 @@ double sensors_cpu_temp(const sensors_t *S)
         return -1;
     return S->s[S->cpu_idx].value;
 }
+
+/* "coretemp" -> "CPU", "nvme#2" -> "NVMe 2", ... */
+void sensors_chip_name(const char *chip, char *out, size_t n)
+{
+    static const struct {
+        const char *prefix, *name;
+    } map[] = { { "coretemp", "CPU" }, { "k10temp", "CPU" },   { "zenpower", "CPU" },  { "cpu_thermal", "CPU" },
+                { "amdgpu", "GPU" },   { "radeon", "GPU" },    { "nouveau", "GPU" },   { "i915", "GPU" },
+                { "xe", "GPU" },       { "nvme", "NVMe" },     { "acpitz", "ACPI" },   { "pch_", "PCH" },
+                { "iwlwifi", "WiFi" }, { "thinkpad", "ThinkPad" }, { "drivetemp", "Drive" } };
+    const char *nm = chip;
+    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (!strncmp(chip, map[i].prefix, strlen(map[i].prefix))) {
+            nm = map[i].name;
+            break;
+        }
+    const char *hash = strchr(chip, '#');
+    if (hash && nm != chip)
+        sfmt(out, n, "%s %s", nm, hash + 1);
+    else
+        str_copy(out, n, nm);
+}

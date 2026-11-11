@@ -1,17 +1,18 @@
 # hsm — hardware status monitor
 
-A fast, lightweight hardware and process monitor for the Linux terminal, written in C. It shows everything your machine is doing on one screen: CPU, GPU, memory, power draw, disk and network throughput, temperatures, fans, and every process with its CPU, memory and disk I/O. You choose which panels appear, arrange them, and pick how bars and graphs look.
+A fast, lightweight hardware and process monitor for the Linux terminal, written in C. It shows everything your machine is doing on one screen: CPU, GPU, memory, power draw, disk and network throughput, temperatures, fans, and every process with its CPU, memory and disk I/O. You choose which panels appear, arrange them, and pick how bars and graphs look. Colours are your terminal's standard ones, so they follow your terminal's theme. It can also **log** any sensor, or single processes, to CSV files, so a crash caused by heat or overload can be traced afterwards.
 
 * **Fast**: reads `/proc` and `/sys` directly. It never spawns helper programs or parses tool output. One full sample of every subsystem takes about 0.3 ms.
-* **Small**: about 170 KB binary, about 4 MB RAM, about 0.1% CPU at a 1 s refresh.
-* **Customizable**: show, hide and rearrange panels; choose bar style, graph style and colours. Settings are saved automatically.
+* **Small**: about 250 KB binary, about 4 MB RAM, about 0.1% CPU at a 1 s refresh.
+* **Logging**: record temperatures, load, clocks, power, fans, disk and network to a CSV file, and follow individual processes in their own files. It works from the screen or headless (`hsm --log`).
+* **Customizable**: show, hide and rearrange panels; choose bar style, graph style and colour mode. Settings are saved automatically.
 * **No hard dependencies** beyond ncurses. NVIDIA support is loaded at runtime only if the driver is installed.
 
 ## What it shows
 
 | Panel | Details | Source |
 |---|---|---|
-| CPU | total and per-core bars (usage, clock speed or per-core temperature), user/sys/iowait/steal, average clock, package temperature and power, load average, context switches, interrupts and forks per second, history graph | `/proc/stat`, cpufreq, hwmon, RAPL |
+| CPU | total and per-core bars (usage, clock speed and/or per-core temperature, in any combination), user/sys/iowait/steal, average clock, package temperature and power, load average, context switches, interrupts and forks per second, history graph | `/proc/stat`, cpufreq, hwmon, RAPL |
 | GPU | load, VRAM, core clock bar, memory clock, temperature, power and power limit, fan | see below |
 | Memory | used/available, cache, shared, dirty, swap usage, swap-in/out rate, major page faults | `/proc/meminfo`, `/proc/vmstat` |
 | Power | CPU package, cores, iGPU (uncore), DRAM, platform (psys), GPU power, battery drain and time left, AC state, estimated total | RAPL powercap, hwmon, `power_supply` |
@@ -70,24 +71,32 @@ hsm [options]
   -a, --ascii       plain ASCII drawing for terminals without Unicode
   -h, --help        help
   -v, --version     version, copyright and license
+
+Logging without the screen (runs until Ctrl+C, kill, or the logged processes exit):
+  --log             log the values chosen in the Logging view (5) to a CSV file
+  --log-pid PID     log one process's usage (can be given up to 16 times)
+  --log-every SEC   seconds between rows (default: the saved setting)
+  --log-dir DIR     where to write the files (default: ~/.local/state/hsm/logs)
 ```
 
 ### Keys
 
 | Key | Action |
 |---|---|
-| `1` `2` `3` `4` / `Tab` | **Dashboard** / **Processes** (full table) / **Hardware** (every sensor and device) / **Setup** |
+| `1` `2` `3` `4` `5` / `Tab` | **Dashboard** / **Processes** (full table) / **Hardware** (every sensor and device) / **Setup** / **Logging** |
 | `s` / `F2` | open Setup |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | move the selection, or scroll the Hardware view |
+| `l` | start or stop logging sensors to a CSV file (see [Logging](#logging)) |
+| `L` | start or stop logging the selected process |
 | `x` / `F9` | send a signal to (kill) the selected process |
 | `c` `m` `d` `p` `n` `t` | sort by CPU, memory, disk I/O, PID, name, CPU time. Press the same key again to reverse. |
 | `r` | reverse the sort |
 | `/` | filter by process name, command line, user or PID (`Enter` keeps it, `Esc` clears it) |
-| `b` | CPU core bars: usage / clock speed / temperature |
+| `b` | CPU core bars: cycle through usage, clock, temperature and their combinations |
 | `k` | show or hide kernel threads |
 | `f` | selection follows the process instead of staying on the row |
 | `+` `-` | slower / faster refresh (0.25 s to 10 s) |
-| `Space` | pause sampling |
+| `Space` | pause sampling (logging pauses too) |
 | `?` | help |
 | `q` / `F10` | quit |
 
@@ -103,7 +112,7 @@ Press `s` (or `4`) to open **Setup**. Changes apply immediately and are saved au
 | `Space` / `Enter` | show or hide it |
 | `[` `]` or `Shift`+`↑` `↓` | move it up or down (it moves between columns at the ends) |
 | `←` `→` | move it to the left or right column |
-| `R` | reset layout and styles to the defaults |
+| `R`, then `Enter` or `R` | reset **all** settings to the defaults |
 | `Esc` | back to the dashboard |
 
 A live **Preview** shows where every panel will go. If a column ends up empty, the other one uses the full width.
@@ -116,10 +125,22 @@ A live **Preview** shows where every panel will go. If a column ends up empty, t
 | Bar style | Blocks `████▌···`, Squares `■■■■■■`, Line `━━━━──`, Classic `[|||   ]` |
 | Graphs | Blocks, Braille (twice the detail), Off (more room for everything else) |
 | Colours | By value (green / yellow / red), Gradient (colour changes along the bar), Single colour, Monochrome |
-| CPU core bars | Usage, Clock speed (compared with the CPU's max), Temperature (per core on Intel; package temperature on AMD) |
+| Colour | only in Single colour mode: cyan, blue, green, yellow, red, magenta, white, or the bright version of each (the bright ones need a 16-colour terminal) |
 | Left column width | Automatic or 35% to 70% |
 | Refresh interval | 0.25 s to 10 s |
 | Kernel threads | shown / hidden in the process list |
+
+**CPU core bars**: switch each kind on or off independently, so a core can show one, two or all three bars side by side:
+
+| Bar | Shows |
+|---|---|
+| Usage | how busy the core is |
+| Clock speed | current clock compared with the CPU's maximum |
+| Temperature | that core's temperature (per core on Intel; package temperature on AMD) |
+
+At least one kind stays on. The `b` key cycles through all the combinations without opening Setup.
+
+**Reset**: the settings list ends with *Reset ALL settings to defaults* (or press `R` anywhere in Setup). It asks you to press Enter a second time, so nothing is lost by accident; any other key cancels.
 
 Any panel with spare height uses it for a history graph.
 
@@ -136,14 +157,80 @@ left_width = auto
 bars = blocks          # blocks | squares | line | classic
 graphs = braille       # blocks | braille | off
 colors = gradient      # value | gradient | single | mono
-cpu_bars = temp        # usage | clock | temp
+cpu_bars = usage, temp # any of: usage, clock, temp  (or: all)
+single_color = green   # used by colors = single; cyan blue green yellow red magenta white,
+                       # or bright-cyan, bright-blue, ... bright-white
 interval = 1
 sort = cpu
 reverse = off
 kernel_threads = off
+log_dir = default      # or a folder, e.g. ~/hsm-logs
+log_every = 5          # seconds between log rows, or "refresh" for every update
+log_skip = net.eth0.rx, net.eth0.tx   # values left out of the system log
 ```
 
 hsm saves the file when you change something in Setup, and on exit only if you changed something during that session, so hand edits aren't overwritten. When you run `sudo hsm`, it uses *your* config file (not root's) and reads and writes it as you, so the file stays owned by you.
+
+## Logging
+
+Logs help you find out what happened before a crash, a shutdown or a slowdown: how hot the CPU got, which process was using it, whether a fan stopped, how hard a disk was working. Everything is written as CSV, so you can open the files in LibreOffice Calc, Excel or Google Sheets, or plot them with any tool.
+
+**System log.** Press `5` to open the **Logging** view. It lists every value hsm can record, grouped by CPU, CPU cores, Memory, GPU, Power, Temperatures, Fans, Disks and Network, each with its current reading:
+
+| Key | Action |
+|---|---|
+| `↑` `↓` `←` `→` `PgUp` `PgDn` | move through the list |
+| `Space` / `Enter` | select or deselect a value |
+| `a` / `n` | select all / none |
+| `i` | time between rows: every refresh, 1, 2, 5, 10, 30 or 60 seconds |
+| `l` | start / stop the log (this key works in every view) |
+
+Everything is selected at first. Your selection and interval are saved. While a log is running, the header shows a red **● REC** and the selection can't change, so every row has the same columns.
+
+**Process logs.** Select a process in the Processes view (`2`) or the dashboard's process list and press `L`. Its row gets a red `●` and its usage goes to its own file. Press `L` on it again (or `Space` on it in the Logging view) to stop. Up to 16 processes can be logged at once. When a process exits, its log is closed and the footer tells you.
+
+**Where the files go.** `~/.local/state/hsm/logs/` (or `$XDG_STATE_HOME/hsm/logs/`), or the folder set by `log_dir` in the config file. Under `sudo hsm` they still go to *your* folder and belong to you. A new file is made each time you start a log; nothing is ever overwritten.
+
+```
+hsm-system-2026-11-11_18-08-27.csv
+hsm-process-1288-firefox-2026-11-11_18-08-49.csv
+```
+
+System log columns: `time`, `elapsed_s`, then one column per selected value with its unit in the heading:
+
+```
+time,elapsed_s,"CPU total (%)","CPU temperature (C)","Average CPU clock (MHz)","GPU load (%)",...
+2026-11-11 18:08:27,0.0,12.5,54.0,3602,8.0,...
+```
+
+Process log columns: `time`, `elapsed_s`, `pid`, `state`, CPU (% of one core), memory %, RSS (MB), threads, disk read and write (MB/s), and the whole system's CPU % and CPU temperature next to it, so you can see whether the process was the cause.
+
+A value that can't be read at that moment (for example RAPL power without root) is left empty. Every row is written as soon as it is taken, and the file is synced to disk every 5 seconds, so a log survives a crash or power loss with at most the last few seconds missing.
+
+**Logging in the background (no screen).** For tracking down a crash that happens overnight, run hsm headless:
+
+```sh
+hsm --log --log-every 5                      # the values chosen in the Logging view
+hsm --log-pid 4321 --log-every 1             # one process; stops when it exits
+sudo hsm --log --log-pid 4321                # with RAPL power; files still owned by you
+nohup hsm --log --log-every 10 >/dev/null 2>&1 &   # keeps running after you log out
+```
+
+It prints where the files are, writes until `Ctrl+C` or `kill`, then prints how many rows were saved. To start it at every boot, a small systemd service works well (`/etc/systemd/system/hsm-log.service`, then `sudo systemctl enable --now hsm-log`):
+
+```ini
+[Unit]
+Description=hsm hardware log
+
+[Service]
+ExecStart=/usr/local/bin/hsm --log --log-every 10 --log-dir /var/log/hsm
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Each start makes a new file, so old logs are kept; delete the ones you don't need now and then.
 
 ## Killing processes
 
@@ -180,6 +267,8 @@ z /sys/class/powercap/intel-rapl:*:*/energy_uj 0444 - - -
 
 Then run `sudo systemd-tmpfiles --create` (it is also applied at every boot).
 
+**"unknown terminal type"?** Your `TERM` names a terminal ncurses doesn't know. Run `TERM=xterm-256color hsm`, or install your distribution's `ncurses-term` package.
+
 **No fans in the Fans panel?** Many desktop boards only report fan speeds once their Super I/O sensor driver is loaded. Install `lm-sensors` and run `sudo sensors-detect`.
 
 ## How power is estimated
@@ -193,7 +282,7 @@ The Power panel title shows the best whole-machine figure it can find, in this o
 ## Project layout
 
 ```
-src/main.c        argument parsing, main loop (sampling + input on one thread, no busy-waiting)
+src/main.c        argument parsing, main loop (sampling + input on one thread, no busy-waiting), headless --log
 src/config.c      settings file: load, save, defaults (sudo-safe)
 src/sys.c         ties the collectors together, history buffers, total-power estimate
 src/cpu.c         /proc/stat, cpufreq, topology, /proc/cpuinfo, load, uptime
@@ -209,7 +298,9 @@ src/ui_prim.c     drawing primitives: text, boxes, bar styles, block/braille gra
 src/ui_panels.c   dashboard panels and the two-column layout engine
 src/ui_procs.c    process table: sorting, filtering, selection
 src/ui_hw.c       Hardware view
-src/ui_setup.c    Setup screen
+src/ui_setup.c    Setup screen: panels, styles, CPU bars, single colour, reset
+src/ui_log.c      Logging view: choose values, start / stop logs, process logs
+src/log.c         logging: the list of values, CSV system and process logs (sudo-safe)
 src/report.c      --once plain-text snapshot
 src/util.c        file reading, formatting, history ring buffer
 ```
@@ -226,8 +317,8 @@ For development, `HSM_SYSFS`, `HSM_PROCFS` and `HSM_PCI_IDS` point the program a
 * tree view of processes
 * per-process GPU usage (DRM fdinfo)
 * Intel `xe` driver and ARM (Mali / Adreno devfreq) GPU load
-* CSV / JSON logging mode
-* colour themes
+* view a saved log as graphs inside hsm
+* JSON output for --once
 
 ## License
 

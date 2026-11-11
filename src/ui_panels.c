@@ -31,92 +31,132 @@
 
 /* ================================================================== CPU */
 
-static int cpu_cols(int iw, int ncpu, int max_rows)
+static int nbits(int m)
+{
+    return !!(m & CPUBAR_USAGE) + !!(m & CPUBAR_CLOCK) + !!(m & CPUBAR_TEMP);
+}
+
+/* columns of per-core cells; k = bars per core (1-3) */
+static int cpu_cols(int iw, int ncpu, int max_rows, int k)
 {
     if (ncpu <= 1)
         return 1;
     if (max_rows < 1)
         max_rows = 1;
     int cols = (ncpu + max_rows - 1) / max_rows;
-    int pref = MAX(iw / 28, 1);
+    int pref = MAX(iw / (k <= 1 ? 28 : 4 + 16 * k), 1);
     if (cols < pref)
         cols = pref;
     if (cols > ncpu)
         cols = ncpu;
-    while (cols > 1 && iw / cols < 7)
+    while (cols > 1 && iw / cols < 7 * MAX(k, 1))
         cols--;
     return cols;
 }
 
-static int cpu_rows(int iw, int ncpu, int max_rows)
+static int cpu_rows(int iw, int ncpu, int max_rows, int k)
 {
-    int c = cpu_cols(iw, ncpu, max_rows);
+    int c = cpu_cols(iw, ncpu, max_rows, k);
     return (ncpu + c - 1) / c;
 }
 
 static int g_core_max = 8; /* rows allowed for per-core bars, set every frame */
 
-/* One per-core cell. Setup -> "CPU core bars" picks what the bar shows:
- * usage %, clock speed (vs. the CPU's max) or the core's temperature. */
-static void cpu_cell(sys_t *s, int mode, int i, int y, int x, int cw, int idw)
+/* One metric of one CPU: bar fill (0-100), value text and colours. */
+static void cpu_metric(sys_t *s, int metric, int i, double *bpct, char *txt, size_t n, attr_t *ba, attr_t *ta)
 {
     cpu_t *c = &s->cpu;
-    int id = c->id[i], grad = g_lay->color_mode == COLOR_GRADIENT;
-    double pct = c->pct[i], mhz = c->mhz[i], bpct = pct;
-    char pri[16] = "", sec[16] = "";
-    attr_t ba = 0, pa = pct_attr(pct);
-
-    if (mode == CPUBAR_CLOCK) {
+    int id = c->id[i], grad = gradient_on();
+    double pct = c->pct[i], mhz = c->mhz[i];
+    if (metric == CPUBAR_CLOCK) {
         double mx = c->mhz_hw[id] > 0 ? c->mhz_hw[id] : c->mhz_max;
-        bpct = (mhz > 0 && mx > 0) ? 100.0 * mhz / mx : 0;
+        *bpct = (mhz > 0 && mx > 0) ? 100.0 * mhz / mx : 0;
         if (mhz > 0)
-            sfmt(pri, sizeof pri, "%.1fG", mhz / 1000.0);
+            sfmt(txt, n, "%.1fG", mhz / 1000.0);
         else
-            str_copy(pri, sizeof pri, "n/a");
-        sfmt(sec, sizeof sec, "%.0f%%", pct);
-        ba = grad ? 0 : CP(C_INFO);
-        pa = A_BOLD;
-    } else if (mode == CPUBAR_TEMP) {
+            str_copy(txt, n, "n/a");
+        *ba = grad ? 0 : CP(C_IN);
+        *ta = mhz > 0 ? A_BOLD : A_GRAY;
+    } else if (metric == CPUBAR_TEMP) {
         int core = c->core_id[id] >= 0 ? c->core_id[id] : id;
         double t = sensors_core_temp(&s->sens, c->pkg_id[id], core);
         if (t < 0)
             t = c->temp_c; /* no per-core sensor (e.g. AMD): package temperature */
-        if (t >= 0) {
-            bpct = t; /* bar spans 0-100 °C */
-            sfmt(pri, sizeof pri, "%.0f%s", t, U ? "°" : "C");
-            ba = grad ? 0 : temp_attr(t);
-            pa = temp_attr(t) | A_BOLD;
-        } else {
-            bpct = 0;
-            str_copy(pri, sizeof pri, "n/a");
-            pa = A_GRAY;
-        }
-        sfmt(sec, sizeof sec, "%.0f%%", pct);
+        *bpct = t > 0 ? t : 0; /* bar spans 0-100 °C */
+        if (t >= 0)
+            sfmt(txt, n, "%.0f%s", t, U ? "°" : "C");
+        else
+            str_copy(txt, n, "n/a");
+        *ba = grad ? 0 : bar_temp_attr(t);
+        *ta = t >= 0 ? temp_attr(t) | A_BOLD : A_GRAY;
     } else {
-        sfmt(pri, sizeof pri, "%.0f%%", pct);
-        if (mhz > 0)
-            sfmt(sec, sizeof sec, "%.1fG", mhz / 1000.0);
+        *bpct = pct;
+        sfmt(txt, n, "%.0f%%", pct);
+        *ba = 0;
+        *ta = pct_attr(pct);
     }
+}
+
+/* One per-core cell showing the bars picked in Setup (any combination of
+ * usage, clock speed and temperature), side by side. */
+static void cpu_cell(sys_t *s, int mask, int i, int y, int x, int cw, int idw)
+{
+    cpu_t *c = &s->cpu;
+    int ms[3], k = 0;
+    if (mask & CPUBAR_USAGE)
+        ms[k++] = CPUBAR_USAGE;
+    if (mask & CPUBAR_CLOCK)
+        ms[k++] = CPUBAR_CLOCK;
+    if (mask & CPUBAR_TEMP)
+        ms[k++] = CPUBAR_TEMP;
+    if (!k)
+        ms[k++] = CPUBAR_USAGE;
 
     int avail = cw - (cw >= 20 ? 3 : 1); /* gap to the next column */
-    int show_pri = avail >= idw + 1 + 4 + 5;
-    int show_sec = sec[0] && avail >= idw + 1 + 8 + 5 + 6;
-    int bw = avail - idw - 1 - (show_pri ? 5 : 0) - (show_sec ? 6 : 0);
-    put(y, x, idw, A_GRAY, "%*d", idw, id);
-    if (bw > 0)
-        bar(y, x + idw + 1, bw, bpct, ba);
-    int xx = x + idw + 1 + MAX(bw, 0);
-    if (show_pri) { /* right-aligned by display columns ("54°" is 3 columns, 4 bytes) */
-        put(y, xx + 5 - utf8_cols(pri), 5, pa, "%s", pri);
-        xx += 5;
+    put(y, x, idw, A_GRAY, "%*d", idw, c->id[i]);
+    int bx = x + idw + 1, rem = avail - idw - 1;
+    double bp;
+    char txt[16];
+    attr_t ba, ta;
+
+    if (k == 1) { /* one bar + its value, and a grey hint (clock or usage) */
+        cpu_metric(s, ms[0], i, &bp, txt, sizeof txt, &ba, &ta);
+        char sec[16] = "";
+        if (ms[0] == CPUBAR_USAGE) {
+            if (c->mhz[i] > 0)
+                sfmt(sec, sizeof sec, "%.1fG", c->mhz[i] / 1000.0);
+        } else {
+            sfmt(sec, sizeof sec, "%.0f%%", c->pct[i]);
+        }
+        int show_t = rem >= 4 + 5, show_s = sec[0] && rem >= 8 + 5 + 6;
+        int bw = rem - (show_t ? 5 : 0) - (show_s ? 6 : 0);
+        if (bw > 0)
+            bar(y, bx, bw, bp, ba);
+        int xx = bx + MAX(bw, 0);
+        if (show_t) { /* right-aligned by display columns ("54°" is 3 columns, 4 bytes) */
+            put(y, xx + 5 - utf8_cols(txt), 5, ta, "%s", txt);
+            xx += 5;
+        }
+        if (show_s)
+            put(y, xx + 6 - utf8_cols(sec), 6, A_GRAY, "%s", sec);
+        return;
     }
-    if (show_sec)
-        put(y, xx + 6 - utf8_cols(sec), 6, A_GRAY, "%s", sec);
+    int sw = rem / k; /* one slot per metric: bar + 5-column value */
+    for (int j = 0; j < k; j++) {
+        cpu_metric(s, ms[j], i, &bp, txt, sizeof txt, &ba, &ta);
+        int sx = bx + j * sw, gap = j < k - 1 ? 2 : 0;
+        int bw = sw - 5 - gap;
+        if (bw >= 2)
+            bar(y, sx, bw, bp, ba);
+        else
+            bw = 0;
+        put(y, sx + bw + 5 - utf8_cols(txt), 5, ta, "%s", txt);
+    }
 }
 
 static int cpu_need(sys_t *s, ui_state_t *u, int w)
 {
-    return 4 + MIN(cpu_rows(w - 4, s->cpu.ncpu, g_core_max), g_core_max);
+    return 4 + MIN(cpu_rows(w - 4, s->cpu.ncpu, g_core_max, nbits(u->lay.cpu_bars)), g_core_max);
 }
 
 static void panel_cpu(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
@@ -127,10 +167,11 @@ static void panel_cpu(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
     app(info, sizeof info, "%s", c->model);
     if (c->threads)
         app(info, sizeof info, "%s%dC/%dT", SEP, c->cores, c->threads);
-    if (u->lay.cpu_bars == CPUBAR_CLOCK)
-        app(info, sizeof info, "%sbars: clock", SEP);
-    else if (u->lay.cpu_bars == CPUBAR_TEMP)
-        app(info, sizeof info, "%sbars: temperature", SEP);
+    if (u->lay.cpu_bars != CPUBAR_USAGE) {
+        char bd[48];
+        cpubar_desc(u->lay.cpu_bars, bd, sizeof bd);
+        app(info, sizeof info, "%sbars: %s", SEP, bd);
+    }
     box_(y, x, h, w, "CPU", info);
     int ix = x + 2, iw = w - 4, iy = y + 1, ih = h - 2, r = 0;
     if (ih <= 0 || iw <= 10)
@@ -178,13 +219,14 @@ static void panel_cpu(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
 
     /* cores at the bottom, history graph fills what is left */
     int avail_rows = ih - r;
-    int rows_total = cpu_rows(iw, c->ncpu, crows);
+    int k = nbits(u->lay.cpu_bars);
+    int rows_total = cpu_rows(iw, c->ncpu, crows, k);
     int rows_vis = MIN(rows_total, avail_rows);
     int gh = avail_rows - rows_vis;
     if (gh > 0)
         graph(iy + r, ix, gh, iw, &s->h_cpu, 100, 0, 0);
     int cy = iy + r + MAX(gh, 0);
-    int cols = cpu_cols(iw, c->ncpu, crows);
+    int cols = cpu_cols(iw, c->ncpu, crows, k);
     int cw = iw / cols, maxid = 0;
     for (int i = 0; i < c->ncpu; i++)
         maxid = MAX(maxid, c->id[i]);
@@ -284,7 +326,7 @@ static void panel_gpu(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
                 sfmt(v, sizeof v, "%.0f/%.0f MHz", g->clk_mhz, g->clk_max_mhz);
             else
                 sfmt(v, sizeof v, "?/%.0f MHz", g->clk_max_mhz);
-            meter(iy + r++, ix, iw, "Clock", 6, cpct, v, 15, g_lay->color_mode == COLOR_GRADIENT ? 0 : CP(C_INFO));
+            meter(iy + r++, ix, iw, "Clock", 6, cpct, v, 15, gradient_on() ? 0 : CP(C_IN));
         }
         if (r < ih)
             gpu_details(iy + r++, ix, iw, g);
@@ -493,9 +535,9 @@ static void panel_disk(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         fmt_rate(d->rd_bps, a, sizeof a);
         fmt_rate(d->wr_bps, b, sizeof b);
         xx += put(iy + r, xx, xm - xx, A_GRAY, "R ");
-        xx += put(iy + r, xx, xm - xx, d->rd_bps > 0 ? CP(C_INFO) | A_BOLD : A_GRAY, "%7s", a);
+        xx += put(iy + r, xx, xm - xx, d->rd_bps > 0 ? CP(C_IN) | A_BOLD : A_GRAY, "%7s", a);
         xx += put(iy + r, xx, xm - xx, A_GRAY, "  W ");
-        xx += put(iy + r, xx, xm - xx, d->wr_bps > 0 ? CP(C_ACC) | A_BOLD : A_GRAY, "%7s", b);
+        xx += put(iy + r, xx, xm - xx, d->wr_bps > 0 ? CP(C_OUT) | A_BOLD : A_GRAY, "%7s", b);
         if (xm - xx >= 6)
             xx += put(iy + r, xx, xm - xx, pct_attr(d->util), " %4.0f%%", d->util);
         if (xm - xx >= 14) {
@@ -504,7 +546,7 @@ static void panel_disk(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         }
     }
     if (r < ih)
-        dual_graph(iy + r, ix, ih - r, iw, &s->h_dr, &s->h_dw, CP(C_INFO), CP(C_ACC), "R", "W");
+        dual_graph(iy + r, ix, ih - r, iw, &s->h_dr, &s->h_dw, CP(C_IN), CP(C_OUT), "R", "W");
 }
 
 static int net_pick(sys_t *s, int *idx, int max)
@@ -554,16 +596,16 @@ static void panel_net(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         fmt_rate(f->rx_bps, a, sizeof a);
         fmt_rate(f->tx_bps, b, sizeof b);
         xx += put(iy + r, xx, xm - xx, A_GRAY, "%s ", U ? "↓" : "in");
-        xx += put(iy + r, xx, xm - xx, f->rx_bps > 0 ? CP(C_INFO) | A_BOLD : A_GRAY, "%7s", a);
+        xx += put(iy + r, xx, xm - xx, f->rx_bps > 0 ? CP(C_IN) | A_BOLD : A_GRAY, "%7s", a);
         xx += put(iy + r, xx, xm - xx, A_GRAY, "  %s ", U ? "↑" : "out");
-        xx += put(iy + r, xx, xm - xx, f->tx_bps > 0 ? CP(C_ACC) | A_BOLD : A_GRAY, "%7s", b);
+        xx += put(iy + r, xx, xm - xx, f->tx_bps > 0 ? CP(C_OUT) | A_BOLD : A_GRAY, "%7s", b);
         if (f->addr[0] && xm - xx >= (int)strlen(f->addr) + 2)
             put(iy + r, xx, xm - xx, A_GRAY, "  %s", f->addr);
         else if (f->speed > 0 && xm - xx >= 10)
             put(iy + r, xx, xm - xx, A_GRAY, "  %dM", f->speed);
     }
     if (r < ih)
-        dual_graph(iy + r, ix, ih - r, iw, &s->h_rx, &s->h_tx, CP(C_INFO), CP(C_ACC), U ? "↓" : "v", U ? "↑" : "^");
+        dual_graph(iy + r, ix, ih - r, iw, &s->h_rx, &s->h_tx, CP(C_IN), CP(C_OUT), U ? "↓" : "v", U ? "↑" : "^");
 }
 
 /* ========================================================= Temperatures */
@@ -573,27 +615,6 @@ typedef struct {
     double v, crit;
 } tent_t;
 
-/* "coretemp" -> "CPU", "nvme#2" -> "NVMe 2", ... */
-static void friendly_chip(const char *chip, char *out, size_t n)
-{
-    static const struct {
-        const char *prefix, *name;
-    } map[] = { { "coretemp", "CPU" }, { "k10temp", "CPU" },   { "zenpower", "CPU" },  { "cpu_thermal", "CPU" },
-                { "amdgpu", "GPU" },   { "radeon", "GPU" },    { "nouveau", "GPU" },   { "i915", "GPU" },
-                { "xe", "GPU" },       { "nvme", "NVMe" },     { "acpitz", "ACPI" },   { "pch_", "PCH" },
-                { "iwlwifi", "WiFi" }, { "thinkpad", "ThinkPad" }, { "drivetemp", "Drive" } };
-    const char *nm = chip;
-    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
-        if (!strncmp(chip, map[i].prefix, strlen(map[i].prefix))) {
-            nm = map[i].name;
-            break;
-        }
-    const char *hash = strchr(chip, '#');
-    if (hash && nm != chip)
-        sfmt(out, n, "%s %s", nm, hash + 1);
-    else
-        str_copy(out, n, nm);
-}
 
 static int generic_label(const char *l)
 {
@@ -616,7 +637,7 @@ static int temps_list(sys_t *s, tent_t *T, int max)
         if (t->type != SENS_TEMP || !t->ok || i == S->cpu_idx)
             continue;
         char chip[24];
-        friendly_chip(t->chip, chip, sizeof chip);
+        sensors_chip_name(t->chip, chip, sizeof chip);
         if (!strncmp(t->chip, "coretemp", 8))
             str_copy(T[n].name, sizeof T[n].name, t->label); /* "Core 3" */
         else if (generic_label(t->label) || !strcmp(t->label, "Composite"))
@@ -672,7 +693,7 @@ static void panel_temps(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         put(cy, cx, nw, A_NORMAL, "%s", T[i].name);
         if (bw > 2)
             bar(cy, cx + nw, bw, 100.0 * T[i].v / (T[i].crit > 0 ? T[i].crit : 100.0),
-                g_lay->color_mode == COLOR_GRADIENT ? 0 : temp_attr(T[i].v));
+                gradient_on() ? 0 : bar_temp_attr(T[i].v));
         char v[16];
         sfmt(v, sizeof v, "%.0f%s", T[i].v, DEG);
         put(cy, cx + aw - utf8_cols(v), vw, temp_attr(T[i].v) | A_BOLD, "%s", v);
@@ -698,7 +719,7 @@ static int fans_list(sys_t *s, fent_t *F, int max)
         if (t->type != SENS_FAN || !t->ok)
             continue;
         char chip[24];
-        friendly_chip(t->chip, chip, sizeof chip);
+        sensors_chip_name(t->chip, chip, sizeof chip);
         sfmt(F[n].name, sizeof F[n].name, "%s %s", chip, t->label);
         F[n].v = t->value;
         /* bar scale: the fan's rated max if the driver exposes it,
@@ -759,7 +780,7 @@ static void panel_fans(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
             sfmt(v, sizeof v, "%.0f RPM", F[i].v);
         put(iy + i, ix, nw, A_NORMAL, "%s", F[i].name);
         meter(iy + i, ix + nw, iw - nw, "", 0, 100.0 * F[i].v / F[i].ref, v, 9,
-              F[i].v <= 0 ? A_GRAY : g_lay->color_mode == COLOR_GRADIENT ? 0 : CP(C_INFO));
+              F[i].v <= 0 ? A_GRAY : gradient_on() ? 0 : CP(C_IN));
     }
 }
 

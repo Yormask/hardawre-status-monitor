@@ -115,7 +115,7 @@ static void hw_sensors(sys_t *s, lc_t *c)
             double ref = t->crit > 0 ? t->crit : 100.0;
             int bw = MIN(20, c->x + c->w - xx - 14);
             if (bw > 3) {
-                bar(y, xx + 1, bw, 100.0 * t->value / ref, temp_attr(t->value));
+                bar(y, xx + 1, bw, 100.0 * t->value / ref, gradient_on() ? 0 : bar_temp_attr(t->value));
                 xx += bw + 1;
             }
             if (t->crit > 0)

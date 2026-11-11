@@ -35,42 +35,35 @@ const layout_t *g_lay = &g_default_lay;
 static int g_colors;
 
 const char *const SORT_NAMES[] = { "CPU%", "MEM%", "DISK I/O", "PID", "NAME", "TIME" };
-const char *const VIEW_NAMES[] = { "Dashboard", "Processes", "Hardware", "Setup" };
+const char *const VIEW_NAMES[] = { "Dashboard", "Processes", "Hardware", "Setup", "Logging" };
 
 static const char *const BLK[9] = { " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
 static const char *const HB[8] = { "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };
 
+static void init_colors(void);
+
 /* ================================================================ setup */
 
-void ui_init(int utf8)
+int ui_init(int utf8)
 {
     U = utf8;
     SEP = U ? " · " : " | ";
     DEG = U ? "°C" : "C";
-    initscr();
+    if (!newterm(NULL, stdout, stdin)) /* unlike initscr(), lets us explain a bad $TERM */
+        return -1;
     cbreak();
     noecho();
     nonl();
     keypad(stdscr, TRUE);
     curs_set(0);
-    set_escdelay(25);
+    set_escdelay(100); /* tolerate escape sequences split by slow links (ssh) */
     g_colors = has_colors();
     if (g_colors) {
         start_color();
         use_default_colors();
-        init_pair(C_TITLE, COLOR_CYAN, -1);
-        init_pair(C_BORDER, COLORS >= 16 ? 8 : COLOR_BLUE, -1);
-        init_pair(C_OK, COLOR_GREEN, -1);
-        init_pair(C_WARN, COLOR_YELLOW, -1);
-        init_pair(C_CRIT, COLOR_RED, -1);
-        init_pair(C_GRAY, COLORS >= 16 ? 8 : COLOR_WHITE, -1);
-        init_pair(C_HDR, COLOR_BLACK, COLOR_CYAN);
-        init_pair(C_THEAD, COLOR_BLACK, COLOR_GREEN);
-        init_pair(C_SEL, COLOR_BLACK, COLOR_CYAN);
-        init_pair(C_ACC, COLOR_MAGENTA, -1);
-        init_pair(C_INFO, COLOR_CYAN, -1);
-        init_pair(C_KEY, COLOR_BLACK, COLOR_CYAN);
     }
+    init_colors();
+    return 0;
 }
 
 void ui_end(void)
@@ -80,15 +73,65 @@ void ui_end(void)
 
 /* =============================================================== colours */
 
+/* All colours are the terminal's standard ones, so they follow whatever
+ * colour theme the terminal itself uses. */
+static void init_colors(void)
+{
+    if (!g_colors)
+        return;
+    short gray = COLORS >= 16 ? 8 : COLOR_WHITE;
+    init_pair(C_TITLE, COLOR_CYAN, -1);
+    init_pair(C_BORDER, COLORS >= 16 ? 8 : COLOR_BLUE, -1);
+    init_pair(C_OK, COLOR_GREEN, -1);
+    init_pair(C_WARN, COLOR_YELLOW, -1);
+    init_pair(C_CRIT, COLOR_RED, -1);
+    init_pair(C_GRAY, gray, -1);
+    init_pair(C_HDR, COLOR_BLACK, COLOR_CYAN);
+    init_pair(C_THEAD, COLOR_BLACK, COLOR_GREEN);
+    init_pair(C_SEL, COLOR_BLACK, COLOR_CYAN);
+    init_pair(C_ACC, COLOR_MAGENTA, -1);
+    init_pair(C_INFO, COLOR_CYAN, -1);
+    init_pair(C_KEY, COLOR_BLACK, COLOR_CYAN);
+    init_pair(C_IN, COLOR_CYAN, -1);
+    init_pair(C_OUT, COLOR_MAGENTA, -1);
+    init_pair(C_BLO, COLOR_GREEN, -1);
+    init_pair(C_BMID, COLOR_YELLOW, -1);
+    init_pair(C_BHI, COLOR_RED, -1);
+    init_pair(C_TRACK, gray, -1);
+    init_pair(C_GLO, COLOR_GREEN, -1);
+    init_pair(C_GMID, COLOR_YELLOW, -1);
+    init_pair(C_GHI, COLOR_RED, -1);
+    init_pair(C_SINGLE, COLOR_CYAN, -1);
+}
+
+void colors_sync(const layout_t *l)
+{
+    static int last = -1;
+    if (!g_colors || l->single_color == last)
+        return;
+    last = l->single_color;
+    short c = SINGLE_COLOR[CLAMP(last, 0, SINGLE_COUNT - 1)];
+    if (c >= 8 && COLORS < 16) /* no bright colours: use the normal one */
+        c = (short)(c - 8);
+    init_pair(C_SINGLE, c, -1);
+}
+
 static int mono(void)
 {
     return !g_colors || g_lay->color_mode == COLOR_MONO;
+}
+
+int gradient_on(void)
+{
+    return !mono() && g_lay->color_mode == COLOR_GRADIENT;
 }
 
 attr_t cp(int n)
 {
     if (mono()) /* keep bars/highlights readable without colour */
         return (n == C_HDR || n == C_THEAD || n == C_SEL || n == C_KEY) ? A_REVERSE : 0;
+    if (g_lay->color_mode == COLOR_SINGLE && (n == C_IN || n == C_OUT)) /* clock bars, I/O graphs */
+        return COLOR_PAIR(C_SINGLE);
     return COLOR_PAIR(n);
 }
 
@@ -99,12 +142,13 @@ attr_t gray_attr(void)
     return COLOR_PAIR(C_GRAY) | (COLORS < 16 ? A_DIM : 0);
 }
 
+/* text colours (values, statuses) */
 attr_t pct_attr(double p)
 {
     if (mono())
         return p >= 85 ? A_BOLD : A_NORMAL;
     if (g_lay->color_mode == COLOR_SINGLE)
-        return COLOR_PAIR(C_INFO);
+        return COLOR_PAIR(C_SINGLE);
     return COLOR_PAIR(p >= 85 ? C_CRIT : p >= 60 ? C_WARN : C_OK);
 }
 
@@ -113,8 +157,32 @@ attr_t temp_attr(double t)
     if (mono())
         return t >= 85 ? A_BOLD : A_NORMAL;
     if (g_lay->color_mode == COLOR_SINGLE)
-        return COLOR_PAIR(C_INFO);
+        return COLOR_PAIR(C_SINGLE);
     return COLOR_PAIR(t >= 85 ? C_CRIT : t >= 70 ? C_WARN : C_OK);
+}
+
+/* bar and graph colours */
+attr_t bar_attr(double p)
+{
+    if (mono())
+        return p >= 85 ? A_BOLD : A_NORMAL;
+    if (g_lay->color_mode == COLOR_SINGLE)
+        return COLOR_PAIR(C_SINGLE);
+    return COLOR_PAIR(p >= 85 ? C_BHI : p >= 60 ? C_BMID : C_BLO);
+}
+
+attr_t bar_temp_attr(double t)
+{
+    return bar_attr(t >= 85 ? 100 : t >= 70 ? 70 : 0);
+}
+
+attr_t graph_attr(double p)
+{
+    if (mono())
+        return p >= 85 ? A_BOLD : A_NORMAL;
+    if (g_lay->color_mode == COLOR_SINGLE)
+        return COLOR_PAIR(C_SINGLE);
+    return COLOR_PAIR(p >= 85 ? C_GHI : p >= 60 ? C_GMID : C_GLO);
 }
 
 /* ================================================================== text */
@@ -226,9 +294,10 @@ void bar(int y, int x, int w, double pct, attr_t a)
         w = COLS - x;
     pct = CLAMP(pct, 0.0, 100.0);
     int style = U ? g_lay->bar_style : BAR_CLASSIC;
-    int grad = !a && g_lay->color_mode == COLOR_GRADIENT && !mono();
+    int grad = !a && gradient_on();
     if (!a)
-        a = pct_attr(pct);
+        a = bar_attr(pct);
+    attr_t track = mono() ? A_DIM : COLOR_PAIR(C_TRACK) | (COLORS < 16 ? A_DIM : 0);
 
     const char *on = "█", *off = "·";
     int bx = x, bw = w;
@@ -263,16 +332,16 @@ void bar(int y, int x, int w, double pct, attr_t a)
     full = MIN(full, bw);
     move(y, bx);
     for (int i = 0; i < full; i++) {
-        attrset(grad ? pct_attr(100.0 * (i + 1) / bw) : a);
+        attrset(grad ? bar_attr(100.0 * (i + 1) / bw) : a);
         addstr(on);
     }
     int used = full;
     if (part > 0 && used < bw) {
-        attrset(grad ? pct_attr(100.0 * (used + 1) / bw) : a);
+        attrset(grad ? bar_attr(100.0 * (used + 1) / bw) : a);
         addstr(HB[part]);
         used++;
     }
-    attrset(A_GRAY);
+    attrset(track);
     for (; used < bw; used++)
         addstr(off);
     attrset(A_NORMAL);
@@ -343,7 +412,7 @@ void graph(int y, int x, int h, int w, const hist_t *hs, double maxv, attr_t fix
         lv = levels(v, maxv, steps);
         double vmax = MAX(v, v2);
         for (int r = 0; r < h; r++) {
-            attr_t a = fixed ? fixed : h <= 2 ? pct_attr(100.0 * vmax / maxv) : pct_attr(100.0 * (r + 0.5) / h);
+            attr_t a = fixed ? fixed : h <= 2 ? graph_attr(100.0 * vmax / maxv) : graph_attr(100.0 * (r + 0.5) / h);
             int yy = flip ? y + r : y + h - 1 - r;
             if (br) {
                 int fl = CLAMP(lv - r * 4, 0, 4), fr = CLAMP(lv2 - r * 4, 0, 4), bits = 0;
