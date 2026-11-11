@@ -1,0 +1,148 @@
+/* main.c - LHS (Linux Hardware Stats): argument parsing and the main loop */
+#define _GNU_SOURCE
+#include "ui.h"
+
+#include <langinfo.h>
+#include <locale.h>
+#include <ncurses.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+static sys_t S; /* big (history buffers, per-CPU arrays): keep it off the stack */
+static volatile sig_atomic_t g_quit;
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_quit = 1;
+}
+
+static void usage(FILE *f)
+{
+    fprintf(f,
+            "LHS %s - Linux Hardware Stats\n"
+            "Live monitor for CPU, GPU, memory, power, disk and network activity.\n\n"
+            "Usage: lhs [options]\n"
+            "  -d, --delay SEC   refresh interval in seconds (default 1, min 0.1)\n"
+            "  -1, --once        print one plain-text snapshot and exit\n"
+            "  -n, --top N       processes listed by --once (default 15)\n"
+            "  -a, --ascii       draw with plain ASCII instead of Unicode\n"
+            "  -h, --help        show this help\n"
+            "  -v, --version     show version\n\n"
+            "Keys: 1/2/3 views, c/m/d/p/n/t sort, / filter, k kernel threads,\n"
+            "      +/- interval, space pause, ? help, q quit\n\n"
+            "Run as root (sudo lhs) to see CPU power (RAPL), Intel GPU load and\n"
+            "per-process disk I/O of other users.\n",
+            LHS_VERSION);
+}
+
+static void sleep_sec(double s)
+{
+    struct timespec ts = { (time_t)s, (long)((s - (double)(time_t)s) * 1e9) };
+    while (nanosleep(&ts, &ts) == -1 && !g_quit)
+        ;
+}
+
+int main(int argc, char **argv)
+{
+    double interval = 1.0;
+    int once = 0, ascii = 0, ntop = 15;
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if ((!strcmp(a, "-d") || !strcmp(a, "--delay")) && i + 1 < argc) {
+            interval = atof(argv[++i]);
+        } else if (!strncmp(a, "--delay=", 8)) {
+            interval = atof(a + 8);
+        } else if (!strcmp(a, "-1") || !strcmp(a, "--once")) {
+            once = 1;
+        } else if ((!strcmp(a, "-n") || !strcmp(a, "--top")) && i + 1 < argc) {
+            ntop = atoi(argv[++i]);
+        } else if (!strcmp(a, "-a") || !strcmp(a, "--ascii")) {
+            ascii = 1;
+        } else if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+            usage(stdout);
+            return 0;
+        } else if (!strcmp(a, "-v") || !strcmp(a, "--version")) {
+            printf("lhs %s\n", LHS_VERSION);
+            return 0;
+        } else {
+            fprintf(stderr, "lhs: unknown option '%s'\n\n", a);
+            usage(stderr);
+            return 2;
+        }
+    }
+    if (interval < 0.1)
+        interval = 0.1;
+    if (interval > 60)
+        interval = 60;
+
+    /* Test hooks. secure_getenv() ignores them when lhs runs setuid or with
+     * file capabilities, so they can't be used to read arbitrary files. */
+    const char *e;
+    if ((e = secure_getenv("LHS_SYSFS")) && *e)
+        g_sysfs = e;
+    if ((e = secure_getenv("LHS_PROCFS")) && *e)
+        g_procfs = e;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_signal;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+
+    setlocale(LC_ALL, "");
+    int utf8 = !ascii && !strcmp(nl_langinfo(CODESET), "UTF-8");
+
+    sys_init(&S);
+
+    if (once) {
+        sleep_sec(interval);
+        sys_sample(&S);
+        report_print(&S, ntop);
+        sys_free(&S);
+        return 0;
+    }
+    if (!isatty(STDOUT_FILENO)) {
+        fprintf(stderr, "lhs: stdout is not a terminal (use --once for a text snapshot)\n");
+        sys_free(&S);
+        return 1;
+    }
+
+    sleep_sec(0.25); /* short warm-up so the first frame already shows rates */
+    sys_sample(&S);
+
+    ui_state_t u;
+    memset(&u, 0, sizeof u);
+    u.interval = interval;
+    u.sort = SORT_CPU;
+    ui_init(utf8);
+
+    double next = now_sec() + interval;
+    while (!g_quit) {
+        ui_draw(&S, &u);
+        double now = now_sec();
+        int ms = (int)((next - now) * 1000.0);
+        timeout(ms < 0 ? 0 : ms);
+        int ch = getch();
+        if (ch != ERR && ch != KEY_RESIZE && !ui_key(&u, ch))
+            break;
+        now = now_sec();
+        if (next > now + u.interval) /* interval was shortened */
+            next = now + u.interval;
+        if (now >= next) {
+            if (!u.paused)
+                sys_sample(&S);
+            next = now + u.interval;
+        }
+    }
+
+    ui_end();
+    sys_free(&S);
+    return 0;
+}
