@@ -1,0 +1,18 @@
+
+# Build output (make / make debug)
+/build/
+/lhs
+*.o
+ 
+# Core dumps and valgrind leftovers
+core
+core.[0-9]*
+vgcore.*
+ 
+# Editors and OS files
+*.swp
+*~
+.vscode/
+.idea/
+.DS_Store
+ 
