@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
- * network and processes on Linux
+ * hsm (hardware status monitor) - live monitor for CPU, GPU, memory,
+ * power, disks, network and processes on Linux
  * Copyright (C) 2026  Yormask
  *
  * This program is free software: you can redistribute it and/or modify
@@ -126,7 +126,7 @@ static void nvml_sample(gpu_t *g)
 /* ------------------------------------------------------ PCI name lookup */
 static int pci_name(unsigned vendor, unsigned device, char *out, size_t n)
 {
-    const char *files[] = { secure_getenv("HWSTATS_PCI_IDS"), "/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
+    const char *files[] = { secure_getenv("HSM_PCI_IDS"), "/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
                             "/usr/share/pci.ids", "/usr/local/share/pci.ids" };
     FILE *f = NULL;
     for (size_t i = 0; i < sizeof files / sizeof files[0] && !f; i++)

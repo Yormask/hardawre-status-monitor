@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
- * network and processes on Linux
+ * hsm (hardware status monitor) - live monitor for CPU, GPU, memory,
+ * power, disks, network and processes on Linux
  * Copyright (C) 2026  Yormask
  *
  * This program is free software: you can redistribute it and/or modify
@@ -128,6 +128,24 @@ void cpu_init(cpu_t *c)
     c->cores = npairs ? npairs : threads;
 }
 
+/* Read once per CPU: topology (for per-core temperatures) and max clock. */
+static void cpu_topology(cpu_t *c, int id)
+{
+    char p[PATHBUF];
+    long long v;
+    c->topo_done[id] = 1;
+    c->core_id[id] = c->pkg_id[id] = -1;
+    sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/topology/core_id", g_sysfs, id);
+    if (!read_ll(p, &v))
+        c->core_id[id] = (int)v;
+    sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/topology/physical_package_id", g_sysfs, id);
+    if (!read_ll(p, &v))
+        c->pkg_id[id] = (int)v;
+    sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", g_sysfs, id);
+    if (!read_ll(p, &v) && v > 0)
+        c->mhz_hw[id] = (double)v / 1000.0;
+}
+
 static double jtot(const cpu_jiffies_t *j)
 {
     return j->user + j->nice + j->sys + j->idle + j->iowait + j->irq + j->softirq + j->steal;
@@ -213,6 +231,8 @@ void cpu_sample(cpu_t *c, double dt)
                 c->prev_all = j;
             } else if (n < MAX_CPUS && id >= 0 && id < MAX_CPUS) {
                 c->id[n] = id;
+                if (!c->topo_done[id])
+                    cpu_topology(c, id);
                 c->pct[n] = c->primed ? busy_pct(&c->prev[id], &j) : 0;
                 c->prev[id] = j;
                 n++;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
- * network and processes on Linux
+ * hsm (hardware status monitor) - live monitor for CPU, GPU, memory,
+ * power, disks, network and processes on Linux
  * Copyright (C) 2026  Yormask
  *
  * This program is free software: you can redistribute it and/or modify
@@ -18,13 +18,13 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* collect.h - data collectors for every subsystem hardware-stats monitors.
+/* collect.h - data collectors for every subsystem hsm monitors.
  *
  * Every collector reads directly from /proc and /sys (no external tools, no
  * helper processes), keeps the previous raw counters itself and turns them
  * into rates using the real elapsed time `dt` passed in by the caller. */
-#ifndef HWSTATS_COLLECT_H
-#define HWSTATS_COLLECT_H
+#ifndef HSM_COLLECT_H
+#define HSM_COLLECT_H
 
 #include "util.h"
 #include <sys/types.h>
@@ -43,6 +43,10 @@ typedef struct {
     int id[MAX_CPUS];     /* kernel CPU number of each entry               */
     double pct[MAX_CPUS]; /* busy % per logical CPU                        */
     double mhz[MAX_CPUS]; /* current clock per logical CPU (0 = unknown)   */
+    /* per kernel CPU number (index = id[]): hardware max clock, topology */
+    double mhz_hw[MAX_CPUS];
+    int core_id[MAX_CPUS], pkg_id[MAX_CPUS];
+    unsigned char topo_done[MAX_CPUS];
     double total, user, sys, iowait, steal;
     double mhz_avg, mhz_max;
     double temp_c; /* package temperature, -1 = unknown */
@@ -144,6 +148,7 @@ void procs_init(procs_t *ps);
 void procs_sample(procs_t *ps, double dt, unsigned long long memtotal);
 void procs_free(procs_t *ps);
 const char *proc_cmdline(proc_t *p);
+int proc_send_signal(pid_t pid, unsigned long long start, int sig); /* 0 or errno */
 const char *uid_name(uid_t uid);
 
 /* ------------------------------------------------------ Sensors (hwmon) */
@@ -154,6 +159,7 @@ typedef struct {
     int type, chip_idx, ok;
     char chip[32], label[48], path[PATHBUF];
     double value, crit; /* °C / RPM / W ; crit -1 = none */
+    double peak, fmax;  /* highest value seen; fans: fanN_max if exposed */
 } sensor_t;
 
 typedef struct {
@@ -165,6 +171,7 @@ typedef struct {
 void sensors_init(sensors_t *s);
 void sensors_sample(sensors_t *s);
 double sensors_cpu_temp(const sensors_t *s);
+double sensors_core_temp(const sensors_t *s, int pkg, int core); /* coretemp "Core N", -1 */
 
 /* ------------------------------------------------------------------ GPU */
 #define MAX_GPUS 8
@@ -253,7 +260,7 @@ typedef struct {
     double total_w; /* best whole-machine power estimate, -1 = unknown */
     const char *total_w_src;
 
-    hist_t h_cpu, h_mem, h_gpu[MAX_GPUS], h_dr, h_dw, h_rx, h_tx, h_pw;
+    hist_t h_cpu, h_mem, h_gpu[MAX_GPUS], h_dr, h_dw, h_rx, h_tx, h_pw, h_temp;
     double next_slow;
 } sys_t;
 

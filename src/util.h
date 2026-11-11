@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
- * network and processes on Linux
+ * hsm (hardware status monitor) - live monitor for CPU, GPU, memory,
+ * power, disks, network and processes on Linux
  * Copyright (C) 2026  Yormask
  *
  * This program is free software: you can redistribute it and/or modify
@@ -19,14 +19,15 @@
  */
 
 /* util.h - small helpers shared by every module */
-#ifndef HWSTATS_UTIL_H
-#define HWSTATS_UTIL_H
+#ifndef HSM_UTIL_H
+#define HSM_UTIL_H
 
 #include <stddef.h>
 #include <sys/types.h>
 
-#define APP_NAME "hardware-stats"
-#define APP_VERSION "1.0.0"
+#define APP_NAME "hsm"
+#define APP_LONG_NAME "hardware status monitor"
+#define APP_VERSION "1.1.0"
 #define APP_COPYRIGHT "Copyright (C) 2026 Yormask"
 #define PATHBUF 512
 
@@ -34,8 +35,8 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-/* Roots of the kernel pseudo-filesystems. Overridable with the HWSTATS_SYSFS /
- * HWSTATS_PROCFS environment variables, which is handy for testing against a
+/* Roots of the kernel pseudo-filesystems. Overridable with the HSM_SYSFS /
+ * HSM_PROCFS environment variables, which is handy for testing against a
  * captured or fake tree. */
 extern const char *g_sysfs;
 extern const char *g_procfs;

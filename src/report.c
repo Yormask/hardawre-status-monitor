@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
- * network and processes on Linux
+ * hsm (hardware status monitor) - live monitor for CPU, GPU, memory,
+ * power, disks, network and processes on Linux
  * Copyright (C) 2026  Yormask
  *
  * This program is free software: you can redistribute it and/or modify
@@ -18,7 +18,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* report.c - one-shot plain-text snapshot (hardware-stats --once), handy for scripts,
+/* report.c - one-shot plain-text snapshot (hsm --once), handy for scripts,
  * bug reports and ssh sessions without a full terminal */
 #define _GNU_SOURCE
 #include "ui.h"

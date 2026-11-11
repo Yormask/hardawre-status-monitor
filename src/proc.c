@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
- * network and processes on Linux
+ * hsm (hardware status monitor) - live monitor for CPU, GPU, memory,
+ * power, disks, network and processes on Linux
  * Copyright (C) 2026  Yormask
  *
  * This program is free software: you can redistribute it and/or modify
@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pwd.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -233,6 +234,27 @@ void procs_sample(procs_t *ps, double dt, unsigned long long memtotal)
         free(ps->prev[i].cmdline);
         ps->prev[i].cmdline = NULL;
     }
+}
+
+/* Signal a process, but only if it is still the one that was selected:
+ * between the user's choice and now it may have exited and its PID been
+ * reused by something else. "start" is its start time from /proc/PID/stat. */
+int proc_send_signal(pid_t pid, unsigned long long start, int sig)
+{
+    char path[PATHBUF], buf[2048];
+    if (pid <= 0)
+        return EINVAL;
+    sfmt(path, sizeof path, "%s/%d/stat", g_procfs, (int)pid);
+    if (read_file(path, buf, sizeof buf) <= 0)
+        return ESRCH;
+    char *rp = strrchr(buf, ')');
+    unsigned long long st = 0;
+    if (!rp || !rp[1] ||
+        sscanf(rp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu", &st) != 1)
+        return ESRCH;
+    if (start && st != start)
+        return ESRCH;
+    return kill(pid, sig) == 0 ? 0 : errno;
 }
 
 const char *proc_cmdline(proc_t *p)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
- * network and processes on Linux
+ * hsm (hardware status monitor) - live monitor for CPU, GPU, memory,
+ * power, disks, network and processes on Linux
  * Copyright (C) 2026  Yormask
  *
  * This program is free software: you can redistribute it and/or modify
@@ -44,21 +44,22 @@ static void on_signal(int sig)
 static void usage(FILE *f)
 {
     fprintf(f,
-            "%s %s - live monitor for CPU, GPU, memory, power, disk and network activity\n\n"
+            "%s (%s) %s\nLive monitor for CPU, GPU, memory, power, disk and network activity.\n\n"
             "Usage: %s [options]\n"
-            "  -d, --delay SEC   refresh interval in seconds (default 1, min 0.1)\n"
+            "  -d, --delay SEC   refresh interval in seconds (default: saved setting or 1)\n"
             "  -1, --once        print one plain-text snapshot and exit\n"
             "  -n, --top N       processes listed by --once (default 15)\n"
             "  -a, --ascii       draw with plain ASCII instead of Unicode\n"
             "  -h, --help        show this help\n"
             "  -v, --version     show version\n\n"
-            "Keys: 1/2/3 views, c/m/d/p/n/t sort, / filter, k kernel threads,\n"
-            "      +/- interval, space pause, ? help, q quit\n\n"
+            "Keys: 1-4 views, s setup, x kill, c/m/d/p/n/t sort, / filter,\n"
+            "      b CPU bars, k kernel threads, +/- interval, space pause, ? help, q quit\n\n"
+            "Settings are saved in %s\n\n"
             "Run as root (sudo %s) to see CPU power (RAPL), exact Intel GPU load\n"
             "and per-process disk I/O of other users.\n\n"
             "%s. This program comes with ABSOLUTELY NO WARRANTY.\n"
             "It is free software under the GNU GPL v3 or later; see the LICENSE file.\n",
-            APP_NAME, APP_VERSION, APP_NAME, APP_NAME, APP_COPYRIGHT);
+            APP_NAME, APP_LONG_NAME, APP_VERSION, APP_NAME, config_path(), APP_NAME, APP_COPYRIGHT);
 }
 
 static void sleep_sec(double s)
@@ -70,7 +71,7 @@ static void sleep_sec(double s)
 
 int main(int argc, char **argv)
 {
-    double interval = 1.0;
+    double interval = -1; /* -1: use the saved setting */
     int once = 0, ascii = 0, ntop = 15;
 
     for (int i = 1; i < argc; i++) {
@@ -101,7 +102,7 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    if (interval < 0.1)
+    if (interval != -1 && interval < 0.1)
         interval = 0.1;
     if (interval > 60)
         interval = 60;
@@ -109,9 +110,9 @@ int main(int argc, char **argv)
     /* Test hooks. secure_getenv() ignores them when the program runs setuid or with
      * file capabilities, so they can't be used to read arbitrary files. */
     const char *e;
-    if ((e = secure_getenv("HWSTATS_SYSFS")) && *e)
+    if ((e = secure_getenv("HSM_SYSFS")) && *e)
         g_sysfs = e;
-    if ((e = secure_getenv("HWSTATS_PROCFS")) && *e)
+    if ((e = secure_getenv("HSM_PROCFS")) && *e)
         g_procfs = e;
 
     struct sigaction sa;
@@ -127,7 +128,7 @@ int main(int argc, char **argv)
     sys_init(&S);
 
     if (once) {
-        sleep_sec(interval);
+        sleep_sec(interval > 0 ? interval : 1.0);
         sys_sample(&S);
         report_print(&S, ntop);
         sys_free(&S);
@@ -142,10 +143,11 @@ int main(int argc, char **argv)
     sleep_sec(0.25); /* short warm-up so the first frame already shows rates */
     sys_sample(&S);
 
-    ui_state_t u;
-    memset(&u, 0, sizeof u);
-    u.interval = interval;
-    u.sort = SORT_CPU;
+    static ui_state_t u;
+    config_defaults(&u);
+    config_load(&u); /* ~/.config/hsm/config, if it exists */
+    if (interval > 0)
+        u.interval = interval;
     ui_init(utf8);
 
     double next = now_sec() + interval;
@@ -168,6 +170,8 @@ int main(int argc, char **argv)
     }
 
     ui_end();
+    if (config_changed(&u)) /* remember sort order, interval, CPU bar mode... */
+        config_save(&u);
     sys_free(&S);
     return 0;
 }

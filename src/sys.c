@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
- * network and processes on Linux
+ * hsm (hardware status monitor) - live monitor for CPU, GPU, memory,
+ * power, disks, network and processes on Linux
  * Copyright (C) 2026  Yormask
  *
  * This program is free software: you can redistribute it and/or modify
@@ -148,6 +148,7 @@ void sys_sample(sys_t *s)
         hist_push(&s->h_rx, s->net.rx_bps);
         hist_push(&s->h_tx, s->net.tx_bps);
         hist_push(&s->h_pw, s->total_w > 0 ? s->total_w : 0);
+        hist_push(&s->h_temp, s->cpu.temp_c > 0 ? s->cpu.temp_c : 0);
     }
     s->samples++;
 }

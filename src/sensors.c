@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * hardware-stats - live monitor for CPU, GPU, memory, power, disks,
- * network and processes on Linux
+ * hsm (hardware status monitor) - live monitor for CPU, GPU, memory,
+ * power, disks, network and processes on Linux
  * Copyright (C) 2026  Yormask
  *
  * This program is free software: you can redistribute it and/or modify
@@ -104,6 +104,12 @@ static int scan_chip(sensors_t *S, const char *dir, const char *chip, int chip_i
         sfmt(p, sizeof p, "%s/%s%d_label", dir, prefix[s->type], c[i].num);
         if (read_line(p, s->label, sizeof s->label) || !s->label[0])
             sfmt(s->label, sizeof s->label, "%s%d", prefix[s->type], c[i].num);
+        if (s->type == SENS_FAN) {
+            long long v;
+            sfmt(p, sizeof p, "%s/fan%d_max", dir, c[i].num);
+            if (!read_ll(p, &v) && v > 0)
+                s->fmax = (double)v;
+        }
         if (s->type == SENS_TEMP) {
             long long v;
             sfmt(p, sizeof p, "%s/temp%d_crit", dir, c[i].num);
@@ -210,7 +216,30 @@ void sensors_sample(sensors_t *S)
         case SENS_FAN: s->value = (double)v; break;           /* RPM */
         case SENS_POWER: s->value = (double)v / 1e6; break;   /* microwatt */
         }
+        if (s->value > s->peak)
+            s->peak = s->value;
     }
+}
+
+/* Intel coretemp exposes one "Core N" sensor per physical core; the n-th
+ * coretemp chip belongs to CPU package n. AMD k10temp has no per-core
+ * values, so this returns -1 there. */
+double sensors_core_temp(const sensors_t *S, int pkg, int core)
+{
+    int pk = -1, last = -1;
+    for (int i = 0; i < S->n; i++) {
+        const sensor_t *s = &S->s[i];
+        if (s->type != SENS_TEMP || strncmp(s->chip, "coretemp", 8))
+            continue;
+        if (s->chip_idx != last) {
+            pk++;
+            last = s->chip_idx;
+        }
+        int k;
+        if (pk == (pkg < 0 ? 0 : pkg) && s->ok && sscanf(s->label, "Core %d", &k) == 1 && k == core)
+            return s->value;
+    }
+    return -1;
 }
 
 double sensors_cpu_temp(const sensors_t *S)

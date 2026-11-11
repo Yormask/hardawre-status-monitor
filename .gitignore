@@ -1,5 +1,6 @@
 # Build output (make / make debug)
 /build/
+/hsm
 /hardware-stats
 /lhs
 *.o

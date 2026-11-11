@@ -1,6 +1,6 @@
-# hardware-stats - live hardware and process monitor for Linux
+# hsm (hardware status monitor) - live hardware and process monitor for Linux
 # Copyright (C) 2026  Yormask - GPL-3.0-or-later (see LICENSE)
-BIN     := hardware-stats
+BIN     := hsm
 CC      ?= cc
 PREFIX  ?= /usr/local
 CFLAGS  ?= -O2 -pipe
