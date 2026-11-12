@@ -86,6 +86,10 @@ void mem_sample(mem_t *m, double dt)
                 out = strtoull(line + 8, NULL, 10);
             else if (!strncmp(line, "pgmajfault ", 11))
                 maj = strtoull(line + 11, NULL, 10);
+            else if (!strncmp(line, "oom_kill ", 9)) { /* Linux 4.13+ */
+                m->oom_kill = strtoull(line + 9, NULL, 10);
+                m->oom_ok = 1;
+            }
         }
         long pg = sysconf(_SC_PAGESIZE);
         if (pg <= 0)

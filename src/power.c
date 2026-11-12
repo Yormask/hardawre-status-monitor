@@ -105,7 +105,8 @@ void power_init(power_t *p)
                 battery_t *b = &p->bat[p->nbat++];
                 str_copy(b->name, sizeof b->name, e->d_name);
                 str_copy(b->path, sizeof b->path, dir);
-                b->watts = b->capacity = b->time_left = -1;
+                b->watts = b->capacity = b->time_left = b->health = -1;
+                b->cycles = -1;
             } else if (!strcmp(type, "Mains") && !p->ac_path[0]) {
                 sfmt(p->ac_path, sizeof p->ac_path, "%s/online", dir);
             }
@@ -145,6 +146,15 @@ static void battery_sample(battery_t *b)
         e_now = (double)now * (double)volt / 1e12;
         e_full = (double)full * (double)volt / 1e12;
     }
+    /* wear: what a full charge holds now compared with when it was new */
+    long long des, fl;
+    b->health = -1;
+    if ((battr(b, "energy_full_design", &des) == 0 && battr(b, "energy_full", &fl) == 0) ||
+        (battr(b, "charge_full_design", &des) == 0 && battr(b, "charge_full", &fl) == 0))
+        if (des > 0 && fl > 0)
+            b->health = CLAMP(100.0 * (double)fl / (double)des, 0, 150);
+    b->cycles = battr(b, "cycle_count", &v) == 0 && v > 0 ? (long)v : -1;
+
     b->time_left = -1;
     if (b->watts > 0.1 && e_now >= 0) {
         if (!strcmp(b->status, "Discharging"))

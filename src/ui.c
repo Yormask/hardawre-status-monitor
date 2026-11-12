@@ -48,7 +48,7 @@ static void header(sys_t *s, ui_state_t *u)
     int x = 0;
     x += put(0, x, COLS - x, CP(C_HDR) | A_BOLD, " %s ", APP_NAME);
     x += 1;
-    static const char *const SHORT[VIEW_COUNT] = { "Dash", "Procs", "HW", "Setup", "Log" };
+    static const char *const SHORT[VIEW_COUNT] = { "Dash", "Procs", "HW", "Setup", "Log", "Svc" };
     for (int v = 0; v < VIEW_COUNT; v++) {
         attr_t a = v == u->view ? CP(C_HDR) | A_BOLD : A_GRAY;
         x += put(0, x, COLS - x, a, " %d %s ", v + 1, COLS < 100 ? SHORT[v] : VIEW_NAMES[v]);
@@ -64,11 +64,17 @@ static void header(sys_t *s, ui_state_t *u)
         sfmt(rec, sizeof rec, " %s REC%s ", U ? "●" : "*", r);
     }
     int rw = utf8_cols(rec);
+    /* something wrong right now (throttling, out of memory...): say so in every view */
+    char al[48] = "", what[40];
+    int alvl = health_alert(&s->health, what, sizeof what);
+    if (alvl)
+        sfmt(al, sizeof al, " %s %s ", U ? "⚠" : "!", COLS < 110 ? (alvl > 1 ? "problem" : "warning") : what);
+    int aw = utf8_cols(al);
     time_t t = time(NULL);
     struct tm tm;
     localtime_r(&t, &tm);
     strftime(clock, sizeof clock, "%H:%M:%S", &tm);
-    int cw = (int)strlen(clock), xm = COLS - cw - 2 - (rw ? rw + 1 : 0);
+    int cw = (int)strlen(clock), xm = COLS - cw - 2 - (rw ? rw + 1 : 0) - (aw ? aw + 1 : 0);
     fmt_duration(s->cpu.uptime, up, sizeof up);
     kv(0, &x, xm, A_BOLD, "", "%s", s->host);
     kv(0, &x, xm, A_NORMAL, "", "%s", s->os);
@@ -76,6 +82,9 @@ static void header(sys_t *s, ui_state_t *u)
     kv(0, &x, xm, A_NORMAL, "up", "%s", up);
     if (rw)
         put(0, COLS - cw - 2 - rw, rw, CP(C_CRIT) | A_BOLD | A_REVERSE, "%s", rec);
+    if (aw)
+        put(0, COLS - cw - 2 - (rw ? rw + 1 : 0) - aw, aw,
+            (alvl > 1 ? CP(C_CRIT) : CP(C_WARN)) | A_BOLD | A_REVERSE, "%s", al);
     put(0, COLS - cw - 2, cw + 2, A_BOLD, " %s ", clock);
 }
 
@@ -103,7 +112,7 @@ static void footer(ui_state_t *u)
 
     static const char *const keys[][2] = {
         { "q", "Quit" },     { "?", "Help" },     { "s", "Setup" },       { "l", "Log" },
-        { "L", "Log proc" }, { "x", "Kill" },     { "1-5", "View" },      { "c/m/d/p/n/t", "Sort" },
+        { "L", "Log proc" }, { "x", "Kill" },     { "1-6", "View" },      { "c/m/d/g/o/p/n/t", "Sort" },
         { "/", "Filter" },   { "b", "CPU bars" }, { "k", "Kthreads" },    { "f", "Follow" },
         { "+/-", "Interval" }, { "Spc", "Pause" },
     };
@@ -111,13 +120,18 @@ static void footer(ui_state_t *u)
         { "l", "Start/stop" }, { "Space", "Select" }, { "a", "All" }, { "n", "None" },
         { "i", "Interval" },   { "L", "Log process (view 2)" }, { "q", "Quit" },
     };
+    static const char *const vkeys[][2] = {
+        { "Enter", "Show processes" }, { "c/m/d/n/t", "Sort" }, { "/", "Filter" }, { "Esc", "Clear" },
+        { "1-6", "View" },             { "?", "Help" },         { "q", "Quit" },
+    };
     static const char *const skeys[][2] = {
         { "Up/Dn", "Select" }, { "Enter", "Toggle" }, { "Left/Right", "Column / value" },
         { "[ ]", "Move" },     { "R", "Reset all" },     { "Esc", "Back" },  { "q", "Quit" },
     };
-    const char *const(*k)[2] = u->view == VIEW_SETUP ? skeys : u->view == VIEW_LOG ? lkeys : keys;
+    const char *const(*k)[2] = u->view == VIEW_SETUP ? skeys : u->view == VIEW_LOG ? lkeys : u->view == VIEW_SVC ? vkeys : keys;
     size_t nk = u->view == VIEW_SETUP ? sizeof skeys / sizeof skeys[0]
               : u->view == VIEW_LOG   ? sizeof lkeys / sizeof lkeys[0]
+              : u->view == VIEW_SVC   ? sizeof vkeys / sizeof vkeys[0]
                                       : sizeof keys / sizeof keys[0];
     for (size_t i = 0; i < nk && x < xm; i++) {
         int need = (int)strlen(k[i][0]) + (int)strlen(k[i][1]) + 3;
@@ -131,16 +145,17 @@ static void footer(ui_state_t *u)
 static void help_overlay(void)
 {
     static const char *const L[][2] = {
-        { "1 - 5, Tab", "Dashboard / Processes / Hardware / Setup / Logging" },
+        { "1 - 6, Tab", "Dashboard, Processes, Hardware, Setup, Logging, Services" },
         { "s, F2", "Setup: choose, arrange and style the panels" },
         { "Up Down PgUp PgDn", "move the selection or scroll (Home / End too)" },
         { "l", "start / stop logging sensors to a CSV file" },
         { "L", "start / stop logging the selected process" },
         { "x, F9", "send a signal to (kill) the selected process" },
         { "c m d p n t", "sort: CPU mem I/O PID name time (twice: reverse)" },
+        { "g o", "sort by GPU use / by open files" },
+        { "Enter (6)", "Services: show the processes of the selected one" },
         { "/", "filter by name, command, user or PID (Esc clears)" },
-        { "f", "selection sticks to the process, not the row" },
-        { "k", "show / hide kernel threads" },
+        { "f k", "follow the process, not the row / kernel threads" },
         { "b", "CPU core bars: usage, clock, temperature, or a mix" },
         { "+ -", "slower / faster refresh" },
         { "Space", "pause / resume sampling" },
@@ -156,8 +171,8 @@ static void help_overlay(void)
         put(y + 2 + i, x + 3, 18, CP(C_INFO) | A_BOLD, "%s", L[i][0]);
         put(y + 2 + i, x + 22, w - 25, A_NORMAL, "%s", L[i][1]);
     }
-    put(y + h - 5, x + 3, w - 6, A_GRAY, "Run as root for CPU power (RAPL), exact Intel GPU load and");
-    put(y + h - 4, x + 3, w - 6, A_GRAY, "disk I/O or signals for other users' processes.");
+    put(y + h - 5, x + 3, w - 6, A_GRAY, "Run as root (sudo hsm) for CPU power, exact Intel GPU load, the kernel");
+    put(y + h - 4, x + 3, w - 6, A_GRAY, "log, NVMe drive health and other users' processes.");
     put(y + h - 3, x + 3, w - 6, A_BOLD, "%s (%s)  %s", APP_NAME, APP_LONG_NAME, APP_COPYRIGHT);
     put(y + h - 2, x + 3, w - 6, A_GRAY, "ABSOLUTELY NO WARRANTY. Free software: GPL v3 or later (see LICENSE).");
 }
@@ -285,6 +300,7 @@ void ui_draw(sys_t *s, ui_state_t *u)
     case VIEW_PROCS: draw_procs(s, u, 1, 0, LINES - 2, COLS, 1); break;
     case VIEW_HW: hardware(s, u); break;
     case VIEW_SETUP: setup_view(s, u); break;
+    case VIEW_SVC: services_view(s, u); break;
     }
     footer(u);
     if (u->kill_open)
@@ -306,21 +322,23 @@ static void set_sort(ui_state_t *u, int s)
 
 int ui_key(sys_t *s, ui_state_t *u, int ch)
 {
-    if (u->filter_edit) {
-        size_t len = strlen(u->filter);
+    if (u->filter_edit) { /* typing a filter: processes, or services in view 6 */
+        char *f = u->view == VIEW_SVC ? u->svc_filter : u->filter;
+        size_t cap = u->view == VIEW_SVC ? sizeof u->svc_filter : sizeof u->filter, len = strlen(f);
         if (ch == 27) {
-            u->filter[0] = '\0';
+            f[0] = '\0';
             u->filter_edit = 0;
         } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
             u->filter_edit = 0;
         } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
             if (len)
-                u->filter[len - 1] = '\0';
-        } else if (ch >= 32 && ch < 127 && len + 1 < sizeof u->filter) {
-            u->filter[len] = (char)ch;
-            u->filter[len + 1] = '\0';
+                f[len - 1] = '\0';
+        } else if (ch >= 32 && ch < 127 && len + 1 < cap) {
+            f[len] = (char)ch;
+            f[len + 1] = '\0';
         }
         u->sel_idx = u->scroll = 0;
+        u->svc_sel = u->svc_scroll = 0;
         return 1;
     }
     if (u->kill_open) {
@@ -334,6 +352,8 @@ int ui_key(sys_t *s, ui_state_t *u, int ch)
     if (u->view == VIEW_SETUP && setup_key(u, ch))
         return 1;
     if (u->view == VIEW_LOG && log_view_key(s, u, ch))
+        return 1;
+    if (u->view == VIEW_SVC && ch != '/' && services_key(s, u, ch))
         return 1;
 
     static const double steps[] = { 0.25, 0.5, 1, 2, 3, 5, 10 };
@@ -353,6 +373,7 @@ int ui_key(sys_t *s, ui_state_t *u, int ch)
     case 's':
     case KEY_F(2): u->view = VIEW_SETUP; break;
     case '5': u->view = VIEW_LOG; break;
+    case '6': u->view = VIEW_SVC; break;
     case 'l': log_toggle_system(s, u); break;
     case 'L': log_toggle_process(s, u); break;
     case '\t': u->view = (u->view + 1) % VIEW_COUNT; break;
@@ -378,15 +399,20 @@ int ui_key(sys_t *s, ui_state_t *u, int ch)
     case 'p': set_sort(u, SORT_PID); break;
     case 'n': set_sort(u, SORT_NAME); break;
     case 't': set_sort(u, SORT_TIME); break;
+    case 'g': set_sort(u, SORT_GPU); break;
+    case 'o': set_sort(u, SORT_FILES); break;
     case 'r': u->reverse ^= 1; break;
     case 'k': u->show_kthreads ^= 1; break;
     case 'f': u->follow ^= 1; break;
     case '/':
         u->filter_edit = 1;
-        if (u->view != VIEW_DASH)
+        if (u->view != VIEW_DASH && u->view != VIEW_SVC)
             u->view = VIEW_PROCS;
         break;
-    case 27: u->filter[0] = '\0'; break;
+    case 27:
+        u->filter[0] = '\0';
+        u->svc_path[0] = '\0'; /* processes of one service -> all of them again */
+        break;
     case '+':
     case '=': u->interval = steps[MIN(si + 1, nsteps - 1)]; break;
     case '-':

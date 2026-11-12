@@ -1,9 +1,10 @@
 # hsm — hardware status monitor
 
-A fast, lightweight hardware and process monitor for the Linux terminal, written in C. It shows everything your machine is doing on one screen: CPU, GPU, memory, power draw, disk and network throughput, temperatures, fans, and every process with its CPU, memory and disk I/O. You choose which panels appear, arrange them, and pick how bars and graphs look. Colours are your terminal's standard ones, so they follow your terminal's theme, and you can pick the background, the selection colour and the text colours from them. It can also **log** any sensor, or single processes, to CSV files, so a crash caused by heat or overload can be traced afterwards.
+A fast, lightweight hardware and process monitor for the Linux terminal, written in C. It shows everything your machine is doing on one screen: CPU, GPU, memory, power draw, disk and network throughput, temperatures, fans, voltages, every process with its CPU, memory, disk I/O, GPU use and open files, and every systemd service and container. A **Health** panel watches for the things that come before a crash: thermal throttling, tasks stalling for CPU, memory or disk, out-of-memory kills, PCIe bus errors, NVMe drive wear and errors, and the kernel's own error messages. You choose which panels appear, arrange them, and pick how bars and graphs look. Colours are your terminal's standard ones, so they follow your terminal's theme, and you can pick the background, the selection colour and the text colours from them. It can also **log** any sensor, or single processes, to CSV files, so a crash caused by heat or overload can be traced afterwards.
 
 * **Fast**: reads `/proc` and `/sys` directly. It never spawns helper programs or parses tool output. One full sample of every subsystem takes about 0.3 ms.
-* **Small**: about 250 KB binary, about 4 MB RAM, about 0.1% CPU at a 1 s refresh.
+* **Small**: about 390 KB binary, about 4 MB RAM, about 0.1% CPU at a 1 s refresh.
+* **Health**: throttling, pressure stalls, OOM kills, PCIe errors, NVMe health and kernel errors in one panel, with an alert in the header while something is wrong.
 * **Logging**: record temperatures, load, clocks, power, fans, disk and network to a CSV file, and follow individual processes in their own files. It works from the screen or headless (`hsm --log`).
 * **Customizable**: show, hide and rearrange panels; choose bar style, graph style, colour mode, selection and title colours, and the background. Settings are saved automatically.
 * **No hard dependencies** beyond ncurses. NVIDIA support is loaded at runtime only if the driver is installed.
@@ -16,14 +17,17 @@ A fast, lightweight hardware and process monitor for the Linux terminal, written
 | GPU | load, VRAM, core clock bar, memory clock, temperature, power and power limit, fan | see below |
 | Memory | used/available, cache, shared, dirty, swap usage, swap-in/out rate, major page faults | `/proc/meminfo`, `/proc/vmstat` |
 | Power | CPU package, cores, iGPU (uncore), DRAM, platform (psys), GPU power, battery drain and time left, AC state, estimated total | RAPL powercap, hwmon, `power_supply` |
-| Disk I/O | read/write throughput, IOPS and busy % per physical drive | `/proc/diskstats`, `/sys/block` |
-| Network | download/upload rate per interface, link speed, IPv4 address | `/proc/net/dev`, `/sys/class/net` |
+| Disk I/O | read/write throughput, IOPS, busy % and **time per request** per physical drive | `/proc/diskstats`, `/sys/block` |
+| Network | download/upload rate per interface, link speed, IPv4 address, errors and dropped packets, Wi-Fi signal | `/proc/net/dev`, `/proc/net/wireless` |
 | Temperatures | every temperature sensor (CPU package and each core, NVMe drives, GPU, chipset, Wi-Fi...) with CPU temperature history | `/sys/class/hwmon` |
 | Fans | every fan speed sensor, plus NVIDIA GPU fans | `/sys/class/hwmon`, NVML |
 | Filesystems | used/total for local filesystems | `/proc/self/mounts`, `statvfs` |
-| Processes | PID, user, state, threads, nice, CPU %, MEM %, RSS/VIRT, **disk read/write per process**, CPU time, full command line | `/proc/[pid]/*` |
+| Processes | PID, user, state, threads, nice, CPU %, MEM %, RSS/VIRT, **disk read/write per process**, **GPU % per process**, open files, CPU time, full command line | `/proc/[pid]/*`, DRM fdinfo, NVML |
+| Health | thermal throttling, pressure stalls (CPU / memory / disk), out-of-memory kills, PCIe errors, NVMe drive health, kernel errors, and a list of recent events | see [Health](#health-finding-the-cause-of-a-failure) |
+| Services | CPU, memory, disk I/O and tasks per systemd service, login session, desktop app and container (a panel; the full table is view `6`) | cgroup v2 |
+| Voltages | every voltage the motherboard's sensor chip reports, in red when outside its limits | `/sys/class/hwmon` |
 
-The **Hardware** view (key `3`) lists every sensor, GPU detail, RAPL power domain, drive (with totals since boot), filesystem and network interface.
+The **Hardware** view (key `3`) lists every sensor, GPU detail, RAPL power domain, drive (with totals since boot), filesystem and network interface, plus the full health details, the CPU's power settings (driver, governor, energy preference, turbo, frequency limits, platform profile), how long the CPUs sleep in each idle state, battery wear and charge cycles.
 
 ### GPU support
 
@@ -55,11 +59,13 @@ make
 sudo make install         # installs to /usr/local/bin/hsm
 ```
 
-After installing, run `hsm` from anywhere. Use `sudo hsm` to also see power and exact Intel GPU load, and to signal other users' processes (see [Permissions](#permissions-what-needs-root)).
+After installing, run `hsm` from anywhere. Use `sudo hsm` to also see power, exact Intel GPU load, the kernel log and NVMe drive health, and to signal other users' processes (see [Permissions](#permissions-what-needs-root)).
 
 `make debug` builds with AddressSanitizer and UBSan for development. `make uninstall` removes the installed binary.
 
-**Upgrading from an older version** that was called `lhs` or `hardware-stats`: remove the old binary with `sudo rm -f /usr/local/bin/lhs /usr/local/bin/hardware-stats`.
+**Upgrading from an older version** of hsm: new panels appear where they would be by default (Health below the GPU; Services and Voltages hidden). Your other settings stay as they were.
+
+**Upgrading from a version** that was called `lhs` or `hardware-stats`: remove the old binary with `sudo rm -f /usr/local/bin/lhs /usr/local/bin/hardware-stats`.
 
 ## Usage
 
@@ -83,13 +89,14 @@ Logging without the screen (runs until Ctrl+C, kill, or the logged processes exi
 
 | Key | Action |
 |---|---|
-| `1` `2` `3` `4` `5` / `Tab` | **Dashboard** / **Processes** (full table) / **Hardware** (every sensor and device) / **Setup** / **Logging** |
+| `1` `2` `3` `4` `5` `6` / `Tab` | **Dashboard** / **Processes** (full table) / **Hardware** (every sensor and device) / **Setup** / **Logging** / **Services** |
 | `s` / `F2` | open Setup |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | move the selection, or scroll the Hardware view |
 | `l` | start or stop logging sensors to a CSV file (see [Logging](#logging)) |
 | `L` | start or stop logging the selected process |
 | `x` / `F9` | send a signal to (kill) the selected process |
 | `c` `m` `d` `p` `n` `t` | sort by CPU, memory, disk I/O, PID, name, CPU time. Press the same key again to reverse. |
+| `g` `o` | sort by GPU use, by open files |
 | `r` | reverse the sort |
 | `/` | filter by process name, command line, user or PID (`Enter` keeps it, `Esc` clears it) |
 | `b` | CPU core bars: cycle through usage, clock, temperature and their combinations |
@@ -162,9 +169,9 @@ Any panel with spare height uses it for a history graph.
 Settings live in `~/.config/hsm/config` (or `$XDG_CONFIG_HOME/hsm/config`). It's plain text, so you can also edit it by hand:
 
 ```
-left = cpu, temps, gpu
-right = memory, power, disk, network, fans, filesystems
-hidden = filesystems
+left = cpu, gpu, health
+right = memory, power, disk, network, temps, fans, voltages, services, filesystems
+hidden = filesystems, voltages
 processes = on
 left_width = auto
 bars = blocks          # blocks | squares | line | classic
@@ -193,7 +200,7 @@ hsm saves the file when you change something in Setup, and on exit only if you c
 
 Logs help you find out what happened before a crash, a shutdown or a slowdown: how hot the CPU got, which process was using it, whether a fan stopped, how hard a disk was working. Everything is written as CSV, so you can open the files in LibreOffice Calc, Excel or Google Sheets, or plot them with any tool.
 
-**System log.** Press `5` to open the **Logging** view. It lists every value hsm can record, grouped by CPU, CPU cores, Memory, GPU, Power, Temperatures, Fans, Disks and Network, each with its current reading:
+**System log.** Press `5` to open the **Logging** view. It lists every value hsm can record, grouped by CPU, CPU cores, Health, CPU idle, Memory, GPU, Power, Temperatures, Fans, Voltages, Disks, Network and Events, each with its current reading:
 
 | Key | Action |
 |---|---|
@@ -221,7 +228,9 @@ time,elapsed_s,"CPU total (%)","CPU temperature (C)","Average CPU clock (MHz)","
 2026-11-11 18:08:27,0.0,12.5,54.0,3602,8.0,...
 ```
 
-Process log columns: `time`, `elapsed_s`, `pid`, `state`, CPU (% of one core), memory %, RSS (MB), threads, disk read and write (MB/s), and the whole system's CPU % and CPU temperature next to it, so you can see whether the process was the cause.
+Besides temperatures, fans, load and clocks, the system log can record everything from the Health panel (CPU throttled %, pressure, OOM kills, PCIe errors, NVMe wear / errors / unsafe shutdowns), voltages, disk time per request, network errors and Wi-Fi signal, and CPU idle states and wake-ups. The last column, **Events**, holds the text of anything that happened since the previous row (kernel errors, throttling, an OOM kill...), so the moment of a problem is easy to find in a long log.
+
+Process log columns: `time`, `elapsed_s`, `pid`, `state`, CPU (% of one core), memory %, RSS (MB), threads, disk read and write (MB/s), GPU % and GPU memory (MB), open files, and the whole system's CPU % and CPU temperature next to it, so you can see whether the process was the cause. A steadily climbing open-files count is the classic sign of a file leak.
 
 A value that can't be read at that moment (for example RAPL power without root) is left empty. Every row is written as soon as it is taken, and the file is synced to disk every 5 seconds, so a log survives a crash or power loss with at most the last few seconds missing.
 
@@ -250,6 +259,39 @@ WantedBy=multi-user.target
 
 Each start makes a new file, so old logs are kept; delete the ones you don't need now and then.
 
+## Health: finding the cause of a failure
+
+The **Health** panel (on by default, below the GPU) and the top of the **Hardware** view (`3`) collect the signs that usually come before a freeze, crash or reboot. While something is wrong right now, the header shows an alert (such as **⚠ throttling**) in every view.
+
+| Shown as | What it means | What's normal |
+|---|---|---|
+| **Waiting** CPU / Mem / I/O | The kernel's *pressure stall information* (PSI): the share of time tasks had to wait for the CPU, for memory, or for the disk. This is the best single measure of "the computer is struggling", better than CPU % or load average. The Hardware view also shows the kernel's 10 s / 1 min / 5 min averages and the "full" figure (every task waiting at once). | under 10%. Memory pressure above a few % means it is swapping or reclaiming hard. |
+| **Throttling** | The CPU slowing itself down because it reached its temperature limit, counted by the CPU itself (Intel). Shows "NOW" while it happens, how often since hsm started, and since boot. | none. Some at heavy load on a small case or laptop is common; often means dust, dried thermal paste or a weak fan. |
+| **OOM kills** | Processes the kernel killed because memory ran out (the reason behind apps that "crash for no reason"). | none |
+| **PCIe** | Errors on the PCIe bus, counted per device (AER). Corrected errors are retried by the hardware; uncorrected ones lose data. | none. A slowly growing corrected count points at a failing drive, GPU, riser or slot, or a power problem. |
+| **NVMe** | The drive's own health log: wear used against its rating, spare blocks, media / data integrity errors, unsafe shutdowns (power lost or a crash), hours powered on, time spent too hot. | 0 media errors, wear well below 100%. Unsafe shutdowns go up by one with every crash or power cut. |
+| **Kernel** | Kernel messages about hardware and crashes: I/O errors, file system errors, GPU hangs and resets, machine checks, lockups, segfaults, under-voltage, suspend and resume. | a few harmless firmware (ACPI) complaints at boot |
+| *events* | The latest of all of the above, newest first, with the time. Hsm adds its own: throttling started, memory ran out, new PCIe errors, a temperature reaching its limit, a drive warning, the CPU governor changing. | |
+
+Two of these need root (run `sudo hsm`): the kernel log (most distributions restrict it) and the NVMe health log. Everything else works as a normal user. Throttling counters exist on Intel CPUs; AMD CPUs throttle too but don't report it this way.
+
+All of it can be recorded: see [Logging](#logging), which also writes the events as text into the log, in the row where they happened.
+
+**After a crash**: the last rows of a log show what the machine was doing. Then `journalctl -b -1 -e` shows the end of the previous boot's system log, with the kernel messages from the moment it went down.
+
+## Services and containers
+
+View `6` lists every systemd **service**, login **session**, desktop **app** and **container** (Docker, Podman, Kubernetes, LXC) with its CPU (% of one core, like processes), memory, disk read and write rates, number of tasks, out-of-memory kills, and where it sits in the cgroup tree. Unlike the process list, a service's numbers include all of its processes, so "which service is eating my memory?" has a direct answer.
+
+| Key | Action |
+|---|---|
+| `↑` `↓` `PgUp` `PgDn` `Home` `End` | move |
+| `Enter` | show the processes of the selected service in the process view (`Esc` shows all again) |
+| `c` `m` `d` `n` `t` | sort by CPU, memory, disk I/O, name, tasks (again: reverse) |
+| `/` | filter by name |
+
+The **Services** dashboard panel (off by default; turn it on in Setup) shows the busiest five. This needs cgroup v2, which systemd uses by default since 2021 (Ubuntu 21.10, Debian 11, Fedora 31, Arch). The numbers are only collected while services are on screen.
+
 ## Killing processes
 
 Select a process in the dashboard's process list or the Processes view (`2`), press `x` and choose a signal:
@@ -275,6 +317,9 @@ Most things work as a normal user. A few are restricted by the kernel:
 | Exact Intel GPU engine load | system-wide perf counters need `CAP_PERFMON` or `perf_event_paranoid <= 0` | Run `sudo hsm`, or `sudo setcap cap_perfmon=ep /usr/local/bin/hsm`. Without either, it falls back to the RC6 estimate. |
 | Disk I/O of other users' processes | `/proc/PID/io` is protected like ptrace | Run `sudo hsm`. Your own processes always show I/O. |
 | Signals to other users' processes | normal Unix permissions | Run `sudo hsm`. |
+| Kernel messages | `kernel.dmesg_restrict = 1` on most distributions | Run `sudo hsm`. |
+| NVMe drive health | the drive's device node is root-only | Run `sudo hsm`. |
+| Open files and GPU use of other users' processes | protected like ptrace | Run `sudo hsm`. Your own processes always show them. |
 
 **Making RAPL readable permanently (optional, single-user machines only).** This re-opens the side channel the kernel restriction closes, so only do it on a machine where you are the only user. Create `/etc/tmpfiles.d/hsm-rapl.conf`:
 
@@ -307,8 +352,10 @@ src/cpu.c         /proc/stat, cpufreq, topology, /proc/cpuinfo, load, uptime
 src/mem.c         /proc/meminfo, /proc/vmstat
 src/disk.c        /proc/diskstats (physical drives only), filesystems
 src/net.c         /proc/net/dev, link state, addresses
-src/proc.c        process table, per-process CPU / memory / disk I/O, safe signal sending
-src/sensors.c     hwmon temperatures, fans, power; per-core temperature lookup
+src/proc.c        process table, per-process CPU / memory / disk I/O / GPU (DRM fdinfo) / open files, safe signals
+src/sensors.c     hwmon temperatures, fans, power, voltages; per-core temperature lookup
+src/health.c      throttling, pressure stalls, OOM kills, PCIe AER, NVMe health log, kernel messages, events
+src/cgroup.c      services and containers from the cgroup v2 tree
 src/gpu.c         Intel i915 (perf PMU + RC6), AMD amdgpu, NVIDIA NVML via dlopen, generic hwmon
 src/power.c       RAPL powercap zones, batteries, AC adapter
 src/ui.c          header, footer, help, signal dialog, keys, view switching
@@ -318,6 +365,7 @@ src/ui_procs.c    process table: sorting, filtering, selection
 src/ui_hw.c       Hardware view
 src/ui_setup.c    Setup screen: panels, styles, colours, CPU bars, reset
 src/ui_log.c      Logging view: choose values, start / stop logs, process logs
+src/ui_svc.c      Services view and panel
 src/log.c         logging: the list of values, CSV system and process logs (sudo-safe)
 src/report.c      --once plain-text snapshot
 src/util.c        file reading, formatting, history ring buffer
@@ -327,13 +375,12 @@ Every collector keeps its own previous counters and turns them into rates using 
 
 ### Testing against fake hardware
 
-For development, `HSM_SYSFS`, `HSM_PROCFS` and `HSM_PCI_IDS` point the program at a different `/sys`, `/proc` or `pci.ids`. That lets you test GPU, RAPL, battery, fan and sensor code on machines without that hardware. These variables are ignored when the binary runs setuid or with file capabilities.
+For development, `HSM_SYSFS`, `HSM_PROCFS`, `HSM_DEVFS` and `HSM_PCI_IDS` point the program at a different `/sys`, `/proc`, `/dev` (kernel log, NVMe drives) or `pci.ids`. That lets you test GPU, RAPL, battery, fan and sensor code on machines without that hardware. These variables are ignored when the binary runs setuid or with file capabilities.
 
 ## Ideas for later
 
 * renice processes from the process view
 * tree view of processes
-* per-process GPU usage (DRM fdinfo)
 * Intel `xe` driver and ARM (Mali / Adreno devfreq) GPU load
 * view a saved log as graphs inside hsm
 * JSON output for --once

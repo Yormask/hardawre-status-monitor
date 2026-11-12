@@ -24,7 +24,7 @@
 #include "collect.h"
 #include <stdio.h>
 
-#define MAX_CHAN 256
+#define MAX_CHAN 512
 #define MAX_PLOG 16
 
 /* One loggable value ("channel"): CPU usage, a temperature sensor, a
@@ -58,6 +58,7 @@ typedef struct {
     char path[PATHBUF];
     unsigned long rows;
     double t0, last_row, last_sync;
+    unsigned long ev_seq; /* events up to this one are already in the log */
 
     int nplog;
     plog_t pl[MAX_PLOG];

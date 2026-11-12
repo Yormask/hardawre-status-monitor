@@ -75,7 +75,8 @@ static int scan_chip(sensors_t *S, const char *dir, const char *chip, int chip_i
         else if (match_attr(nm, "power", "_input", &num)) {
             type = SENS_POWER;
             pref = 1;
-        }
+        } else if (match_attr(nm, "in", "_input", &num))
+            type = SENS_VOLT;
         if (type < 0)
             continue;
         c[nc].type = type;
@@ -87,7 +88,7 @@ static int scan_chip(sensors_t *S, const char *dir, const char *chip, int chip_i
     closedir(d);
     qsort(c, (size_t)nc, sizeof *c, cand_cmp);
 
-    static const char *const prefix[] = { "temp", "fan", "power" };
+    static const char *const prefix[] = { "temp", "fan", "power", "in" };
     int added = 0;
     for (int i = 0; i < nc && S->n < MAX_SENSORS; i++) {
         if (i && c[i].type == c[i - 1].type && c[i].num == c[i - 1].num)
@@ -120,6 +121,17 @@ static int scan_chip(sensors_t *S, const char *dir, const char *chip, int chip_i
             }
             if (v > 0 && v < 200000)
                 s->crit = (double)v / 1000.0;
+        }
+        if (s->type == SENS_VOLT) { /* limits set by the BIOS / driver, often unset (0) */
+            long long lo, hi;
+            sfmt(p, sizeof p, "%s/in%d_min", dir, c[i].num);
+            if (!read_ll(p, &lo) && lo > 0)
+                s->lo = (double)lo / 1000.0;
+            sfmt(p, sizeof p, "%s/in%d_max", dir, c[i].num);
+            if (!read_ll(p, &hi) && hi > 0)
+                s->hi = (double)hi / 1000.0;
+            if (s->hi > 0 && s->lo >= s->hi) /* nonsense pair */
+                s->lo = s->hi = 0;
         }
         S->n++;
         added++;
@@ -215,6 +227,7 @@ void sensors_sample(sensors_t *S)
         case SENS_TEMP: s->value = (double)v / 1000.0; break; /* millidegree C */
         case SENS_FAN: s->value = (double)v; break;           /* RPM */
         case SENS_POWER: s->value = (double)v / 1e6; break;   /* microwatt */
+        case SENS_VOLT: s->value = (double)v / 1000.0; break; /* millivolt */
         }
         if (s->value > s->peak)
             s->peak = s->value;

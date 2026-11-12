@@ -66,6 +66,8 @@ void sys_init(sys_t *s)
     sensors_init(&s->sens);
     gpus_init(&s->gpus);
     power_init(&s->power);
+    health_init(&s->health);
+    cpu_power_sample(&s->cpu);
     sys_sample(s); /* primes every counter; rates appear from the next sample */
 }
 
@@ -121,14 +123,18 @@ void sys_sample(sys_t *s)
     procs_sample(&s->procs, dt, s->mem.total);
     sensors_sample(&s->sens);
     gpus_sample(&s->gpus, dt);
+    gpus_proc_sample(&s->gpus, &s->procs);
     power_sample(&s->power, dt);
     s->cpu.temp_c = sensors_cpu_temp(&s->sens);
 
     if (t >= s->next_slow) { /* things that change slowly */
         fs_sample(&s->disks);
         net_addrs(&s->net);
+        cpu_power_sample(&s->cpu);
         s->next_slow = t + 5.0;
     }
+    health_sample(s);
+    svcs_sample(&s->svc);
 
     /* Intel iGPU power = RAPL "uncore" (power plane 1) on client CPUs */
     for (int i = 0; i < s->gpus.n; i++) {
@@ -157,4 +163,6 @@ void sys_free(sys_t *s)
 {
     procs_free(&s->procs);
     gpus_close(&s->gpus);
+    health_close(&s->health);
+    svcs_free(&s->svc);
 }

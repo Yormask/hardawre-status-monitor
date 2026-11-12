@@ -81,8 +81,9 @@ void net_sample(net_t *nt, double dt)
             name++;
         if (!strcmp(name, "lo"))
             continue;
-        unsigned long long rxb, rxp, txb, txp;
-        if (sscanf(colon + 1, "%llu %llu %*u %*u %*u %*u %*u %*u %llu %llu", &rxb, &rxp, &txb, &txp) != 4)
+        unsigned long long rxb, rxp, rxe, rxd, txb, txp, txe, txd;
+        if (sscanf(colon + 1, "%llu %llu %llu %llu %*u %*u %*u %*u %llu %llu %llu %llu", &rxb, &rxp, &rxe, &rxd, &txb,
+                   &txp, &txe, &txd) != 8)
             continue;
         netif_t *f = find_if(nt, name);
         if (!f) {
@@ -96,15 +97,20 @@ void net_sample(net_t *nt, double dt)
             f->is_virtual = !path_exists(path);
             sfmt(path, sizeof path, "%s/class/net/%s/wireless", g_sysfs, name);
             f->wireless = path_exists(path);
+            f->quality = -1;
         }
         f->seen = 1;
         if_link(f);
         if (f->primed && dt > 0) {
             f->rx_bps = rxb >= f->rx_total ? (double)(rxb - f->rx_total) / dt : 0;
             f->tx_bps = txb >= f->tx_total ? (double)(txb - f->tx_total) / dt : 0;
+            f->err_rate = rxe + txe >= f->errors ? (double)(rxe + txe - f->errors) / dt : 0;
+            f->drop_rate = rxd + txd >= f->drops ? (double)(rxd + txd - f->drops) / dt : 0;
         }
         f->rx_total = rxb;
         f->tx_total = txb;
+        f->errors = rxe + txe;
+        f->drops = rxd + txd;
         f->primed = 1;
     }
 
@@ -133,6 +139,42 @@ void net_sample(net_t *nt, double dt)
     }
     nt->rx_bps = phys ? rx : vrx;
     nt->tx_bps = phys ? tx : vtx;
+
+    /* Wi-Fi signal: /proc/net/wireless (link quality out of 70, level in dBm) */
+    int wl = 0;
+    for (int i = 0; i < nt->n; i++)
+        if (nt->i[i].wireless) {
+            nt->i[i].quality = -1;
+            nt->i[i].signal_dbm = 0;
+            wl = 1;
+        }
+    sfmt(path, sizeof path, "%s/net/wireless", g_procfs);
+    if (!wl || read_file_grow(path, &buf, &cap) <= 0)
+        return;
+    cur = buf;
+    lineno = 0;
+    while ((line = next_line(&cur)) != NULL) {
+        if (lineno++ < 2)
+            continue;
+        char *colon = strchr(line, ':');
+        if (!colon)
+            continue;
+        *colon = '\0';
+        char *name = line;
+        while (*name == ' ')
+            name++;
+        double q, lvl;
+        unsigned st;
+        if (sscanf(colon + 1, " %x %lf %lf", &st, &q, &lvl) != 3)
+            continue;
+        netif_t *f = find_if(nt, name);
+        if (!f)
+            continue;
+        if (lvl > 0) /* very old drivers: unsigned, 256-based */
+            lvl -= 256;
+        f->signal_dbm = lvl < 0 ? lvl : 0;
+        f->quality = (int)CLAMP(q * 100.0 / 70.0, 0, 100);
+    }
 }
 
 void net_addrs(net_t *nt)

@@ -27,7 +27,7 @@
 
 #define APP_NAME "hsm"
 #define APP_LONG_NAME "hardware status monitor"
-#define APP_VERSION "1.4.0"
+#define APP_VERSION "1.5.0"
 #define APP_COPYRIGHT "Copyright (C) 2026 Yormask"
 #define PATHBUF 512
 
@@ -40,6 +40,7 @@
  * captured or fake tree. */
 extern const char *g_sysfs;
 extern const char *g_procfs;
+extern const char *g_devfs; /* /dev (HSM_DEVFS): the kernel log and NVMe drives */
 
 /* File reading. All return -1 on failure (errno is preserved). */
 ssize_t read_file(const char *path, char *buf, size_t size);       /* NUL-terminated */

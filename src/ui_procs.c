@@ -22,6 +22,7 @@
 #include "log.h"
 #include "ui_int.h"
 
+#include <dirent.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +33,7 @@
 
 /* ============================================================ Processes */
 
-enum { K_PID, K_USER, K_PRI, K_NI, K_THR, K_S, K_CPU, K_MEM, K_VIRT, K_RSS, K_RD, K_WR, K_TIME, K_CMD };
+enum { K_PID, K_USER, K_PRI, K_NI, K_THR, K_S, K_CPU, K_MEM, K_VIRT, K_RSS, K_RD, K_WR, K_GPU, K_FDS, K_TIME, K_CMD };
 static const struct {
     const char *h;
     int w, right, sort;
@@ -41,6 +42,7 @@ static const struct {
     [K_NI] = { "NI", 3, 1, -1 },           [K_THR] = { "THR", 4, 1, -1 },      [K_S] = { "S", 1, 0, -1 },
     [K_CPU] = { "CPU%", 5, 1, SORT_CPU },  [K_MEM] = { "MEM%", 5, 1, SORT_MEM }, [K_VIRT] = { "VIRT", 6, 1, -1 },
     [K_RSS] = { "RSS", 6, 1, SORT_MEM },   [K_RD] = { "READ/s", 8, 1, SORT_IO }, [K_WR] = { "WRITE/s", 8, 1, SORT_IO },
+    [K_GPU] = { "GPU%", 5, 1, SORT_GPU },  [K_FDS] = { "FILES", 5, 1, SORT_FILES },
     [K_TIME] = { "TIME+", 9, 1, SORT_TIME }, [K_CMD] = { "COMMAND", 0, 0, SORT_NAME },
 };
 
@@ -63,12 +65,65 @@ static int cmp_proc(const void *a, const void *b)
     case SORT_PID: r = (p->pid > q->pid) - (p->pid < q->pid); break;
     case SORT_NAME: r = strcasecmp(p->comm, q->comm); break;
     case SORT_TIME: r = cmp_dbl_desc((double)p->ticks, (double)q->ticks); break;
+    case SORT_GPU: r = cmp_dbl_desc(p->gpu, q->gpu); break;
+    case SORT_FILES: r = cmp_dbl_desc(p->nfds, q->nfds); break;
     }
     if (!r && g_sort != SORT_MEM)
         r = cmp_dbl_desc((double)p->rss, (double)q->rss);
     if (!r)
         r = (p->pid > q->pid) - (p->pid < q->pid);
     return g_rev ? -r : r;
+}
+
+/* ------------------------------------- processes of one service (cgroup) */
+
+static pid_t *g_cgp;
+static int g_ncgp, g_cgcap;
+
+static int cmp_pidv(const void *a, const void *b)
+{
+    pid_t x = *(const pid_t *)a, y = *(const pid_t *)b;
+    return (x > y) - (x < y);
+}
+
+static void cg_collect(const char *dir, int depth)
+{
+    char p[PATHBUF];
+    sfmt(p, sizeof p, "%s/cgroup.procs", dir);
+    FILE *f = fopen(p, "re");
+    if (f) {
+        long v;
+        while (fscanf(f, "%ld", &v) == 1) {
+            if (g_ncgp >= g_cgcap) {
+                int nc = g_cgcap ? g_cgcap * 2 : 256;
+                pid_t *np = realloc(g_cgp, (size_t)nc * sizeof *np);
+                if (!np)
+                    break;
+                g_cgp = np;
+                g_cgcap = nc;
+            }
+            g_cgp[g_ncgp++] = (pid_t)v;
+        }
+        fclose(f);
+    }
+    if (depth >= 8)
+        return;
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL)
+        if (e->d_type == DT_DIR && e->d_name[0] != '.') {
+            char sub[PATHBUF];
+            if (sfmt(sub, sizeof sub, "%s/%s", dir, e->d_name) < (int)sizeof sub)
+                cg_collect(sub, depth + 1);
+        }
+    closedir(d);
+}
+
+static int in_service(pid_t pid)
+{
+    return g_ncgp && bsearch(&pid, g_cgp, (size_t)g_ncgp, sizeof *g_cgp, cmp_pidv) != NULL;
 }
 
 static int proc_match(proc_t *p, const char *f)
@@ -141,6 +196,24 @@ static void cell_text(proc_t *p, int k, long hz, char *o, size_t n, attr_t *a)
         }
         break;
     }
+    case K_GPU:
+        if (p->gpu < 0) {
+            str_copy(o, n, p->kthread ? "" : "-");
+            *a = A_GRAY;
+        } else {
+            sfmt(o, n, "%.1f", p->gpu);
+            *a = p->gpu < 0.05 ? A_GRAY : p->gpu >= 85 ? CP(C_CRIT) | A_BOLD : p->gpu >= 50 ? CP(C_WARN) | A_BOLD : A_BOLD;
+        }
+        break;
+    case K_FDS: /* thousands of open files usually means a leak */
+        if (p->nfds < 0) {
+            str_copy(o, n, p->kthread ? "" : "-");
+            *a = A_GRAY;
+        } else {
+            sfmt(o, n, "%d", p->nfds);
+            *a = p->nfds >= 10000 ? CP(C_CRIT) | A_BOLD : p->nfds >= 1000 ? CP(C_WARN) | A_BOLD : A_NORMAL;
+        }
+        break;
     case K_TIME: fmt_time(p->ticks, hz, o, n); *a = A_GRAY; break;
     default: o[0] = '\0';
     }
@@ -185,19 +258,30 @@ void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full)
         ord = no;
         ocap = nc;
     }
+    g_ncgp = 0;
+    if (u->svc_path[0] && s->svc.root[0]) { /* one service's processes (Enter in view 6) */
+        char dir[PATHBUF];
+        sfmt(dir, sizeof dir, "%s/%s", s->svc.root, u->svc_path);
+        cg_collect(dir, 0);
+        if (g_ncgp > 1)
+            qsort(g_cgp, (size_t)g_ncgp, sizeof *g_cgp, cmp_pidv);
+    }
     int n = 0;
     for (int i = 0; i < ps->n; i++) {
         proc_t *p = &ps->p[i];
-        if (p->kthread && !u->show_kthreads)
+        if (p->kthread && !u->show_kthreads && !u->svc_path[0])
             continue;
         if (!proc_match(p, u->filter))
+            continue;
+        if (u->svc_path[0] && !in_service(p->pid))
             continue;
         ord[n++] = i;
     }
     g_sort = u->sort;
     g_rev = u->reverse;
     g_pa = ps->p;
-    qsort(ord, (size_t)n, sizeof *ord, cmp_proc);
+    if (n > 1)
+        qsort(ord, (size_t)n, sizeof *ord, cmp_proc);
 
     char info[256] = "";
     app(info, sizeof info, "%d tasks, %d thr, %d running", ps->n, ps->threads, ps->running);
@@ -210,6 +294,8 @@ void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full)
         app(info, sizeof info, "%sfollow", SEP);
     if (u->filter[0])
         app(info, sizeof info, "%sfilter \"%s\": %d", SEP, u->filter, n);
+    if (u->svc_path[0])
+        app(info, sizeof info, "%s%s: %d (Esc: all)", SEP, u->svc_name, n);
     if (ps->io_denied && geteuid() != 0)
         app(info, sizeof info, "%sI/O of other users' processes needs root", SEP);
     box_(y, x, h, w, "Processes", info);
@@ -256,17 +342,21 @@ void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full)
     u->scroll = CLAMP(u->scroll, 0, MAX(0, n - rows));
 
     /* choose columns, dropping the least important ones on narrow screens */
-    int cols[16], nc = 0;
+    int cols[20], nc = 0;
+    static int gpu_seen; /* once a GPU client showed up, keep the column */
+    gpu_seen |= ps->gpu_any;
     if (full) {
-        static const int fc[] = { K_PID, K_USER, K_PRI, K_NI, K_THR, K_S, K_CPU, K_MEM, K_VIRT, K_RSS, K_RD, K_WR, K_TIME, K_CMD };
+        static const int fc[] = { K_PID, K_USER, K_PRI, K_NI, K_THR, K_S, K_CPU, K_MEM, K_VIRT, K_RSS, K_RD, K_WR, K_GPU, K_FDS, K_TIME, K_CMD };
         for (size_t i = 0; i < sizeof fc / sizeof fc[0]; i++)
-            cols[nc++] = fc[i];
+            if (fc[i] != K_GPU || gpu_seen)
+                cols[nc++] = fc[i];
     } else {
-        static const int dc[] = { K_PID, K_USER, K_S, K_CPU, K_MEM, K_RSS, K_RD, K_WR, K_TIME, K_CMD };
+        static const int dc[] = { K_PID, K_USER, K_S, K_CPU, K_MEM, K_RSS, K_RD, K_WR, K_GPU, K_TIME, K_CMD };
         for (size_t i = 0; i < sizeof dc / sizeof dc[0]; i++)
-            cols[nc++] = dc[i];
+            if (dc[i] != K_GPU || gpu_seen)
+                cols[nc++] = dc[i];
     }
-    static const int drop[] = { K_PRI, K_VIRT, K_NI, K_TIME, K_THR, K_WR, K_RD, K_USER };
+    static const int drop[] = { K_PRI, K_VIRT, K_FDS, K_NI, K_TIME, K_THR, K_GPU, K_WR, K_RD, K_USER };
     for (size_t d = 0; d < sizeof drop / sizeof drop[0]; d++) {
         int used = 0;
         for (int i = 0; i < nc; i++)

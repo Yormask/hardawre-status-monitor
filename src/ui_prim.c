@@ -34,8 +34,8 @@ static layout_t g_default_lay;
 const layout_t *g_lay = &g_default_lay;
 static int g_colors;
 
-const char *const SORT_NAMES[] = { "CPU%", "MEM%", "DISK I/O", "PID", "NAME", "TIME" };
-const char *const VIEW_NAMES[] = { "Dashboard", "Processes", "Hardware", "Setup", "Logging" };
+const char *const SORT_NAMES[] = { "CPU%", "MEM%", "DISK I/O", "PID", "NAME", "TIME", "GPU%", "FILES" };
+const char *const VIEW_NAMES[] = { "Dashboard", "Processes", "Hardware", "Setup", "Logging", "Services" };
 
 static const char *const BLK[9] = { " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
 static const char *const HB[8] = { "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };

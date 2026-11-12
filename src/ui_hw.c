@@ -122,9 +122,127 @@ static void hw_sensors(sys_t *s, lc_t *c)
                 put(y, xx + 1, c->x + c->w - xx - 1, A_GRAY, "crit %.0f%s", t->crit, DEG);
         } else if (t->type == SENS_FAN) {
             put(y, xx, c->w - lw - 2, A_BOLD, "%5.0f RPM", t->value);
+        } else if (t->type == SENS_VOLT) {
+            int bad = (t->hi > 0 && t->value > t->hi) || (t->lo > 0 && t->value < t->lo);
+            xx += put(y, xx, 10, bad ? CP(C_CRIT) | A_BOLD : A_BOLD, "%7.3f V", t->value);
+            if (t->lo > 0 || t->hi > 0)
+                put(y, xx + 2, c->x + c->w - xx - 2, A_GRAY, "range %.2f - %.2f V", t->lo, t->hi);
         } else {
             put(y, xx, c->w - lw - 2, CP(C_WARN) | A_BOLD, "%6.2f W", t->value);
         }
+    }
+}
+
+static void hw_health(sys_t *s, lc_t *c)
+{
+    health_t *H = &s->health;
+    char a[24], b[24];
+    lc_title(c, "Health");
+
+    /* pressure stall information */
+    if (H->psi[0].ok) {
+        lc_text(c, A_GRAY, "%-16s %6s %6s %6s %6s   %-21s", "Waiting (PSI)", "now", "10s", "1min", "5min", "all tasks at once");
+        static const char *const nm[3] = { "  CPU", "  Memory", "  Disk I/O" };
+        for (int i = 0; i < 3; i++) {
+            psi_t *p = &H->psi[i];
+            char full[64] = "";
+            if (i && p->has_full)
+                sfmt(full, sizeof full, "%5.1f%% %5.1f%% %5.1f%%", p->full, p->favg10, p->favg60);
+            int y = lc_row(c);
+            if (y < 0)
+                continue;
+            int xx = c->x;
+            xx += put(y, xx, 16, CP(C_INFO), "%-16s ", nm[i]);
+            xx += put(y, xx, c->x + c->w - xx, pct_attr(p->some >= 25 ? 100 : p->some >= 10 ? 70 : 0) | A_BOLD, "%5.1f%% ", p->some);
+            xx += put(y, xx, c->x + c->w - xx, A_NORMAL, "%5.1f%% %5.1f%% %5.1f%%   ", p->avg10, p->avg60, p->avg300);
+            put(y, xx, c->x + c->w - xx, A_GRAY, "%s", full);
+        }
+        lc_text(c, A_GRAY, "  share of time tasks had to wait; 10%% or more is noticeable");
+    } else {
+        lc_kv(c, "Waiting (PSI)", A_GRAY, "%s", "not available: needs Linux 4.20+ with PSI enabled");
+    }
+
+    /* thermal throttling */
+    if (H->thr_ok) {
+        unsigned long long all = H->thr_count + H->core_count, since = all - H->thr_start;
+        double now = (double)time(NULL);
+        attr_t at = H->thr_last > 0 && now - H->thr_last < 10 ? CP(C_CRIT) | A_BOLD : since ? CP(C_WARN) | A_BOLD : A_BOLD;
+        lc_kv(c, "Throttling", at, "%llu since boot (%.1f s in total)%s", all, H->thr_ms / 1000.0,
+              since ? "" : ", none since start");
+        if (since && H->thr_last > 0 && now - H->thr_last < 10)
+            lc_kv(c, "", at, "%llu since hsm started, NOW (%.0f%% of the time)", since, H->thr_pct);
+        else if (since)
+            lc_kv(c, "", at, "%llu since hsm started", since);
+        for (int i = 0; i < H->nthr && H->nthr > 1; i++)
+            lc_kv(c, "", A_GRAY, "package %d: %llu times, %.1f s", H->thr[i].pkg, H->thr[i].count, (double)H->thr[i].ms / 1000.0);
+        lc_text(c, A_GRAY, "  the CPU slows itself down when it reaches its temperature limit");
+    } else {
+        lc_kv(c, "Throttling", A_GRAY, "%s", "not reported by this CPU (Intel only)");
+    }
+
+    if (s->mem.oom_ok) {
+        unsigned long long since = s->mem.oom_kill - H->oom_start;
+        lc_kv(c, "OOM kills", since ? CP(C_CRIT) | A_BOLD : s->mem.oom_kill ? CP(C_WARN) : A_BOLD,
+              "%llu since boot, %llu since hsm started", s->mem.oom_kill, since);
+    }
+    if (H->aer_ok) {
+        attr_t pa = H->pci_nonfatal + H->pci_fatal ? CP(C_CRIT) | A_BOLD : H->pci_cor ? CP(C_WARN) : A_BOLD;
+        lc_kv(c, "PCIe errors", pa, "%llu corrected, %llu non-fatal, %llu fatal since boot", H->pci_cor,
+              H->pci_nonfatal, H->pci_fatal);
+        for (int i = 0; i < H->npci; i++)
+            lc_kv(c, "", A_GRAY, "%s %s: %llu / %llu / %llu", H->pci[i].dev, H->pci[i].name, H->pci[i].cor,
+                  H->pci[i].nonfatal, H->pci[i].fatal);
+    } else {
+        lc_kv(c, "PCIe errors", A_GRAY, "%s", "not reported (no AER on this machine)");
+    }
+    if (H->files_max) {
+        fmt_si((double)H->files, a, sizeof a);
+        lc_kv(c, "Open files", A_NORMAL, "%s handles in use (whole system)", a);
+    }
+
+    /* NVMe drive health */
+    for (int i = 0; i < H->nnvme; i++) {
+        nvme_t *v = &H->nvme[i];
+        char k[32];
+        sfmt(k, sizeof k, "Drive %s", v->name);
+        if (v->state != 1) {
+            lc_kv(c, k, A_GRAY, "%s: health %s", v->model[0] ? v->model : "NVMe",
+                  v->state == -1 ? "needs root (sudo hsm)" : "not available");
+            continue;
+        }
+        lc_kv(c, k, v->crit || v->media_err ? CP(C_CRIT) | A_BOLD : CP(C_OK) | A_BOLD, "%s: %s", v->model,
+              v->crit ? "WARNING" : v->media_err ? "media errors" : "OK");
+        if (v->crit)
+            lc_kv(c, "", CP(C_CRIT) | A_BOLD, "%s%s%s%s", v->crit & 1 ? "spare low  " : "", v->crit & 2 ? "temperature  " : "",
+                  v->crit & 4 ? "reliability degraded  " : "", v->crit & 8 ? "read-only  " : "");
+        lc_kv(c, "", v->used >= 90 ? CP(C_WARN) : A_NORMAL, "%d%% of rated wear used, spare %d%% (warns below %d%%)",
+              v->used, v->spare, v->spare_thr);
+        fmt_bytes(v->written_b, a, sizeof a);
+        fmt_bytes(v->read_b, b, sizeof b);
+        lc_kv(c, "", A_NORMAL, "%llu h powered on, %llu power cycles", v->hours, v->cycles);
+        lc_kv(c, "", A_NORMAL, "%s written, %s read, now %.0f%s", a, b, v->temp_c, DEG);
+        lc_kv(c, "", v->media_err ? CP(C_CRIT) | A_BOLD : v->unsafe ? A_NORMAL : A_GRAY,
+              "%llu unsafe shutdowns, %llu media errors, %llu logged errors", v->unsafe, v->media_err, v->err_log);
+        if (v->warn_min || v->crit_min)
+            lc_kv(c, "", CP(C_WARN), "%llu min above its warning temperature, %llu min above critical", v->warn_min,
+                  v->crit_min);
+    }
+
+    /* kernel messages and other events */
+    if (H->kmsg == 1)
+        lc_kv(c, "Kernel log", H->kmsg_err ? CP(C_WARN) | A_BOLD : A_BOLD, "%u errors, %u warnings since boot",
+              H->kmsg_err, H->kmsg_warn);
+    else
+        lc_kv(c, "Kernel log", A_GRAY, "%s", H->kmsg == -1 ? "needs root (sudo hsm)" : "not available");
+    if (!H->nev) {
+        lc_text(c, A_GRAY, "  no events");
+        return;
+    }
+    lc_text(c, A_GRAY, "Events, newest first:");
+    for (int i = 0; i < H->nev && i < 40; i++) {
+        int y = lc_row(c);
+        if (y >= 0)
+            event_line(y, c->x + 2, c->w - 2, health_event_at(H, i));
     }
 }
 
@@ -218,6 +336,11 @@ static void hw_power(sys_t *s, lc_t *c)
               tl[0] ? ", " : "", tl);
         if (b->watts >= 0)
             lc_kv(c, "  Rate", CP(C_WARN) | A_BOLD, "%.2f W", b->watts);
+        if (b->health >= 0)
+            lc_kv(c, "  Health", b->health < 60 ? CP(C_CRIT) | A_BOLD : b->health < 80 ? CP(C_WARN) : A_BOLD,
+                  "%.0f%% of its original capacity%s", b->health, b->health < 80 ? " (worn)" : "");
+        if (b->cycles >= 0)
+            lc_kv(c, "  Charge cycles", A_NORMAL, "%ld", b->cycles);
     }
     if (p->ac_online >= 0)
         lc_kv(c, "AC adapter", A_BOLD, "%s", p->ac_online ? "online" : "offline");
@@ -225,38 +348,79 @@ static void hw_power(sys_t *s, lc_t *c)
 
 static void hw_system(sys_t *s, lc_t *c)
 {
-    cpu_t *cp = &s->cpu;
+    cpu_t *cv = &s->cpu;
     mem_t *m = &s->mem;
     char a[24], b[24], d[24];
     lc_title(c, "System");
     lc_kv(c, "Host", A_BOLD, "%s", s->host);
     lc_kv(c, "OS", A_NORMAL, "%s", s->os);
     lc_kv(c, "Kernel", A_NORMAL, "%s (%s)", s->kernel, s->arch);
-    fmt_duration(cp->uptime, a, sizeof a);
+    fmt_duration(cv->uptime, a, sizeof a);
     lc_kv(c, "Uptime", A_NORMAL, "%s", a);
-    lc_kv(c, "Load average", A_BOLD, "%.2f  %.2f  %.2f", cp->load[0], cp->load[1], cp->load[2]);
+    lc_kv(c, "Load average", A_BOLD, "%.2f  %.2f  %.2f", cv->load[0], cv->load[1], cv->load[2]);
     lc_kv(c, "Tasks", A_NORMAL, "%d processes, %d threads, %d running, %d blocked", s->procs.n, s->procs.threads,
           s->procs.running, s->procs.diskwait);
-    fmt_si(cp->ctxt_rate, a, sizeof a);
-    fmt_si(cp->intr_rate, b, sizeof b);
-    fmt_si(cp->fork_rate, d, sizeof d);
+    fmt_si(cv->ctxt_rate, a, sizeof a);
+    fmt_si(cv->intr_rate, b, sizeof b);
+    fmt_si(cv->fork_rate, d, sizeof d);
     lc_kv(c, "Activity", A_NORMAL, "%s ctx switches/s, %s interrupts/s, %s forks/s", a, b, d);
 
     lc_title(c, "CPU");
-    lc_kv(c, "Model", A_BOLD, "%s", cp->model);
-    lc_kv(c, "Topology", A_NORMAL, "%d cores, %d threads (%d online)", cp->cores, cp->threads, cp->ncpu);
-    lc_kv(c, "Usage", A_NORMAL, "%.1f%%  (user %.1f%%, system %.1f%%, iowait %.1f%%, steal %.1f%%)", cp->total,
-          cp->user, cp->sys, cp->iowait, cp->steal);
-    if (cp->mhz_avg > 0)
-        lc_kv(c, "Clock", A_NORMAL, "avg %.0f MHz, max %.0f MHz", cp->mhz_avg, cp->mhz_max);
-    if (cp->temp_c >= 0)
-        lc_kv(c, "Temperature", temp_attr(cp->temp_c) | A_BOLD, "%.1f%s", cp->temp_c, DEG);
-    if (cp->mhz_avg > 0) {
+    lc_kv(c, "Model", A_BOLD, "%s", cv->model);
+    lc_kv(c, "Topology", A_NORMAL, "%d cores, %d threads (%d online)", cv->cores, cv->threads, cv->ncpu);
+    lc_kv(c, "Usage", A_NORMAL, "%.1f%%  (user %.1f%%, system %.1f%%, iowait %.1f%%, steal %.1f%%)", cv->total,
+          cv->user, cv->sys, cv->iowait, cv->steal);
+    if (cv->mhz_avg > 0)
+        lc_kv(c, "Clock", A_NORMAL, "avg %.0f MHz, max %.0f MHz", cv->mhz_avg, cv->mhz_max);
+    if (cv->temp_c >= 0)
+        lc_kv(c, "Temperature", temp_attr(cv->temp_c) | A_BOLD, "%.1f%s", cv->temp_c, DEG);
+    if (cv->driver[0] || cv->governor[0]) {
+        char pw[256] = "";
+        app(pw, sizeof pw, "%s", cv->driver[0] ? cv->driver : "?");
+        if (cv->pstate[0])
+            app(pw, sizeof pw, " (%s)", cv->pstate);
+        if (cv->governor[0])
+            app(pw, sizeof pw, "%sgovernor %s", SEP, cv->governor);
+        lc_kv(c, "Power settings", A_NORMAL, "%s", pw);
+        pw[0] = '\0';
+        if (cv->epp[0])
+            lc_kv(c, "", A_NORMAL, "energy preference %s", cv->epp);
+        if (cv->turbo >= 0)
+            app(pw, sizeof pw, "turbo %s", cv->turbo ? "on" : "OFF");
+        if (cv->lim_max > 0)
+            app(pw, sizeof pw, "%slimits %.0f-%.0f MHz", pw[0] ? SEP : "", cv->lim_min, cv->lim_max);
+        if (cv->profile[0])
+            app(pw, sizeof pw, "%sprofile %s", pw[0] ? SEP : "", cv->profile);
+        int capped = cv->lim_max > 0 && cv->hw_max > 0 && cv->lim_max < cv->hw_max - 1;
+        if (pw[0])
+            lc_kv(c, "", capped || cv->turbo == 0 ? CP(C_WARN) : A_NORMAL, "%s%s", pw,
+                  capped ? "  (below what the CPU can do)" : "");
+    }
+    if (cv->nidle) { /* "C1 2%  C6 12%  C10 55%", wrapped to the column */
+        char id[256] = "", w[24], tok[48];
+        int first = 1, vw = c->w - MIN(16, c->w / 3) - 1;
+        for (int k = 0; k < cv->nidle; k++) {
+            if (!strcmp(cv->idle[k].name, "POLL"))
+                continue;
+            sfmt(tok, sizeof tok, "%s %.0f%%%s  ", cv->idle[k].name, cv->idle[k].pct, cv->idle[k].disabled ? " (off)" : "");
+            if (id[0] && utf8_cols(id) + utf8_cols(tok) > vw) {
+                lc_kv(c, first ? "Idle states" : "", A_NORMAL, "%s", id);
+                first = 0;
+                id[0] = '\0';
+            }
+            app(id, sizeof id, "%s", tok);
+        }
+        if (id[0])
+            lc_kv(c, first ? "Idle states" : "", A_NORMAL, "%s", id);
+        fmt_si(cv->wakeups, w, sizeof w);
+        lc_kv(c, "", A_GRAY, "%s wake-ups/s (deeper states save more power)", w);
+    }
+    if (cv->mhz_avg > 0) {
         int per = MAX(1, (c->w - 2) / 13);
         char line[512] = "";
-        for (int i = 0; i < cp->ncpu; i++) {
-            app(line, sizeof line, "cpu%-3d%5.0f  ", cp->id[i], cp->mhz[i]);
-            if ((i + 1) % per == 0 || i == cp->ncpu - 1) {
+        for (int i = 0; i < cv->ncpu; i++) {
+            app(line, sizeof line, "cpu%-3d%5.0f  ", cv->id[i], cv->mhz[i]);
+            if ((i + 1) % per == 0 || i == cv->ncpu - 1) {
                 lc_text(c, A_GRAY, "  %s", line);
                 line[0] = '\0';
             }
@@ -299,6 +463,9 @@ static void hw_storage(sys_t *s, lc_t *c)
         fmt_rate(k->wr_bps, b, sizeof b);
         fmt_si(k->rd_iops + k->wr_iops, d, sizeof d);
         lc_text(c, A_NORMAL, "  now   read %s  write %s  %s IOPS  busy %.0f%%", a, b, d, k->util);
+        double lat = MAX(k->rd_lat, k->wr_lat);
+        lc_text(c, lat >= 200 ? CP(C_CRIT) | A_BOLD : lat >= 50 ? CP(C_WARN) : A_NORMAL,
+                "  time per request   read %.1f ms  write %.1f ms  in flight %u", k->rd_lat, k->wr_lat, k->inflight);
         fmt_bytes((double)k->rd_total, a, sizeof a);
         fmt_bytes((double)k->wr_total, b, sizeof b);
         lc_text(c, A_GRAY, "  since boot   read %s  written %s", a, b);
@@ -341,6 +508,13 @@ static void hw_network(sys_t *s, lc_t *c)
         fmt_bytes((double)f->rx_total, ta, sizeof ta);
         fmt_bytes((double)f->tx_total, tb, sizeof tb);
         lc_text(c, A_GRAY, "  %s %s  %s %s   total rx %s  tx %s", U ? "↓" : "in", a, U ? "↑" : "out", b, ta, tb);
+        if (f->quality >= 0)
+            lc_text(c, f->signal_dbm >= -67 ? CP(C_OK) : f->signal_dbm >= -75 ? CP(C_WARN) : CP(C_CRIT),
+                    "  Wi-Fi signal %.0f dBm, link quality %d%%", f->signal_dbm, f->quality);
+        if (f->errors || f->drops || f->err_rate > 0 || f->drop_rate > 0)
+            lc_text(c, f->err_rate + f->drop_rate > 0 ? CP(C_CRIT) | A_BOLD : A_GRAY,
+                    "  %llu errors, %llu dropped packets since boot (now %.0f/s)", f->errors, f->drops,
+                    f->err_rate + f->drop_rate);
     }
 }
 
@@ -350,10 +524,11 @@ void hardware(sys_t *s, ui_state_t *u)
     u->hw_scroll = CLAMP(u->hw_scroll, 0, u->hw_max);
     if (COLS >= 110) {
         int lw = COLS / 2;
-        box_(top, 0, h, lw, "Sensors · Graphics · Power", NULL);
+        box_(top, 0, h, lw, "Health · Sensors · Graphics · Power", NULL);
         box_(top, lw, h, COLS - lw, "System · Storage · Network", NULL);
         lc_t L = { top + 1, 2, lw - 4, inner, 0, u->hw_scroll };
         lc_t R = { top + 1, lw + 2, COLS - lw - 4, inner, 0, u->hw_scroll };
+        hw_health(s, &L);
         hw_sensors(s, &L);
         hw_gpus(s, &L);
         hw_power(s, &L);
@@ -364,6 +539,7 @@ void hardware(sys_t *s, ui_state_t *u)
     } else {
         box_(top, 0, h, COLS, "Hardware", NULL);
         lc_t C = { top + 1, 2, COLS - 4, inner, 0, u->hw_scroll };
+        hw_health(s, &C);
         hw_system(s, &C);
         hw_sensors(s, &C);
         hw_gpus(s, &C);

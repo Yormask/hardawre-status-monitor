@@ -49,6 +49,11 @@ typedef struct {
 typedef struct {
     unsigned long long total, free, used;
 } nvmem_t;
+typedef struct { /* nvmlProcessUtilizationSample_t */
+    unsigned int pid;
+    unsigned long long ts;
+    unsigned int sm, mem, enc, dec;
+} nvpsample_t;
 
 static void *nv_lib;
 static nvret_t (*nv_init)(void);
@@ -64,6 +69,7 @@ static nvret_t (*nv_plimit)(nvdev_t, unsigned int *);
 static nvret_t (*nv_clock)(nvdev_t, int, unsigned int *);
 static nvret_t (*nv_maxclock)(nvdev_t, int, unsigned int *);
 static nvret_t (*nv_fan)(nvdev_t, unsigned int *);
+static nvret_t (*nv_putil)(nvdev_t, nvpsample_t *, unsigned int *, unsigned long long);
 
 #define NV_SYM(var, name) (*(void **)(&(var)) = dlsym(nv_lib, name))
 
@@ -87,6 +93,7 @@ static int nvml_load(void)
     NV_SYM(nv_clock, "nvmlDeviceGetClockInfo");
     NV_SYM(nv_maxclock, "nvmlDeviceGetMaxClockInfo");
     NV_SYM(nv_fan, "nvmlDeviceGetFanSpeed");
+    NV_SYM(nv_putil, "nvmlDeviceGetProcessUtilization");
     if (!nv_init || !nv_count || !nv_handle || nv_init() != 0) {
         dlclose(nv_lib);
         nv_lib = NULL;
@@ -124,7 +131,7 @@ static void nvml_sample(gpu_t *g)
 }
 
 /* ------------------------------------------------------ PCI name lookup */
-static int pci_name(unsigned vendor, unsigned device, char *out, size_t n)
+int pci_lookup_name(unsigned vendor, unsigned device, char *out, size_t n)
 {
     const char *files[] = { secure_getenv("HSM_PCI_IDS"), "/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
                             "/usr/share/pci.ids", "/usr/local/share/pci.ids" };
@@ -363,7 +370,7 @@ static void add_sysfs_gpus(gpus_t *gs, int nvml_ok)
             continue; /* reported through NVML instead */
 
         char pn[80];
-        if (pci_name(ven, dev, pn, sizeof pn) == 0)
+        if (pci_lookup_name(ven, dev, pn, sizeof pn) == 0)
             sfmt(g->name, sizeof g->name, "%s %s", vname, pn);
         else
             sfmt(g->name, sizeof g->name, "%s GPU [%04x:%04x]", vname, ven, dev);
@@ -520,5 +527,48 @@ void gpus_close(gpus_t *gs)
             nv_shutdown();
         dlclose(nv_lib);
         nv_lib = NULL;
+    }
+}
+
+/* NVIDIA's proprietary driver has no DRM fdinfo statistics; NVML keeps a
+ * short history of per-process "SM" (shader) utilization instead. Only the
+ * samples newer than the last call are returned. */
+static int cmp_proc_pid(const void *k, const void *e)
+{
+    pid_t a = *(const pid_t *)k, b = ((const proc_t *)e)->pid;
+    return (a > b) - (a < b);
+}
+
+void gpus_proc_sample(gpus_t *gs, procs_t *ps)
+{
+    if (!nv_putil || !ps->n)
+        return;
+    for (int i = 0; i < gs->n; i++) {
+        gpu_t *g = &gs->g[i];
+        if (!g->nvml)
+            continue;
+        nvdev_t d = (nvdev_t)g->nvml;
+        unsigned int cnt = 0;
+        nv_putil(d, NULL, &cnt, g->nv_ts); /* NVML_ERROR_INSUFFICIENT_SIZE, with the count */
+        if (!cnt)
+            continue;
+        if (cnt > 512)
+            cnt = 512;
+        static nvpsample_t smp[512];
+        unsigned int n = cnt;
+        if (nv_putil(d, smp, &n, g->nv_ts) != 0 || n > cnt)
+            continue;
+        for (unsigned int k = 0; k < n; k++) {
+            if (smp[k].ts > g->nv_ts)
+                g->nv_ts = smp[k].ts;
+            pid_t pid = (pid_t)smp[k].pid;
+            proc_t *p = bsearch(&pid, ps->p, (size_t)ps->n, sizeof *ps->p, cmp_proc_pid);
+            if (!p)
+                continue;
+            double u = smp[k].sm > 100 ? 100 : (double)smp[k].sm;
+            if (u > p->gpu) /* several samples per process: keep the busiest */
+                p->gpu = u;
+            ps->gpu_any = 1;
+        }
     }
 }

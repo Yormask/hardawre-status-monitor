@@ -46,7 +46,7 @@ static void on_signal(int sig)
 static void usage(FILE *f)
 {
     fprintf(f,
-            "%s (%s) %s\nLive monitor for CPU, GPU, memory, power, disk and network activity.\n\n"
+            "%s (%s) %s\nLive monitor for CPU, GPU, memory, power, disk, network, services and system health.\n\n"
             "Usage: %s [options]\n"
             "  -d, --delay SEC   refresh interval in seconds (default: saved setting or 1)\n"
             "  -1, --once        print one plain-text snapshot and exit\n"
@@ -59,12 +59,12 @@ static void usage(FILE *f)
             "  --log-pid PID     log one process's usage (can be given up to %d times)\n"
             "  --log-every SEC   seconds between rows (default: the saved setting)\n"
             "  --log-dir DIR     where to write the files (default: %s)\n\n"
-            "Keys: 1-5 views, s setup, l log sensors, L log the selected process, x kill,\n"
-            "      c/m/d/p/n/t sort, / filter, b CPU bars, k kernel threads,\n"
+            "Keys: 1-6 views (6 = services), s setup, l log sensors, L log the selected process,\n"
+            "      x kill, c/m/d/g/o/p/n/t sort, / filter, b CPU bars, k kernel threads,\n"
             "      +/- interval, space pause, ? help, q quit\n\n"
             "Settings are saved in %s\n\n"
-            "Run as root (sudo %s) to see CPU power (RAPL), exact Intel GPU load\n"
-            "and per-process disk I/O of other users.\n\n"
+            "Run as root (sudo %s) to also see CPU power (RAPL), exact Intel GPU load,\n"
+            "the kernel log, NVMe drive health and other users' processes.\n\n"
             "%s. This program comes with ABSOLUTELY NO WARRANTY.\n"
             "It is free software under the GNU GPL v3 or later; see the LICENSE file.\n",
             APP_NAME, APP_LONG_NAME, APP_VERSION, APP_NAME, MAX_PLOG, config_log_dir(NULL), config_path(),
@@ -244,6 +244,8 @@ int main(int argc, char **argv)
         g_sysfs = e;
     if ((e = secure_getenv("HSM_PROCFS")) && *e)
         g_procfs = e;
+    if ((e = secure_getenv("HSM_DEVFS")) && *e)
+        g_devfs = e;
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -260,6 +262,8 @@ int main(int argc, char **argv)
     sys_init(&S);
 
     if (once) {
+        S.svc.want_until = now_sec() + 60; /* services too */
+        svcs_sample(&S.svc);
         sleep_sec(interval > 0 ? interval : 1.0);
         sys_sample(&S);
         report_print(&S, ntop);

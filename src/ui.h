@@ -23,11 +23,11 @@
 
 #include "collect.h"
 
-enum { VIEW_DASH, VIEW_PROCS, VIEW_HW, VIEW_SETUP, VIEW_LOG, VIEW_COUNT };
-enum { SORT_CPU, SORT_MEM, SORT_IO, SORT_PID, SORT_NAME, SORT_TIME, SORT_COUNT };
+enum { VIEW_DASH, VIEW_PROCS, VIEW_HW, VIEW_SETUP, VIEW_LOG, VIEW_SVC, VIEW_COUNT };
+enum { SORT_CPU, SORT_MEM, SORT_IO, SORT_PID, SORT_NAME, SORT_TIME, SORT_GPU, SORT_FILES, SORT_COUNT };
 
 /* dashboard panels */
-enum { P_CPU, P_GPU, P_MEM, P_POWER, P_DISK, P_NET, P_TEMPS, P_FANS, P_FS, P_COUNT };
+enum { P_CPU, P_GPU, P_MEM, P_POWER, P_DISK, P_NET, P_TEMPS, P_FANS, P_FS, P_HEALTH, P_SVC, P_VOLT, P_COUNT };
 /* appearance choices */
 enum { BAR_BLOCKS, BAR_SQUARES, BAR_LINE, BAR_CLASSIC, BAR_COUNT };
 enum { GRAPH_BLOCKS, GRAPH_BRAILLE, GRAPH_OFF, GRAPH_COUNT };
@@ -84,6 +84,11 @@ typedef struct {
 
     int hw_scroll, hw_max;
 
+    /* services (view 6) */
+    int svc_sort, svc_rev, svc_sel, svc_scroll, svc_rows;
+    char svc_filter[64];
+    char svc_path[256], svc_name[80]; /* process list limited to this service, "" = all */
+
     layout_t lay;
     int setup_sel, setup_scroll;
     int confirm; /* reset waiting for a second Enter, -1 = none */
@@ -91,7 +96,7 @@ typedef struct {
     /* logging (view 5) */
     char log_dir[PATHBUF]; /* "" = default folder */
     double log_every;      /* seconds between log rows, 0 = every refresh */
-    char log_skip[4096];   /* channels switched off, comma separated ids */
+    char log_skip[8192];   /* channels switched off, comma separated ids */
     int log_sel, log_scroll;
     double confirm_until;
 

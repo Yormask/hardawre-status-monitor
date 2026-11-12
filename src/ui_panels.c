@@ -460,6 +460,8 @@ static int build_power(sys_t *s, pline_t *L, int max)
             fmt_duration(b->time_left, tl, sizeof tl);
             app(lab, sizeof lab, "%s%s", SEP, tl);
         }
+        if (b->health >= 0)
+            app(lab, sizeof lab, "%shealth %.0f%%", SEP, b->health);
         attr_t va = !strcmp(b->status, "Discharging") ? CP(C_WARN) | A_BOLD : CP(C_OK) | A_BOLD;
         if (b->watts >= 0)
             n = pl_add(L, n, max, va, 0, lab, "%.1f W", b->watts);
@@ -540,6 +542,11 @@ static void panel_disk(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         xx += put(iy + r, xx, xm - xx, d->wr_bps > 0 ? CP(C_OUT) | A_BOLD : A_GRAY, "%7s", b);
         if (xm - xx >= 6)
             xx += put(iy + r, xx, xm - xx, pct_attr(d->util), " %4.0f%%", d->util);
+        if (xm - xx >= 13) { /* average time per request: slow or failing drives show here first */
+            double lat = MAX(d->rd_lat, d->wr_lat);
+            xx += put(iy + r, xx, xm - xx, lat >= 200 ? CP(C_CRIT) | A_BOLD : lat >= 50 ? CP(C_WARN) : A_GRAY,
+                      lat >= 10 ? "  %5.0f ms" : "  %5.1f ms", lat);
+        }
         if (xm - xx >= 14) {
             fmt_si(d->rd_iops + d->wr_iops, a, sizeof a);
             put(iy + r, xx, xm - xx, A_GRAY, "  %s IOPS", a);
@@ -599,6 +606,13 @@ static void panel_net(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         xx += put(iy + r, xx, xm - xx, f->rx_bps > 0 ? CP(C_IN) | A_BOLD : A_GRAY, "%7s", a);
         xx += put(iy + r, xx, xm - xx, A_GRAY, "  %s ", U ? "↑" : "out");
         xx += put(iy + r, xx, xm - xx, f->tx_bps > 0 ? CP(C_OUT) | A_BOLD : A_GRAY, "%7s", b);
+        if (f->err_rate + f->drop_rate > 0 && xm - xx >= 12) /* only when it happens */
+            xx += put(iy + r, xx, xm - xx, CP(C_CRIT) | A_BOLD, "  %.0f %s/s", f->err_rate + f->drop_rate,
+                      f->err_rate > 0 ? "err" : "drop");
+        if (f->quality >= 0 && xm - xx >= 10) {
+            double d = f->signal_dbm;
+            xx += put(iy + r, xx, xm - xx, d >= -67 ? CP(C_OK) : d >= -75 ? CP(C_WARN) : CP(C_CRIT), "  %.0f dBm", d);
+        }
         if (f->addr[0] && xm - xx >= (int)strlen(f->addr) + 2)
             put(iy + r, xx, xm - xx, A_GRAY, "  %s", f->addr);
         else if (f->speed > 0 && xm - xx >= 10)
@@ -814,6 +828,212 @@ static void panel_fs(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
     }
 }
 
+/* =============================================================== Health */
+
+static double psi_tone(double v) /* stalls: 10% is noticeable, 25% is bad */
+{
+    return v >= 25 ? 100 : v >= 10 ? 70 : 0;
+}
+
+static int health_events(sys_t *s, const event_t **E, int max)
+{
+    int n = 0;
+    for (int i = 0; n < max && i < s->health.nev; i++) {
+        const event_t *e = health_event_at(&s->health, i);
+        if (e->level != EV_INFO)
+            E[n++] = e;
+    }
+    return n;
+}
+
+void event_line(int y, int x, int w, const event_t *e)
+{
+    char ts[24];
+    time_t t = (time_t)e->t, now = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(ts, sizeof ts, now - t < 18 * 3600 ? "%H:%M:%S" : "%d %b %H:%M", &tm);
+    int xx = x;
+    xx += put(y, xx, w, A_GRAY, "%-12s", ts);
+    attr_t ca = e->level == EV_ERR ? CP(C_CRIT) | A_BOLD : e->level == EV_WARN ? CP(C_WARN) : A_GRAY;
+    xx += put(y, xx, x + w - xx, ca, "%-8s ", e->cat);
+    put(y, xx, x + w - xx, A_NORMAL, "%s", e->text);
+}
+
+static int health_need(sys_t *s, ui_state_t *u, int w)
+{
+    const event_t *E[3];
+    return 2 + 3 + MAX(1, health_events(s, E, 3));
+}
+
+static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
+{
+    health_t *H = &s->health;
+    char st[48], info[64];
+    int lvl = health_alert(H, st, sizeof st);
+    if (lvl)
+        sfmt(info, sizeof info, "now: %s", st);
+    else
+        str_copy(info, sizeof info, "nothing wrong right now");
+    box_(y, x, h, w, "Health", info);
+    int ix = x + 2, iw = w - 4, iy = y + 1, ih = h - 2, r = 0;
+    if (ih <= 0)
+        return;
+    double now = (double)time(NULL);
+
+    /* row 1: pressure (share of time tasks had to wait) */
+    if (H->psi[0].ok) {
+        static const char *const nm[3] = { "CPU", "Mem", "I/O" };
+        int lw = iw >= 60 ? 9 : 0, cw = (iw - lw) / 3;
+        if (lw)
+            put(iy, ix, lw, A_GRAY, "Waiting");
+        for (int i = 0; i < 3; i++) {
+            double v = H->psi[i].some;
+            char val[16];
+            sfmt(val, sizeof val, v < 9.95 ? "%.1f%%" : "%.0f%%", v);
+            meter(iy, ix + lw + i * cw, cw - (i < 2 ? 2 : 0), nm[i], 4, v, val, 5, bar_attr(psi_tone(v)));
+        }
+    } else {
+        int kx = ix;
+        kv(iy, &kx, ix + iw, A_GRAY, "Waiting", "%s", "n/a (kernel without pressure stall info)");
+    }
+    if (++r >= ih)
+        return;
+
+    /* row 2: throttling, out-of-memory kills */
+    int kx = ix, km = ix + iw;
+    if (!H->thr_ok) {
+        kv(iy + r, &kx, km, A_GRAY, "Throttling", "%s", "n/a");
+    } else {
+        unsigned long long all = H->thr_count + H->core_count, since = all - H->thr_start;
+        if (H->thr_last > 0 && now - H->thr_last < 10 && H->thr_pct >= 1)
+            kv(iy + r, &kx, km, CP(C_CRIT) | A_BOLD, "Throttling", "NOW (%.0f%% of the time)", H->thr_pct);
+        else if (H->thr_last > 0 && now - H->thr_last < 10)
+            kv(iy + r, &kx, km, CP(C_CRIT) | A_BOLD, "Throttling", "%s", "just now");
+        else if (since)
+            kv(iy + r, &kx, km, CP(C_WARN) | A_BOLD, "Throttling", "%llu%s since start", since, U ? "×" : "x");
+        else
+            kv(iy + r, &kx, km, CP(C_OK), "Throttling", "%s", "none");
+        if (all && !since)
+            kv(iy + r, &kx, km, A_GRAY, "", "(%llu since boot)", all);
+    }
+    if (s->mem.oom_ok) {
+        unsigned long long since = s->mem.oom_kill - H->oom_start;
+        if (H->oom_last > 0 && now - H->oom_last < 60)
+            kv(iy + r, &kx, km, CP(C_CRIT) | A_BOLD, "OOM kills", "%s", "just now");
+        else if (since)
+            kv(iy + r, &kx, km, CP(C_WARN) | A_BOLD, "OOM kills", "%llu since start", since);
+        else if (s->mem.oom_kill)
+            kv(iy + r, &kx, km, A_BOLD, "OOM kills", "%llu since boot", s->mem.oom_kill);
+        else
+            kv(iy + r, &kx, km, CP(C_OK), "OOM kills", "%s", "none");
+    }
+    if (++r >= ih)
+        return;
+
+    /* row 3: PCIe errors, NVMe drive health, kernel log */
+    kx = ix;
+    if (!H->aer_ok)
+        kv(iy + r, &kx, km, A_GRAY, "PCIe", "%s", "n/a");
+    else if (H->pci_nonfatal + H->pci_fatal)
+        kv(iy + r, &kx, km, CP(C_CRIT) | A_BOLD, "PCIe", "%llu uncorrected", H->pci_nonfatal + H->pci_fatal);
+    else if (H->pci_cor)
+        kv(iy + r, &kx, km, CP(C_WARN), "PCIe", "%llu corrected", H->pci_cor);
+    else
+        kv(iy + r, &kx, km, CP(C_OK), "PCIe", "%s", "no errors");
+    if (H->nnvme) {
+        int ok = 0, read = 0, worst = -1;
+        for (int i = 0; i < H->nnvme; i++) {
+            nvme_t *v = &H->nvme[i];
+            if (v->state != 1)
+                continue;
+            read++;
+            if (v->crit || v->media_err)
+                worst = i;
+            else
+                ok++;
+        }
+        if (worst >= 0)
+            kv(iy + r, &kx, km, CP(C_CRIT) | A_BOLD, "NVMe", "%s %s", H->nvme[worst].name,
+               H->nvme[worst].crit ? "WARNING" : "media errors");
+        else if (read == 1)
+            kv(iy + r, &kx, km, CP(C_OK), "NVMe", "OK, %d%% worn", H->nvme[0].used);
+        else if (read)
+            kv(iy + r, &kx, km, CP(C_OK), "NVMe", "%d OK", ok);
+        else
+            kv(iy + r, &kx, km, A_GRAY, "NVMe", "%s", H->nvme[0].state == -1 ? "needs root" : "n/a");
+    }
+    if (H->kmsg == 1) {
+        if (H->kmsg_err)
+            kv(iy + r, &kx, km, CP(C_WARN), "Kernel", "%u error%s since boot", H->kmsg_err, H->kmsg_err == 1 ? "" : "s");
+        else
+            kv(iy + r, &kx, km, CP(C_OK), "Kernel", "%s", "no errors");
+    } else {
+        kv(iy + r, &kx, km, A_GRAY, "Kernel log", "%s", H->kmsg == -1 ? "needs root" : "n/a");
+    }
+    r++;
+
+    /* the rest: the latest problems, newest first */
+    const event_t *E[64];
+    int n = health_events(s, E, MIN(ih - r, 64));
+    if (!n && r < ih)
+        put(iy + r, ix, iw, A_GRAY, "%s",
+            H->kmsg == 1 ? "No problems recorded since boot" : "No problems seen since hsm started");
+    for (int i = 0; i < n && r < ih; i++, r++)
+        event_line(iy + r, ix, iw, E[i]);
+}
+
+/* ============================================================= Voltages */
+
+static int volt_list(sys_t *s, int *idx, int max)
+{
+    int n = 0;
+    for (int i = 0; i < s->sens.n && n < max; i++)
+        if (s->sens.s[i].type == SENS_VOLT && s->sens.s[i].ok)
+            idx[n++] = i;
+    return n;
+}
+
+static int volt_cols(int iw)
+{
+    return MAX(1, iw / 26);
+}
+
+static int volt_need(sys_t *s, ui_state_t *u, int w)
+{
+    int idx[64], n = volt_list(s, idx, 64), c = volt_cols(w - 4);
+    return n ? 2 + MIN((n + c - 1) / c, 8) : 4;
+}
+
+static void panel_volt(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
+{
+    int idx[64], n = volt_list(s, idx, 64);
+    char info[32] = "";
+    if (n)
+        sfmt(info, sizeof info, "%d reading%s", n, n == 1 ? "" : "s");
+    box_(y, x, h, w, "Voltages", info);
+    int ix = x + 2, iw = w - 4, iy = y + 1, ih = h - 2;
+    if (ih <= 0)
+        return;
+    if (!n) {
+        put(iy, ix, iw, A_GRAY, "No voltage sensors found.");
+        if (ih > 1)
+            put(iy + 1, ix, iw, A_GRAY, "Desktop boards report them once their sensor driver is loaded.");
+        return;
+    }
+    int cols = volt_cols(iw), rows = MIN((n + cols - 1) / cols, ih), cw = iw / cols;
+    for (int k = 0; k < n && k < rows * cols; k++) {
+        sensor_t *t = &s->sens.s[idx[k]];
+        int cy = iy + k % rows, cx = ix + (k / rows) * cw, aw = cw - (cols > 1 ? 3 : 0);
+        int bad = (t->hi > 0 && t->value > t->hi) || (t->lo > 0 && t->value < t->lo);
+        char chip[24], v[24];
+        sensors_chip_name(t->chip, chip, sizeof chip);
+        sfmt(v, sizeof v, "%.3f V", t->value);
+        put(cy, cx, aw - 9, A_NORMAL, "%s", t->label);
+        put(cy, cx + aw - utf8_cols(v), utf8_cols(v), bad ? CP(C_CRIT) | A_BOLD : A_BOLD, "%s", v);
+    }
+}
+
 /* ============================================================ Dashboard */
 
 typedef struct {
@@ -827,7 +1047,8 @@ static const pdef_t PANELS[P_COUNT] = {
     [P_MEM] = { mem_need, panel_mem, 1 },       [P_POWER] = { power_need, panel_power, 1 },
     [P_DISK] = { disk_need, panel_disk, 1 },    [P_NET] = { net_need, panel_net, 1 },
     [P_TEMPS] = { temps_need, panel_temps, 1 }, [P_FANS] = { fans_need, panel_fans, 0 },
-    [P_FS] = { fs_need, panel_fs, 0 },
+    [P_FS] = { fs_need, panel_fs, 0 },          [P_HEALTH] = { health_need, panel_health, 1 },
+    [P_SVC] = { svc_panel_need, svc_panel, 0 }, [P_VOLT] = { volt_need, panel_volt, 0 },
 };
 
 static int pweight(sys_t *s, int p)

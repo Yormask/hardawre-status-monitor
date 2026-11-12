@@ -38,9 +38,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-const char *const PANEL_KEY[P_COUNT] = { "cpu", "gpu", "memory", "power", "disk", "network", "temps", "fans", "filesystems" };
-const char *const PANEL_NAME[P_COUNT] = { "CPU",     "GPU",          "Memory", "Power",      "Disk I/O",
-                                          "Network", "Temperatures", "Fans",   "Filesystems" };
+const char *const PANEL_KEY[P_COUNT] = { "cpu",   "gpu",  "memory",      "power",  "disk",     "network",
+                                         "temps", "fans", "filesystems", "health", "services", "voltages" };
+const char *const PANEL_NAME[P_COUNT] = { "CPU",          "GPU",  "Memory",      "Power",  "Disk I/O", "Network",
+                                          "Temperatures", "Fans", "Filesystems", "Health", "Services", "Voltages" };
 const char *const SINGLE_NAME[SINGLE_COUNT] = {
     "Cyan", "Blue", "Green", "Yellow", "Red", "Magenta", "White",
     "Bright cyan", "Bright blue", "Bright green", "Bright yellow", "Bright red", "Bright magenta", "Bright white",
@@ -88,7 +89,7 @@ static const char *const BAR_KEY[BAR_COUNT] = { "blocks", "squares", "line", "cl
 static const char *const GRAPH_KEY[GRAPH_COUNT] = { "blocks", "braille", "off" };
 static const char *const COLOR_KEY[COLOR_COUNT] = { "value", "gradient", "single", "mono" };
 static const char *const CPUBAR_KEY[3] = { "usage", "clock", "temp" };
-static const char *const SORT_KEY[SORT_COUNT] = { "cpu", "memory", "io", "pid", "name", "time" };
+static const char *const SORT_KEY[SORT_COUNT] = { "cpu", "memory", "io", "pid", "name", "time", "gpu", "files" };
 
 /* what was last loaded from / written to the file, to know if anything changed */
 typedef struct {
@@ -121,15 +122,15 @@ int config_changed(const ui_state_t *u)
 
 void layout_defaults(layout_t *l)
 {
-    static const int left[] = { P_CPU, P_GPU };
-    static const int right[] = { P_MEM, P_POWER, P_DISK, P_NET, P_TEMPS, P_FANS, P_FS };
+    static const int left[] = { P_CPU, P_GPU, P_HEALTH };
+    static const int right[] = { P_MEM, P_POWER, P_DISK, P_NET, P_TEMPS, P_FANS, P_FS, P_SVC, P_VOLT };
     memset(l, 0, sizeof *l);
     for (size_t i = 0; i < sizeof left / sizeof left[0]; i++)
         l->col[0][l->ncol[0]++] = left[i];
     for (size_t i = 0; i < sizeof right / sizeof right[0]; i++)
         l->col[1][l->ncol[1]++] = right[i];
     for (int p = 0; p < P_COUNT; p++)
-        l->on[p] = p != P_TEMPS && p != P_FANS && p != P_FS;
+        l->on[p] = p != P_TEMPS && p != P_FANS && p != P_FS && p != P_SVC && p != P_VOLT;
     l->show_procs = 1;
     l->cpu_bars = CPUBAR_USAGE;
 }
@@ -317,7 +318,7 @@ int config_load(ui_state_t *u)
     layout_t nl = *l;
     nl.ncol[0] = nl.ncol[1] = 0;
 
-    char line[8192]; /* log_skip can be long */
+    char line[16384]; /* log_skip can be long */
     while (fgets(line, sizeof line, f)) {
         char *s = trim(line);
         if (!*s || *s == '#')
@@ -397,13 +398,19 @@ int config_load(ui_state_t *u)
     fclose(f);
 
     if (have_cols) {
-        /* panels the file doesn't mention (e.g. added in a newer version)
-         * go to the right column, hidden */
+        /* panels the file doesn't mention (added in a newer version) go where
+         * they would be by default: the end of their column, shown or not */
+        layout_t dl;
+        layout_defaults(&dl);
         for (int p = 0; p < P_COUNT; p++) {
             nl.on[p] = 1;
             if (!placed[p]) {
-                nl.col[1][nl.ncol[1]++] = p;
-                nl.on[p] = 0;
+                int c = 1;
+                for (int i = 0; i < dl.ncol[0]; i++)
+                    if (dl.col[0][i] == p)
+                        c = 0;
+                nl.col[c][nl.ncol[c]++] = p;
+                nl.on[p] = dl.on[p];
             }
         }
         char *save = NULL;

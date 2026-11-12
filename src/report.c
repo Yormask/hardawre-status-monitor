@@ -26,6 +26,84 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static int svc_by_mem(const void *a, const void *b)
+{
+    const svc_t *p = *(svc_t *const *)a, *q = *(svc_t *const *)b;
+    return (p->mem < q->mem) - (p->mem > q->mem);
+}
+
+static void report_health(sys_t *s)
+{
+    health_t *h = &s->health;
+    char a[32], b[32];
+    printf("\nHealth\n");
+    static const char *const pn[3] = { "CPU", "memory", "I/O" };
+    if (h->psi[0].ok) {
+        printf("  pressure    ");
+        for (int i = 0; i < 3; i++) {
+            psi_t *p = &h->psi[i];
+            printf("%s %.1f%%", pn[i], p->some);
+            if (i && p->has_full)
+                printf(" (full %.1f%%)", p->full);
+            printf(i < 2 ? ",  " : "");
+        }
+        printf("   (share of time tasks had to wait)\n");
+    } else {
+        printf("  pressure    not available (needs Linux 4.20+ with PSI enabled)\n");
+    }
+    if (h->thr_ok) {
+        unsigned long long now = h->thr_count + h->core_count - h->thr_start;
+        printf("  throttling  %llu times since boot (%.1f s in total)%s%s\n", h->thr_count + h->core_count,
+               h->thr_ms / 1000.0, now ? ", throttled now" : "", h->thr_pct > 0 ? "" : "");
+    } else {
+        printf("  throttling  not reported by this CPU\n");
+    }
+    if (s->mem.oom_ok)
+        printf("  OOM kills   %llu since boot\n", s->mem.oom_kill);
+    if (h->aer_ok)
+        printf("  PCIe errors %llu corrected, %llu uncorrected since boot\n", h->pci_cor, h->pci_nonfatal + h->pci_fatal);
+    else
+        printf("  PCIe errors not reported (no AER on this machine)\n");
+    for (int i = 0; i < h->npci; i++)
+        printf("    %s  %s: %llu corrected, %llu non-fatal, %llu fatal\n", h->pci[i].dev, h->pci[i].name, h->pci[i].cor,
+               h->pci[i].nonfatal, h->pci[i].fatal);
+    if (h->files_max) {
+        fmt_si((double)h->files, a, sizeof a);
+        printf("  open files  %s handles in use\n", a);
+    }
+    for (int i = 0; i < h->nnvme; i++) {
+        nvme_t *v = &h->nvme[i];
+        printf("  %-11s %s: ", v->name, v->model[0] ? v->model : "NVMe drive");
+        if (v->state == 1) {
+            fmt_bytes(v->written_b, a, sizeof a);
+            fmt_bytes(v->read_b, b, sizeof b);
+            printf("%s, %d%% worn, spare %d%%, %llu unsafe shutdowns, %llu media errors, %llu h, %s written, %s read\n",
+                   v->crit ? "WARNING" : "OK", v->used, v->spare, v->unsafe, v->media_err, v->hours, a, b);
+        } else {
+            printf("%s\n", v->state == -1 ? "health needs root (sudo)" : "health not available");
+        }
+    }
+    if (h->kmsg == 1)
+        printf("  kernel log  %u errors, %u warnings since boot\n", h->kmsg_err, h->kmsg_warn);
+    else
+        printf("  kernel log  %s\n", h->kmsg == -1 ? "needs root (sudo)" : "not available");
+    int shown = 0;
+    for (int i = 0; i < h->nev && shown < 8; i++) {
+        const event_t *e = health_event_at(h, i);
+        if (e->level == EV_INFO)
+            continue;
+        if (!shown++)
+            printf("  recent events (newest first)\n");
+        char ts[32];
+        time_t t = (time_t)e->t;
+        struct tm tm;
+        localtime_r(&t, &tm);
+        strftime(ts, sizeof ts, "%m-%d %H:%M:%S", &tm);
+        printf("    %s  %-8s %s%s\n", ts, e->cat, e->level == EV_ERR ? "! " : "", e->text);
+    }
+}
 
 static int by_cpu(const void *a, const void *b)
 {
@@ -51,6 +129,28 @@ void report_print(sys_t *s, int nproc)
     if (cp->temp_c >= 0)
         printf("  temp      %.1f C\n", cp->temp_c);
     printf("  load      %.2f %.2f %.2f\n", cp->load[0], cp->load[1], cp->load[2]);
+    if (cp->governor[0] || cp->driver[0]) {
+        printf("  power     %s", cp->driver[0] ? cp->driver : "?");
+        if (cp->governor[0])
+            printf(", governor %s", cp->governor);
+        if (cp->epp[0])
+            printf(", preference %s", cp->epp);
+        if (cp->turbo >= 0)
+            printf(", turbo %s", cp->turbo ? "on" : "off");
+        if (cp->lim_max > 0)
+            printf(", %.0f-%.0f MHz", cp->lim_min, cp->lim_max);
+        if (cp->profile[0])
+            printf(", profile %s", cp->profile);
+        printf("\n");
+    }
+    if (cp->nidle) {
+        printf("  idle     ");
+        for (int k = 0; k < cp->nidle; k++)
+            if (strcmp(cp->idle[k].name, "POLL"))
+                printf(" %s %.0f%%", cp->idle[k].name, cp->idle[k].pct);
+        fmt_si(cp->wakeups, a, sizeof a);
+        printf(", %s wake-ups/s\n", a);
+    }
     printf("  per CPU  ");
     for (int i = 0; i < cp->ncpu; i++) {
         printf(" %d:%.0f%%", cp->id[i], cp->pct[i]);
@@ -67,6 +167,8 @@ void report_print(sys_t *s, int nproc)
     fmt_bytes((double)m->swap_used, a, sizeof a);
     fmt_bytes((double)m->swap_total, b, sizeof b);
     printf("  swap      %s / %s\n", a, b);
+
+    report_health(s);
 
     printf("\nGPU\n");
     if (!s->gpus.n)
@@ -111,6 +213,10 @@ void report_print(sys_t *s, int nproc)
         printf("  %-10s%s, %.0f%%", bt->name, bt->status, bt->capacity);
         if (bt->watts >= 0)
             printf(", %.2f W", bt->watts);
+        if (bt->health >= 0)
+            printf(", health %.0f%%", bt->health);
+        if (bt->cycles >= 0)
+            printf(", %ld cycles", bt->cycles);
         printf("\n");
     }
     if (!p->nrapl && !p->nbat)
@@ -122,8 +228,8 @@ void report_print(sys_t *s, int nproc)
         fmt_rate(d->rd_bps, a, sizeof a);
         fmt_rate(d->wr_bps, b, sizeof b);
         fmt_bytes((double)d->size, c, sizeof c);
-        printf("  %-10s %-5s %6s  read %8s  write %8s  busy %3.0f%%  %s\n", d->name, d->kind, c, a, b, d->util,
-               d->model);
+        printf("  %-10s %-5s %6s  read %8s  write %8s  busy %3.0f%%  latency r %.1f w %.1f ms  %s\n", d->name, d->kind,
+               c, a, b, d->util, d->rd_lat, d->wr_lat, d->model);
     }
     for (int i = 0; i < s->disks.nfs; i++) {
         fs_t *f = &s->disks.fs[i];
@@ -138,7 +244,12 @@ void report_print(sys_t *s, int nproc)
         netif_t *f = &s->net.i[i];
         fmt_rate(f->rx_bps, a, sizeof a);
         fmt_rate(f->tx_bps, b, sizeof b);
-        printf("  %-14s %-8s rx %8s  tx %8s  %s\n", f->name, f->state, a, b, f->addr);
+        printf("  %-14s %-8s rx %8s  tx %8s  %s", f->name, f->state, a, b, f->addr);
+        if (f->quality >= 0)
+            printf("  wifi %.0f dBm (%d%%)", f->signal_dbm, f->quality);
+        if (f->errors || f->drops)
+            printf("  %llu errors, %llu dropped since boot", f->errors, f->drops);
+        printf("\n");
     }
 
     if (s->sens.n) {
@@ -147,8 +258,8 @@ void report_print(sys_t *s, int nproc)
             sensor_t *t = &s->sens.s[i];
             if (!t->ok)
                 continue;
-            static const char *const unit[] = { "C", "RPM", "W" };
-            printf("  %-14s %-22s %8.1f %s\n", t->chip, t->label, t->value, unit[t->type]);
+            static const char *const unit[] = { "C", "RPM", "W", "V" };
+            printf("  %-14s %-22s %8.*f %s\n", t->chip, t->label, t->type == SENS_VOLT ? 3 : 1, t->value, unit[t->type]);
         }
     }
 
@@ -159,8 +270,9 @@ void report_print(sys_t *s, int nproc)
                 v[i] = &s->procs.p[i];
             qsort(v, (size_t)s->procs.n, sizeof *v, by_cpu);
             printf("\nTop processes by CPU  (%d processes, %d threads)\n", s->procs.n, s->procs.threads);
-            printf("  %7s %-10s %6s %6s %8s %9s %9s  %s\n", "PID", "USER", "CPU%", "MEM%", "RSS", "READ/s", "WRITE/s",
-                   "COMMAND");
+            int gpu = s->procs.gpu_any;
+            printf("  %7s %-10s %6s %6s %8s %9s %9s %6s%s  %s\n", "PID", "USER", "CPU%", "MEM%", "RSS", "READ/s",
+                   "WRITE/s", "FILES", gpu ? "   GPU%" : "", "COMMAND");
             for (int i = 0; i < nproc && i < s->procs.n; i++) {
                 proc_t *q = v[i];
                 fmt_bytes((double)q->rss, a, sizeof a);
@@ -172,8 +284,39 @@ void report_print(sys_t *s, int nproc)
                     str_copy(c, sizeof c, "-");
                 }
                 const char *cmd = q->kthread ? "" : proc_cmdline(q);
-                printf("  %7d %-10.10s %6.1f %6.1f %8s %9s %9s  %.80s%s%s%s\n", (int)q->pid, uid_name(q->uid), q->cpu,
-                       q->mem, a, b, c, cmd, *cmd ? "" : "[", *cmd ? "" : q->comm, *cmd ? "" : "]");
+                char fd[16] = "-", gp[16] = "";
+                if (q->nfds >= 0)
+                    sfmt(fd, sizeof fd, "%d", q->nfds);
+                if (gpu && q->gpu >= 0)
+                    sfmt(gp, sizeof gp, " %6.1f", q->gpu);
+                else if (gpu)
+                    sfmt(gp, sizeof gp, " %6s", "-");
+                printf("  %7d %-10.10s %6.1f %6.1f %8s %9s %9s %6s%s  %.80s%s%s%s\n", (int)q->pid, uid_name(q->uid),
+                       q->cpu, q->mem, a, b, c, fd, gp, cmd, *cmd ? "" : "[", *cmd ? "" : q->comm, *cmd ? "" : "]");
+            }
+            free(v);
+        }
+    }
+
+    svcs_t *sv = &s->svc;
+    if (sv->state == 1 && sv->n) {
+        svc_t **v = malloc((size_t)sv->n * sizeof *v);
+        if (v) {
+            for (int i = 0; i < sv->n; i++)
+                v[i] = &sv->s[i];
+            qsort(v, (size_t)sv->n, sizeof *v, svc_by_mem);
+            printf("\nServices and containers by memory  (%d)\n", sv->n);
+            printf("  %-34s %-9s %6s %8s %9s %9s %6s\n", "NAME", "TYPE", "CPU%", "MEMORY", "READ/s", "WRITE/s", "TASKS");
+            for (int i = 0; i < 12 && i < sv->n; i++) {
+                svc_t *q = v[i];
+                if (q->mem >= 0)
+                    fmt_bytes((double)q->mem, a, sizeof a);
+                else
+                    str_copy(a, sizeof a, "-");
+                fmt_rate(q->rd_bps, b, sizeof b);
+                fmt_rate(q->wr_bps, c, sizeof c);
+                printf("  %-34.34s %-9s %6.1f %8s %9s %9s %6ld%s\n", q->name, svc_kind_name(q->kind), q->cpu, a, b, c,
+                       q->tasks, q->oom ? "  (OOM kills!)" : "");
             }
             free(v);
         }

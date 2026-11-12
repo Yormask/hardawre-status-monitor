@@ -77,6 +77,8 @@ void cpu_init(cpu_t *c)
 {
     char path[PATHBUF];
     c->temp_c = -1;
+    c->turbo = -1;
+    c->lim_min = c->lim_max = c->hw_min = c->hw_max = -1;
     str_copy(c->model, sizeof c->model, "Unknown CPU");
 
     sfmt(path, sizeof path, "%s/cpuinfo", g_procfs);
@@ -195,6 +197,113 @@ static int freqs_from_cpuinfo(cpu_t *c)
     return found;
 }
 
+/* Idle states (cpuidle): how long the CPUs sleep, and how deeply. Every
+ * state of every CPU is two small files, so this runs every 2 s at most. */
+static void cpu_idle_sample(cpu_t *c)
+{
+    char p[PATHBUF];
+    double t = now_sec();
+    if (c->idle_primed >= 2 && t - c->idle_t < 2.0) /* the first two reads go straight through */
+        return;
+    if (!c->nidle && c->idle_t == 0) { /* names, from the first CPU */
+        for (int k = 0; k < MAX_CSTATES; k++) {
+            cstate_t *st = &c->idle[k];
+            sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/cpuidle/state%d/name", g_sysfs, c->ncpu ? c->id[0] : 0, k);
+            if (read_line(p, st->name, sizeof st->name))
+                break;
+            long long v;
+            sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/cpuidle/state%d/latency", g_sysfs, c->ncpu ? c->id[0] : 0, k);
+            st->latency = !read_ll(p, &v) && v >= 0 ? (unsigned)v : 0;
+            c->nidle = k + 1;
+        }
+    }
+    double el = c->idle_t > 0 ? t - c->idle_t : 0;
+    c->idle_t = t;
+    if (!c->nidle)
+        return;
+    double sum[MAX_CSTATES] = { 0 }, entries = 0;
+    int ncount = 0;
+    for (int i = 0; i < c->ncpu; i++) {
+        int id = c->id[i];
+        if (id < 0 || id >= MAX_CPUS)
+            continue;
+        ncount++;
+        for (int k = 0; k < c->nidle; k++) {
+            unsigned long long tm, us;
+            sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/cpuidle/state%d/time", g_sysfs, id, k);
+            if (read_ull(p, &tm))
+                continue;
+            sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/cpuidle/state%d/usage", g_sysfs, id, k);
+            if (read_ull(p, &us))
+                us = c->idle_use[id][k];
+            if (c->idle_primed && el > 0) {
+                if (tm >= c->idle_time[id][k])
+                    sum[k] += (double)(tm - c->idle_time[id][k]);
+                if (us >= c->idle_use[id][k])
+                    entries += (double)(us - c->idle_use[id][k]);
+            }
+            c->idle_time[id][k] = tm;
+            c->idle_use[id][k] = us;
+        }
+    }
+    if (c->idle_primed && el > 0 && ncount) {
+        for (int k = 0; k < c->nidle; k++) /* time is in us */
+            c->idle[k].pct = CLAMP(sum[k] / (el * 1e6 * ncount) * 100.0, 0, 100);
+        c->wakeups = entries / el;
+        c->idle_primed = 2;
+    }
+    for (int k = 0; k < c->nidle; k++) {
+        long long v;
+        sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/cpuidle/state%d/disable", g_sysfs, c->ncpu ? c->id[0] : 0, k);
+        c->idle[k].disabled = !read_ll(p, &v) && v > 0;
+    }
+    if (!c->idle_primed)
+        c->idle_primed = 1;
+}
+
+/* Governor, driver, energy preference, turbo, frequency limits and the
+ * ACPI platform profile. These only change when someone changes them. */
+void cpu_power_sample(cpu_t *c)
+{
+    char p[PATHBUF];
+    long long v;
+    int id = c->ncpu ? c->id[0] : 0;
+    const char *cf = "devices/system/cpu";
+#define RD(field, fmt, ...)                                                                                          \
+    do {                                                                                                             \
+        sfmt(p, sizeof p, fmt, __VA_ARGS__);                                                                         \
+        if (read_line(p, c->field, sizeof c->field))                                                                 \
+            c->field[0] = '\0';                                                                                      \
+    } while (0)
+    RD(driver, "%s/%s/cpu%d/cpufreq/scaling_driver", g_sysfs, cf, id);
+    RD(governor, "%s/%s/cpu%d/cpufreq/scaling_governor", g_sysfs, cf, id);
+    RD(epp, "%s/%s/cpu%d/cpufreq/energy_performance_preference", g_sysfs, cf, id);
+    RD(pstate, "%s/%s/intel_pstate/status", g_sysfs, cf);
+    RD(profile, "%s/firmware/acpi/platform_profile", g_sysfs);
+#undef RD
+    /* turbo: intel_pstate says "no_turbo", acpi-cpufreq / amd-pstate say "boost" */
+    c->turbo = -1;
+    sfmt(p, sizeof p, "%s/%s/intel_pstate/no_turbo", g_sysfs, cf);
+    if (!read_ll(p, &v)) {
+        c->turbo = v ? 0 : 1;
+    } else {
+        sfmt(p, sizeof p, "%s/%s/cpufreq/boost", g_sysfs, cf);
+        if (!read_ll(p, &v))
+            c->turbo = v ? 1 : 0;
+        else {
+            sfmt(p, sizeof p, "%s/%s/cpu%d/cpufreq/boost", g_sysfs, cf, id);
+            if (!read_ll(p, &v))
+                c->turbo = v ? 1 : 0;
+        }
+    }
+    static const char *const f[4] = { "scaling_min_freq", "scaling_max_freq", "cpuinfo_min_freq", "cpuinfo_max_freq" };
+    double *out[4] = { &c->lim_min, &c->lim_max, &c->hw_min, &c->hw_max };
+    for (int k = 0; k < 4; k++) {
+        sfmt(p, sizeof p, "%s/%s/cpu%d/cpufreq/%s", g_sysfs, cf, id, f[k]);
+        *out[k] = !read_ll(p, &v) && v > 0 ? (double)v / 1000.0 : -1;
+    }
+}
+
 void cpu_sample(cpu_t *c, double dt)
 {
     char path[PATHBUF];
@@ -291,6 +400,8 @@ void cpu_sample(cpu_t *c, double dt)
         }
     c->mhz_avg = cnt ? sum / cnt : 0;
     c->mhz_max = mx;
+
+    cpu_idle_sample(c);
 
     char b[256];
     sfmt(path, sizeof path, "%s/loadavg", g_procfs);

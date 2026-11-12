@@ -147,7 +147,14 @@ void disks_sample(disks_t *ds, double dt)
             d->rd_iops = dlt(d->p_rio, rio) / dt;
             d->wr_iops = dlt(d->p_wio, wio) / dt;
             d->util = CLAMP(dlt(d->p_ticks, ioticks) / (dt * 10.0), 0.0, 100.0); /* ms busy per s -> % */
+            /* average time each request took, like iostat's r_await / w_await */
+            double nr = dlt(d->p_rio, rio), nw = dlt(d->p_wio, wio);
+            d->rd_lat = nr > 0 ? dlt(d->p_rms, rticks) / nr : 0;
+            d->wr_lat = nw > 0 ? dlt(d->p_wms, wticks) / nw : 0;
         }
+        d->inflight = (unsigned)inflight;
+        d->p_rms = rticks;
+        d->p_wms = wticks;
         d->p_rsec = rsec;
         d->p_wsec = wsec;
         d->p_rio = rio;

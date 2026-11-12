@@ -33,6 +33,7 @@
 
 const char *g_sysfs = "/sys";
 const char *g_procfs = "/proc";
+const char *g_devfs = "/dev";
 
 ssize_t read_file(const char *path, char *buf, size_t size)
 {

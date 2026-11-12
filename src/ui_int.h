@@ -73,6 +73,11 @@ void hardware(sys_t *s, ui_state_t *u);
 void setup_view(sys_t *s, ui_state_t *u);
 int setup_key(ui_state_t *u, int ch); /* 1 when the key was used */
 void log_view(sys_t *s, ui_state_t *u);
+void services_view(sys_t *s, ui_state_t *u);
+int services_key(sys_t *s, ui_state_t *u, int ch);
+int svc_panel_need(sys_t *s, ui_state_t *u, int w);
+void svc_panel(sys_t *s, ui_state_t *u, int y, int x, int h, int w);
+void event_line(int y, int x, int w, const event_t *e); /* "12:03:44  disk  nvme0n1: I/O error" */
 int log_view_key(sys_t *s, ui_state_t *u, int ch);
 void log_toggle_system(sys_t *s, ui_state_t *u);  /* key l */
 void log_toggle_process(sys_t *s, ui_state_t *u); /* key L */

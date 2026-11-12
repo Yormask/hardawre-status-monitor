@@ -48,7 +48,9 @@ enum {
     CH_CORE, CH_CORE_CLOCK, CH_MEM_PCT, CH_MEM_USED, CH_SWAP_USED,
     CH_GPU_LOAD, CH_GPU_TEMP, CH_GPU_POWER, CH_GPU_CLOCK, CH_GPU_VRAM,
     CH_POWER_TOTAL, CH_RAPL, CH_BAT_POWER, CH_BAT_CHARGE, CH_SENSOR,
-    CH_DISK_R, CH_DISK_W, CH_DISK_BUSY, CH_NET_RX, CH_NET_TX
+    CH_DISK_R, CH_DISK_W, CH_DISK_BUSY, CH_NET_RX, CH_NET_TX,
+    CH_THROTTLE, CH_PSI, CH_OOM, CH_PCIE, CH_NVME_USED, CH_NVME_MEDIA, CH_NVME_UNSAFE, CH_NVME_WARN,
+    CH_DISK_RLAT, CH_DISK_WLAT, CH_NET_ERR, CH_NET_SIGNAL, CH_WAKEUPS, CH_CSTATE, CH_EVENTS
 };
 
 #define MB (1024.0 * 1024.0)
@@ -132,6 +134,43 @@ void log_build_channels(sys_t *s, const char *skip)
             add("CPU cores", CH_CORE_CLOCK, s->cpu.id[i], "", "MHz", lab, "cpu.core%d.clock", s->cpu.id[i]);
         }
 
+    health_t *H = &s->health;
+    if (H->thr_ok)
+        add("Health", CH_THROTTLE, 0, "", "%", "CPU throttled (time)", "health.throttled");
+    static const char *const pn[3] = { "CPU", "Memory", "Disk I/O" }, *const pk[3] = { "cpu", "memory", "io" };
+    for (int i = 0; i < 3; i++)
+        if (H->psi[i].ok) {
+            sfmt(lab, sizeof lab, "%s pressure", pn[i]);
+            add("Health", CH_PSI, i * 2, "", "%", lab, "health.psi.%s", pk[i]);
+            if (i && H->psi[i].has_full) {
+                sfmt(lab, sizeof lab, "%s pressure (full)", pn[i]);
+                add("Health", CH_PSI, i * 2 + 1, "", "%", lab, "health.psi.%s_full", pk[i]);
+            }
+        }
+    if (s->mem.oom_ok)
+        add("Health", CH_OOM, 0, "", "count", "OOM kills since boot", "health.oom");
+    if (H->aer_ok)
+        add("Health", CH_PCIE, 0, "", "count", "PCIe errors since boot", "health.pcie");
+    for (int i = 0; i < H->nnvme; i++) {
+        const char *n = H->nvme[i].name;
+        sfmt(lab, sizeof lab, "%s wear used", n);
+        add("Health", CH_NVME_USED, i, "", "%", lab, "nvme.%s.used", n);
+        sfmt(lab, sizeof lab, "%s media errors", n);
+        add("Health", CH_NVME_MEDIA, i, "", "count", lab, "nvme.%s.media_errors", n);
+        sfmt(lab, sizeof lab, "%s unsafe shutdowns", n);
+        add("Health", CH_NVME_UNSAFE, i, "", "count", lab, "nvme.%s.unsafe", n);
+        sfmt(lab, sizeof lab, "%s critical warning", n);
+        add("Health", CH_NVME_WARN, i, "", "count", lab, "nvme.%s.warning", n);
+    }
+    if (s->cpu.nidle) {
+        add("CPU idle", CH_WAKEUPS, 0, "", "/s", "Wake-ups", "cpu.wakeups");
+        for (int k = 0; k < s->cpu.nidle; k++)
+            if (strcmp(s->cpu.idle[k].name, "POLL")) {
+                sfmt(lab, sizeof lab, "Idle in %s", s->cpu.idle[k].name);
+                add("CPU idle", CH_CSTATE, k, "", "%", lab, "cpu.idle.%s", s->cpu.idle[k].name);
+            }
+    }
+
     add("Memory", CH_MEM_PCT, 0, "", "%", "Memory used", "mem.used_pct");
     add("Memory", CH_MEM_USED, 0, "", "MB", "Memory used", "mem.used");
     if (s->mem.swap_total)
@@ -177,14 +216,14 @@ void log_build_channels(sys_t *s, const char *skip)
         add("Power", CH_BAT_CHARGE, i, "", "%", lab, "power.%s.charge", s->power.bat[i].name);
     }
 
-    static const char *const unit[] = { "C", "RPM", "W" };
+    static const char *const unit[] = { "C", "RPM", "W", "V" };
+    static const char *const grp[] = { "Temperatures", "Fans", "Power", "Voltages" };
     for (int i = 0; i < s->sens.n; i++) {
         sensor_t *t = &s->sens.s[i];
         char chip[24];
         sensors_chip_name(t->chip, chip, sizeof chip);
         sfmt(lab, sizeof lab, "%s %s", chip, t->label); /* "CPU Core 0", "NVMe Composite" */
-        add(t->type == SENS_FAN ? "Fans" : t->type == SENS_POWER ? "Power" : "Temperatures", CH_SENSOR, i, "",
-            unit[t->type], lab, "sensor.%s.%s", t->chip, t->label);
+        add(grp[t->type], CH_SENSOR, i, "", unit[t->type], lab, "sensor.%s.%s", t->chip, t->label);
     }
 
     for (int i = 0; i < s->disks.n; i++) {
@@ -195,6 +234,10 @@ void log_build_channels(sys_t *s, const char *skip)
         add("Disks", CH_DISK_W, 0, d->name, "MB/s", lab, "disk.%s.write", d->name);
         sfmt(lab, sizeof lab, "%s busy", d->name);
         add("Disks", CH_DISK_BUSY, 0, d->name, "%", lab, "disk.%s.busy", d->name);
+        sfmt(lab, sizeof lab, "%s read time", d->name);
+        add("Disks", CH_DISK_RLAT, 0, d->name, "ms", lab, "disk.%s.read_ms", d->name);
+        sfmt(lab, sizeof lab, "%s write time", d->name);
+        add("Disks", CH_DISK_WLAT, 0, d->name, "ms", lab, "disk.%s.write_ms", d->name);
     }
 
     for (int i = 0; i < s->net.n; i++) {
@@ -207,7 +250,16 @@ void log_build_channels(sys_t *s, const char *skip)
         add("Network", CH_NET_RX, 0, f->name, "MB/s", lab, "net.%s.rx", f->name);
         sfmt(lab, sizeof lab, "%s upload", f->name);
         add("Network", CH_NET_TX, 0, f->name, "MB/s", lab, "net.%s.tx", f->name);
+        sfmt(lab, sizeof lab, "%s errors+drops", f->name);
+        add("Network", CH_NET_ERR, 0, f->name, "/s", lab, "net.%s.errors", f->name);
+        if (f->wireless) {
+            sfmt(lab, sizeof lab, "%s Wi-Fi signal", f->name);
+            add("Network", CH_NET_SIGNAL, 0, f->name, "dBm", lab, "net.%s.signal", f->name);
+        }
     }
+
+    /* kernel errors, throttling, OOM kills... as text, in the last column */
+    add("Events", CH_EVENTS, 0, "", "count", "Events", "events");
 
     for (int i = 0; i < g_log.nchan; i++)
         g_log.ch[i].on = !(skip && in_list(skip, g_log.ch[i].id));
@@ -282,18 +334,56 @@ double log_chan_value(const sys_t *s, const chan_t *c)
         return NAN;
     case CH_NET_RX:
     case CH_NET_TX:
+    case CH_NET_ERR:
+    case CH_NET_SIGNAL:
         for (i = 0; i < s->net.n; i++)
-            if (!strcmp(s->net.i[i].name, c->name))
-                return (c->kind == CH_NET_RX ? s->net.i[i].rx_bps : s->net.i[i].tx_bps) / MB;
+            if (!strcmp(s->net.i[i].name, c->name)) {
+                const netif_t *f = &s->net.i[i];
+                switch (c->kind) {
+                case CH_NET_RX: return f->rx_bps / MB;
+                case CH_NET_TX: return f->tx_bps / MB;
+                case CH_NET_ERR: return f->err_rate + f->drop_rate;
+                default: return f->quality >= 0 ? f->signal_dbm : NAN;
+                }
+            }
         return NAN;
+    case CH_DISK_RLAT:
+    case CH_DISK_WLAT:
+        for (i = 0; i < s->disks.n; i++)
+            if (!strcmp(s->disks.d[i].name, c->name))
+                return c->kind == CH_DISK_RLAT ? s->disks.d[i].rd_lat : s->disks.d[i].wr_lat;
+        return NAN;
+    case CH_THROTTLE: return s->health.thr_ok ? s->health.thr_pct : NAN;
+    case CH_PSI: {
+        const psi_t *p = &s->health.psi[c->a / 2];
+        return p->ok ? (c->a & 1 ? p->full : p->some) : NAN;
+    }
+    case CH_OOM: return s->mem.oom_ok ? (double)s->mem.oom_kill : NAN;
+    case CH_PCIE:
+        return s->health.aer_ok ? (double)(s->health.pci_cor + s->health.pci_nonfatal + s->health.pci_fatal) : NAN;
+    case CH_NVME_USED:
+    case CH_NVME_MEDIA:
+    case CH_NVME_UNSAFE:
+    case CH_NVME_WARN: {
+        if (c->a >= s->health.nnvme || s->health.nvme[c->a].state != 1)
+            return NAN;
+        const nvme_t *v = &s->health.nvme[c->a];
+        return c->kind == CH_NVME_USED ? v->used : c->kind == CH_NVME_MEDIA ? (double)v->media_err
+             : c->kind == CH_NVME_UNSAFE ? (double)v->unsafe : (double)v->crit;
+    }
+    case CH_WAKEUPS: return s->cpu.nidle ? s->cpu.wakeups : NAN;
+    case CH_CSTATE: return c->a < s->cpu.nidle ? s->cpu.idle[c->a].pct : NAN;
+    case CH_EVENTS: return (double)s->health.nev;
     }
     return NAN;
 }
 
 static int decimals(const char *unit)
 {
-    if (!strcmp(unit, "MHz") || !strcmp(unit, "RPM"))
+    if (!strcmp(unit, "MHz") || !strcmp(unit, "RPM") || !strcmp(unit, "count") || !strcmp(unit, "dBm"))
         return 0;
+    if (!strcmp(unit, "V"))
+        return 3;
     if (!strcmp(unit, "MB/s"))
         return 3;
     if (!strcmp(unit, "W") || !*unit)
@@ -309,6 +399,8 @@ void log_fmt_value(const chan_t *c, double v, char *out, size_t n)
     }
     if (!strcmp(c->unit, "C"))
         sfmt(out, n, "%.1f °C", v);
+    else if (!strcmp(c->unit, "count"))
+        sfmt(out, n, "%.0f", v);
     else if (!strcmp(c->unit, "%"))
         sfmt(out, n, "%.1f %%", v);
     else if (*c->unit)
@@ -388,14 +480,45 @@ static void note(int err, const char *fmt, ...)
     g_log.note_new = 1;
 }
 
+/* the events since the previous row, as one quoted CSV field:
+ * "12:03:44 disk: nvme0n1: I/O error ... | 12:03:50 thermal: ..." */
+static void put_events(FILE *f, health_t *h)
+{
+    fputs(",\"", f);
+    int n = 0;
+    for (int i = h->nev - 1; i >= 0; i--) { /* oldest first */
+        const event_t *e = health_event_at(h, i);
+        if (e->seq <= g_log.ev_seq)
+            continue;
+        char ts[16];
+        time_t t = (time_t)e->t;
+        struct tm tm;
+        localtime_r(&t, &tm);
+        strftime(ts, sizeof ts, "%H:%M:%S", &tm);
+        fprintf(f, "%s%s %s: ", n++ ? " | " : "", ts, e->cat);
+        for (const char *q = e->text; *q; q++) {
+            if (*q == '"')
+                fputc('"', f); /* CSV: quotes are doubled */
+            if ((unsigned char)*q >= 32 || *q == '\t')
+                fputc(*q, f);
+        }
+    }
+    fputc('"', f);
+    g_log.ev_seq = h->ev_seq;
+}
+
 static void sys_row(sys_t *s, double now)
 {
     char ts[32];
     stamp(ts, sizeof ts, "%Y-%m-%d %H:%M:%S");
     fprintf(g_log.f, "%s,%.1f", ts, now - g_log.t0);
     for (int i = 0; i < g_log.nchan; i++)
-        if (g_log.ch[i].on)
-            put_num(g_log.f, log_chan_value(s, &g_log.ch[i]), decimals(g_log.ch[i].unit));
+        if (g_log.ch[i].on) {
+            if (g_log.ch[i].kind == CH_EVENTS)
+                put_events(g_log.f, &s->health);
+            else
+                put_num(g_log.f, log_chan_value(s, &g_log.ch[i]), decimals(g_log.ch[i].unit));
+        }
     fputc('\n', g_log.f);
     fflush(g_log.f);
     g_log.rows++;
@@ -425,7 +548,7 @@ int log_start(sys_t *s, char *err, size_t n)
         chan_t *c = &g_log.ch[i];
         if (!c->on)
             continue;
-        if (*c->unit)
+        if (*c->unit && strcmp(c->unit, "count"))
             fprintf(g_log.f, ",\"%s (%s)\"", c->label, c->unit);
         else
             fprintf(g_log.f, ",\"%s\"", c->label);
@@ -433,6 +556,7 @@ int log_start(sys_t *s, char *err, size_t n)
     fputc('\n', g_log.f);
     g_log.rows = 0;
     g_log.t0 = g_log.last_sync = now_sec();
+    g_log.ev_seq = s->health.ev_seq; /* only what happens from now on */
     sys_row(s, g_log.t0); /* first row right away */
     return g_log.f ? 0 : -1;
 }
@@ -484,6 +608,9 @@ static void proc_row(sys_t *s, plog_t *pl, proc_t *p, double now)
     fprintf(pl->f, ",%d", p->nthreads);
     put_num(pl->f, p->io_ok ? p->rd_bps / MB : NAN, 3);
     put_num(pl->f, p->io_ok ? p->wr_bps / MB : NAN, 3);
+    put_num(pl->f, p->gpu, 1);
+    put_num(pl->f, p->gpu >= 0 || p->gpu_mem ? (double)p->gpu_mem / MB : NAN, 1);
+    put_num(pl->f, p->nfds >= 0 ? (double)p->nfds : NAN, 0);
     put_num(pl->f, s->cpu.total, 1);
     put_num(pl->f, nn(s->cpu.temp_c), 1);
     fputc('\n', pl->f);
@@ -521,7 +648,8 @@ int log_proc_start(sys_t *s, pid_t pid, unsigned long long start, char *err, siz
     if (!pl->f)
         return -1;
     fprintf(pl->f, "time,elapsed_s,pid,state,\"CPU (%% of one core)\",\"Memory (%%)\",\"RSS (MB)\",threads,"
-                   "\"Disk read (MB/s)\",\"Disk write (MB/s)\",\"System CPU (%%)\",\"CPU temperature (C)\"\n");
+                   "\"Disk read (MB/s)\",\"Disk write (MB/s)\",\"GPU (%%)\",\"GPU memory (MB)\",\"Open files\","
+                   "\"System CPU (%%)\",\"CPU temperature (C)\"\n");
     pl->t0 = now_sec();
     g_log.nplog++;
     proc_row(s, pl, p, pl->t0);
