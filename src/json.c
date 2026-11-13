@@ -232,6 +232,15 @@ static void gpus(sys_t *s)
         pos("vram_used_bytes", g->mem_used, 0);
         pos("vram_total_bytes", g->mem_total, 0);
         pos("fan_pct", g->fan_pct, 0);
+        if (g->nv_state != NV_NONE) {
+            s_("state", g->nv_state == NV_ASLEEP ? "asleep" : g->nv_state == NV_IDLE ? "idle" : "awake");
+            pos("temp_limit_c", g->temp_lim, 0);
+        }
+        if (g->reasons_ok) {
+            boolean("slowed_by_heat", (g->slow_now & GS_HEAT) != 0);
+            boolean("slowed_by_power_limit", (g->slow_now & GS_POWER) != 0);
+            pos("held_back_pct_of_busy_time", g->busy_s > 0 ? 100.0 * g->held_s / g->busy_s : -1, 1);
+        }
         close_('}');
     }
     close_(']');
@@ -266,6 +275,10 @@ static void power(sys_t *s)
             integer("cycles", b->cycles);
         else
             null_("cycles");
+        if (b->lim_end > 0)
+            integer("charge_limit_pct", b->lim_end);
+        else
+            null_("charge_limit_pct");
         close_('}');
     }
     close_(']');

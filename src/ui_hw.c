@@ -145,6 +145,8 @@ static void hw_sensors(sys_t *s, lc_t *c)
             if (t->uhi > 0)
                 sfmt(lim, sizeof lim, "your limit %.0f W", t->uhi);
         }
+        if (t->still) /* a placeholder, or nothing connected */
+            str_copy(lim, sizeof lim, t->type == SENS_VOLT ? "0 V all along: nothing connected?" : "hasn't changed since hsm started");
         if (lim[0] && c->x + c->w - xx > 6)
             put(y, xx + 2, c->x + c->w - xx - 2, A_GRAY, "%s", lim);
     }
@@ -241,6 +243,13 @@ static void hw_health(sys_t *s, lc_t *c)
     if (H->files_max) {
         fmt_si((double)H->files, a, sizeof a);
         lc_kv(c, "Open files", A_NORMAL, "%s handles in use (whole system)", a);
+    }
+    for (int i = 0; i < s->power.nbat; i++) {
+        const battery_t *bt = &s->power.bat[i];
+        if (bt->health > 0 && bt->health < 80)
+            lc_kv(c, "Battery", bt->health < 60 ? CP(C_CRIT) | A_BOLD : CP(C_WARN) | A_BOLD,
+                  "%s holds %.0f%% of what it did when new: worn%s", bt->name, bt->health,
+                  bt->health < 60 ? ", it won't last long on battery" : "");
     }
 
     /* NVMe drive health */
@@ -353,6 +362,19 @@ static void hw_gpus(sys_t *s, lc_t *c)
             app(b, sizeof b, "%sPCI %s", SEP, g->pci);
         app(b, sizeof b, "%s%s%s", SEP, g->card, g->integrated ? " (integrated)" : "");
         lc_kv(c, "  Driver", A_NORMAL, "%s", b);
+        if (g->nv_state != NV_NONE) { /* NVIDIA: asleep or awake, and what hsm does about it */
+            const char *ps = g->nv_state == NV_ASLEEP ? "asleep (powered off)"
+                           : g->nv_state == NV_IDLE   ? "idle: hsm let go of it so it can power off"
+                           : !g->pm_auto              ? "awake (it can't power off: runtime power management is off)"
+                           : g->nv_fails              ? "awake: something else keeps it on (a screen on it, or a program using it)"
+                                                      : "awake (powers off by itself when idle; hsm lets it)";
+            lc_kv(c, "  Power state", g->nv_state == NV_ASLEEP ? CP(C_OK) : A_NORMAL, "%s", ps);
+        }
+        if (g->nv_state == NV_ASLEEP || g->nv_state == NV_IDLE) {
+            if (g->note[0])
+                lc_kv(c, "  Note", CP(C_WARN), "%s", g->note);
+            continue; /* nothing more to read without waking it */
+        }
         if (g->util >= 0) {
             b[0] = '\0';
             for (int e = 0; e < g->neng; e++)
@@ -375,8 +397,30 @@ static void hw_gpus(sys_t *s, lc_t *c)
             lc_kv(c, "  Max clock", A_NORMAL, "%.0f MHz", g->clk_max_mhz);
         if (g->mem_clk_mhz > 0)
             lc_kv(c, "  Memory clock", A_NORMAL, "%.0f MHz", g->mem_clk_mhz);
-        if (g->temp_c >= 0)
-            lc_kv(c, "  Temperature", temp_attr(g->temp_c) | A_BOLD, "%.1f%s", g->temp_c, DEG);
+        if (g->temp_c >= 0) {
+            char lim[96] = "";
+            if (g->temp_lim > 0)
+                app(lim, sizeof lim, "  (slows down from %.0f%s", g->temp_lim, DEG);
+            if (g->temp_slow > 0 && g->temp_slow != g->temp_lim)
+                app(lim, sizeof lim, "%shardware slowdown %.0f%s", lim[0] ? "; " : "  (", g->temp_slow, DEG);
+            if (g->temp_shut > 0)
+                app(lim, sizeof lim, "%sshutdown %.0f%s", lim[0] ? ", " : "  (", g->temp_shut, DEG);
+            if (lim[0])
+                app(lim, sizeof lim, ")");
+            lc_kv(c, "  Temperature", temp_attr_lim(g->temp_c, g->temp_lim) | A_BOLD, "%.1f%s%s", g->temp_c, DEG, lim);
+        }
+        if (g->reasons_ok) { /* why it isn't at full speed, as the driver says */
+            char since[128] = "";
+            if (g->busy_s > 0 && g->held_s > 0)
+                sfmt(since, sizeof since, "; held back %.0f%% of its busy time since start (heat %.0f%%, power limit %.0f%%)",
+                     100.0 * g->held_s / g->busy_s, 100.0 * g->heat_s / g->busy_s, 100.0 * g->pwr_s / g->busy_s);
+            if (g->slow_now)
+                lc_kv(c, "  Slowing down", g->slow_now & GS_HEAT ? CP(C_WARN) | A_BOLD : A_BOLD, "now: %s%s",
+                      g->slow_now == (GS_HEAT | GS_POWER) ? "heat and its power limit" : g->slow_now & GS_HEAT ? "heat" : "its power limit",
+                      since);
+            else
+                lc_kv(c, "  Slowing down", A_NORMAL, "no%s", since);
+        }
         if (g->power_w >= 0) {
             if (g->power_cap_w > 0)
                 lc_kv(c, "  Power", CP(C_WARN) | A_BOLD, "%.1f W of %.0f W limit", g->power_w, g->power_cap_w);
@@ -401,12 +445,16 @@ static void hw_power(sys_t *s, lc_t *c)
     lc_title(c, "Power");
     if (s->total_w >= 0)
         lc_kv(c, "Estimated draw", CP(C_WARN) | A_BOLD, "%.1f W  (%s)", s->total_w, s->total_w_src);
+    else if (s->total_why[0])
+        lc_kv(c, "Estimated draw", A_GRAY, "the CPU part %s: the GPUs alone are no total", s->total_why);
     for (int i = 0; i < p->nrapl; i++) {
         rapl_t *z = &p->z[i];
         char k[48];
         sfmt(k, sizeof k, "%sRAPL %s", z->depth ? "  " : "", z->name);
         if (!z->readable)
             lc_kv(c, k, CP(C_WARN), "%s", "no permission");
+        else if (z->watts >= 0 && p->psys_bad && !strcmp(z->name, "psys"))
+            lc_kv(c, k, A_GRAY, "%.2f W  (less than the CPU inside it: not connected, left out)", z->watts);
         else if (z->watts >= 0)
             lc_kv(c, k, A_BOLD, "%.2f W", z->watts);
         else
@@ -427,11 +475,28 @@ static void hw_power(sys_t *s, lc_t *c)
               tl[0] ? ", " : "", tl);
         if (b->watts >= 0)
             lc_kv(c, "  Rate", CP(C_WARN) | A_BOLD, "%.2f W", b->watts);
-        if (b->health >= 0)
+        if (b->health >= 0) {
+            char wh[48] = "";
+            if (b->full_wh > 0 && b->design_wh > 0)
+                sfmt(wh, sizeof wh, ": %.1f of %.1f Wh", b->full_wh, b->design_wh);
             lc_kv(c, "  Health", b->health < 60 ? CP(C_CRIT) | A_BOLD : b->health < 80 ? CP(C_WARN) : A_BOLD,
-                  "%.0f%% of its original capacity%s", b->health, b->health < 80 ? " (worn)" : "");
+                  "%.0f%% of its original capacity%s%s", b->health, wh, b->health < 80 ? " (worn)" : "");
+        }
         if (b->cycles >= 0)
             lc_kv(c, "  Charge cycles", A_NORMAL, "%ld", b->cycles);
+        if (b->lim_ok) {
+            if (b->lim_end > 0 && b->lim_start > 0)
+                lc_kv(c, "  Charge limit", A_BOLD, "stops at %d%%, starts again below %d%%", b->lim_end, b->lim_start);
+            else if (b->lim_end > 0)
+                lc_kv(c, "  Charge limit", A_BOLD, "stops charging at %d%%", b->lim_end);
+            else
+                lc_kv(c, "  Charge limit", A_NORMAL, "%s", "none: charges to 100%");
+            /* full and plugged in all day: a limit slows the wear */
+            if (b->lim_end < 0 && p->ac_online == 1 && b->capacity >= 95) {
+                lc_text(c, A_GRAY, "    A battery kept full on AC wears faster; this laptop can stop at 60-80%%:");
+                lc_text(c, A_GRAY, "    echo 80 | sudo tee %s/%s", b->path, b->lim_file);
+            }
+        }
     }
     if (p->ac_online >= 0)
         lc_kv(c, "AC adapter", A_BOLD, "%s", p->ac_online ? "online" : "offline");

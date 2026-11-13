@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -55,7 +56,14 @@ typedef struct { /* nvmlProcessUtilizationSample_t */
     unsigned int sm, mem, enc, dec;
 } nvpsample_t;
 
+typedef struct { /* nvmlPciInfo_t (v3) */
+    char bus_legacy[16];
+    unsigned int domain, bus, device, pci_id, pci_sub;
+    char bus_id[32];
+} nvpci_t;
+
 static void *nv_lib;
+static int nv_live; /* nvmlInit done: the handles are valid */
 static nvret_t (*nv_init)(void);
 static nvret_t (*nv_shutdown)(void);
 static nvret_t (*nv_count)(unsigned int *);
@@ -70,10 +78,20 @@ static nvret_t (*nv_clock)(nvdev_t, int, unsigned int *);
 static nvret_t (*nv_maxclock)(nvdev_t, int, unsigned int *);
 static nvret_t (*nv_fan)(nvdev_t, unsigned int *);
 static nvret_t (*nv_putil)(nvdev_t, nvpsample_t *, unsigned int *, unsigned long long);
+static nvret_t (*nv_pci)(nvdev_t, nvpci_t *);
+static nvret_t (*nv_reasons)(nvdev_t, unsigned long long *);
+static nvret_t (*nv_thresh)(nvdev_t, int, unsigned int *);
 
 #define NV_SYM(var, name) (*(void **)(&(var)) = dlsym(nv_lib, name))
 
-static int nvml_load(void)
+/* why the clock is held back (nvmlClocksEventReasons) */
+#define NVR_SW_POWER 0x4ULL
+#define NVR_SW_THERMAL 0x20ULL
+#define NVR_HW_THERMAL 0x40ULL
+#define NVR_HW_POWER_BRAKE 0x80ULL
+
+/* the library only: starting NVML wakes every NVIDIA GPU, so that waits */
+static int nvml_lib(void)
 {
     nv_lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
     if (!nv_lib)
@@ -94,7 +112,12 @@ static int nvml_load(void)
     NV_SYM(nv_maxclock, "nvmlDeviceGetMaxClockInfo");
     NV_SYM(nv_fan, "nvmlDeviceGetFanSpeed");
     NV_SYM(nv_putil, "nvmlDeviceGetProcessUtilization");
-    if (!nv_init || !nv_count || !nv_handle || nv_init() != 0) {
+    NV_SYM(nv_pci, "nvmlDeviceGetPciInfo_v3");
+    NV_SYM(nv_reasons, "nvmlDeviceGetCurrentClocksEventReasons"); /* driver 535 on */
+    if (!nv_reasons)
+        NV_SYM(nv_reasons, "nvmlDeviceGetCurrentClocksThrottleReasons"); /* its old name */
+    NV_SYM(nv_thresh, "nvmlDeviceGetTemperatureThreshold");
+    if (!nv_init || !nv_count || !nv_handle) {
         dlclose(nv_lib);
         nv_lib = NULL;
         return -1;
@@ -128,6 +151,14 @@ static void nvml_sample(gpu_t *g)
         g->clk_max_mhz = u;
     if (nv_fan && !nv_fan(d, &u))
         g->fan_pct = u;
+    unsigned long long r;
+    g->reasons = 0;
+    if (nv_reasons && !nv_reasons(d, &r)) {
+        g->reasons = r;
+        g->reasons_ok = 1;
+    }
+    if (g->power_w >= 0)
+        g->last_power = g->power_w;
 }
 
 /* ------------------------------------------------------ PCI name lookup */
@@ -407,33 +438,223 @@ static void add_sysfs_gpus(gpus_t *gs, int nvml_ok)
     }
 }
 
-void gpus_init(gpus_t *gs)
+/* ---------------------------------------------- NVIDIA: letting it sleep
+ *
+ * A laptop's NVIDIA GPU powers itself off when nothing uses it (runtime D3),
+ * and back on when something does - including every NVML query. Asking it
+ * for its load once a second would keep it on for good, at 5-10 W. So:
+ *   - whether it's asleep comes from its PCI device in sysfs, which doesn't
+ *     wake it; a GPU that's asleep at start isn't touched at all;
+ *   - after 10 s at 0% load, NVML lets go of it, so it can power off;
+ *   - when something wakes it (a game), NVML picks it up again;
+ *   - if it stays on without hsm (an external screen on it, a program that
+ *     holds it), NVML stays too, and tries letting go again later. */
+
+#define NV_IDLE_LET_GO 10.0 /* s at 0% load before NVML lets go */
+#define NV_WAIT_SLEEP 20.0  /* s to wait for it to power off after that */
+
+static void pm_read(const gpu_t *g, char *st, size_t n)
 {
-    int nvml_ok = nvml_load() == 0;
-    add_sysfs_gpus(gs, nvml_ok);
-    if (nvml_ok) {
-        unsigned int cnt = 0;
-        if (nv_count(&cnt) != 0)
-            cnt = 0;
-        for (unsigned int i = 0; i < cnt && gs->n < MAX_GPUS; i++) {
-            nvdev_t h;
-            if (nv_handle(i, &h) != 0)
-                continue;
-            gpu_t *g = &gs->g[gs->n++];
-            memset(g, 0, sizeof *g);
-            g->nvml = h;
-            str_copy(g->vendor, sizeof g->vendor, "NVIDIA");
-            str_copy(g->driver, sizeof g->driver, "nvidia");
-            sfmt(g->card, sizeof g->card, "nvml%u", i);
-            if (!nv_name || nv_name(h, g->name, sizeof g->name) != 0)
-                sfmt(g->name, sizeof g->name, "NVIDIA GPU %u", i);
-            if (strncmp(g->name, "NVIDIA", 6)) {
-                char tmp[96];
-                str_copy(tmp, sizeof tmp, g->name);
-                sfmt(g->name, sizeof g->name, "NVIDIA %s", tmp);
+    st[0] = '\0';
+    if (g->pm_path[0])
+        read_line(g->pm_path, st, n);
+}
+
+/* NVIDIA GPUs on the nvidia driver, from sysfs (with or without a DRM card) */
+static void add_nvidia_pci(gpus_t *gs)
+{
+    char base[PATHBUF], p[PATHBUF], b[128];
+    sfmt(base, sizeof base, "%s/bus/pci/devices", g_sysfs);
+    DIR *d = opendir(base);
+    if (!d)
+        return;
+    char addr[MAX_GPUS][24];
+    int na = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && na < MAX_GPUS) {
+        if (e->d_name[0] == '.')
+            continue;
+        unsigned ven, cls;
+        sfmt(p, sizeof p, "%s/%s/vendor", base, e->d_name);
+        if (read_hex(p, &ven) || ven != 0x10de)
+            continue;
+        sfmt(p, sizeof p, "%s/%s/class", base, e->d_name);
+        if (read_hex(p, &cls) || (cls >> 16) != 0x03) /* display controllers only (not its audio) */
+            continue;
+        char drv[32];
+        sfmt(p, sizeof p, "%s/%s/driver", base, e->d_name);
+        link_base(p, drv, sizeof drv);
+        if (strcmp(drv, "nvidia"))
+            continue;
+        str_copy(addr[na++], sizeof addr[0], e->d_name);
+    }
+    closedir(d);
+    for (int i = 1; i < na; i++) /* in bus order */
+        for (int j = i; j > 0 && strcmp(addr[j], addr[j - 1]) < 0; j--) {
+            char t[24];
+            str_copy(t, sizeof t, addr[j]);
+            str_copy(addr[j], sizeof addr[j], addr[j - 1]);
+            str_copy(addr[j - 1], sizeof addr[j - 1], t);
+        }
+    for (int i = 0; i < na && gs->n < MAX_GPUS; i++) {
+        gpu_t *g = &gs->g[gs->n++];
+        memset(g, 0, sizeof *g);
+        str_copy(g->vendor, sizeof g->vendor, "NVIDIA");
+        str_copy(g->driver, sizeof g->driver, "nvidia");
+        str_copy(g->pci, sizeof g->pci, addr[i]);
+        sfmt(g->dev, sizeof g->dev, "%s/%s", base, addr[i]);
+        unsigned dev = 0;
+        sfmt(p, sizeof p, "%s/device", g->dev);
+        read_hex(p, &dev);
+        char pn[80];
+        if (pci_lookup_name(0x10de, dev, pn, sizeof pn) == 0)
+            sfmt(g->name, sizeof g->name, "NVIDIA %s", pn);
+        else
+            sfmt(g->name, sizeof g->name, "NVIDIA GPU [10de:%04x]", dev);
+        g->clk_max_mhz = g->mem_total = g->temp_lim = g->temp_slow = g->temp_shut = -1;
+        g->nv_state = NV_IDLE;
+        /* may the kernel power it off? (power/control "auto", and the driver
+         * didn't turn the feature off) */
+        sfmt(g->pm_path, sizeof g->pm_path, "%s/power/runtime_status", g->dev);
+        sfmt(p, sizeof p, "%s/power/control", g->dev);
+        g->pm_auto = !read_line(p, b, sizeof b) && !strcmp(b, "auto") && path_exists(g->pm_path);
+        sfmt(p, sizeof p, "%s/driver/nvidia/gpus/%s/power", g_procfs, addr[i]);
+        char info[512];
+        if (g->pm_auto && read_file(p, info, sizeof info) > 0) {
+            char *rt = strstr(info, "Runtime D3 status:");
+            if (rt) {
+                rt[strcspn(rt, "\n")] = '\0';
+                if (strstr(rt, "Disabled") || strstr(rt, "Not supported"))
+                    g->pm_auto = 0;
             }
         }
+        char st[32];
+        pm_read(g, st, sizeof st);
+        if (!strcmp(st, "suspended"))
+            g->nv_state = NV_ASLEEP;
     }
+}
+
+static gpu_t *nv_match(gpus_t *gs, nvdev_t h, unsigned idx, unsigned cnt)
+{
+    nvpci_t pi;
+    if (nv_pci && !nv_pci(h, &pi)) {
+        char a[24];
+        sfmt(a, sizeof a, "%04x:%02x:%02x.0", pi.domain & 0xffff, pi.bus & 0xff, pi.device & 0xff);
+        for (int i = 0; i < gs->n; i++)
+            if (gs->g[i].nv_state != NV_NONE && !strcasecmp(gs->g[i].pci, a))
+                return &gs->g[i];
+    }
+    /* no PCI info: one NVIDIA GPU in sysfs and one in NVML are the same */
+    int k = -1, nnv = 0;
+    for (int i = 0; i < gs->n; i++)
+        if (gs->g[i].nv_state != NV_NONE) {
+            nnv++;
+            k = i;
+        }
+    if (nnv == 1 && cnt == 1 && idx == 0 && !gs->g[k].nvml)
+        return &gs->g[k];
+    return NULL;
+}
+
+/* start NVML and give each NVIDIA GPU its handle; 0 = done */
+static int nvml_up(gpus_t *gs)
+{
+    if (!nv_lib || nv_live)
+        return nv_live ? 0 : -1;
+    int r = nv_init();
+    if (r != 0) { /* say why on the GPUs, instead of showing them idle */
+        for (int i = 0; i < gs->n; i++)
+            if (gs->g[i].nv_state != NV_NONE)
+                sfmt(gs->g[i].note, sizeof gs->g[i].note, "%s",
+                     r == 18  ? "NVML doesn't match the driver: reboot after a driver update"
+                     : r == 9 ? "the NVIDIA driver isn't loaded"
+                              : "NVML didn't start");
+        return -1;
+    }
+    nv_live = 1;
+    unsigned int cnt = 0;
+    if (nv_count(&cnt) != 0)
+        cnt = 0;
+    for (unsigned int i = 0; i < cnt; i++) {
+        nvdev_t h;
+        if (nv_handle(i, &h) != 0)
+            continue;
+        gpu_t *g = nv_match(gs, h, i, cnt);
+        if (!g) { /* not in sysfs (no PCI info there): NVML alone tells about it */
+            if (gs->n >= MAX_GPUS)
+                continue;
+            g = &gs->g[gs->n++];
+            memset(g, 0, sizeof *g);
+            str_copy(g->vendor, sizeof g->vendor, "NVIDIA");
+            str_copy(g->driver, sizeof g->driver, "nvidia");
+            g->clk_max_mhz = g->mem_total = g->temp_lim = g->temp_slow = g->temp_shut = -1;
+            g->name[0] = '\0';
+        }
+        g->nvml = h;
+        g->nv_state = NV_ON;
+        g->nv_idle_t = 0;
+        g->note[0] = '\0';
+        sfmt(g->card, sizeof g->card, "nvml%u", i);
+        char nm[96];
+        if (nv_name && nv_name(h, nm, sizeof nm) == 0 && nm[0]) { /* the driver's own name beats pci.ids */
+            if (strncmp(nm, "NVIDIA", 6))
+                sfmt(g->name, sizeof g->name, "NVIDIA %s", nm);
+            else
+                str_copy(g->name, sizeof g->name, nm);
+        } else if (!g->name[0]) {
+            sfmt(g->name, sizeof g->name, "NVIDIA GPU %u", i);
+        }
+        unsigned int t;
+        if (nv_thresh && g->temp_lim < 0) { /* where it slows itself down, from the card's own table */
+            if (!nv_thresh(h, 3 /* GPU_MAX: max operating */, &t) && t > 0 && t < 150)
+                g->temp_lim = t;
+            if (!nv_thresh(h, 1 /* SLOWDOWN: hardware */, &t) && t > 0 && t < 150)
+                g->temp_slow = t;
+            if (!nv_thresh(h, 0 /* SHUTDOWN */, &t) && t > 0 && t < 150)
+                g->temp_shut = t;
+            if (g->temp_lim < 0 && g->temp_slow > 0)
+                g->temp_lim = g->temp_slow;
+        }
+    }
+    return 0;
+}
+
+/* let go of NVML, so the GPUs can power off */
+static void nvml_down(gpus_t *gs)
+{
+    if (!nv_live)
+        return;
+    double now = now_sec();
+    for (int i = 0; i < gs->n; i++) {
+        gpu_t *g = &gs->g[i];
+        if (g->nv_state == NV_NONE)
+            continue;
+        g->nvml = NULL;
+        g->nv_state = NV_IDLE;
+        g->nv_wait_t = now;
+        g->slow_now = 0;
+        g->slow_since = 0;
+    }
+    if (nv_shutdown)
+        nv_shutdown();
+    nv_live = 0;
+}
+
+void gpus_init(gpus_t *gs)
+{
+    int lib = nvml_lib() == 0;
+    add_sysfs_gpus(gs, lib);
+    if (!lib)
+        return;
+    int first = gs->n;
+    add_nvidia_pci(gs);
+    /* asleep, every one of them: leave them be until something wakes them */
+    int awake = 0;
+    for (int i = first; i < gs->n; i++)
+        awake |= gs->g[i].nv_state != NV_ASLEEP;
+    if (awake || gs->n == first) /* or none in sysfs at all: NVML knows */
+        nvml_up(gs);
 }
 
 static void sysfs_sample(gpu_t *g)
@@ -503,18 +724,122 @@ static void sysfs_sample(gpu_t *g)
     }
 }
 
-void gpus_sample(gpus_t *gs, double dt)
+/* held back by heat / by a power limit, out of the clock event reasons */
+static int slow_bits(unsigned long long r)
 {
-    (void)dt;
+    return ((r & (NVR_SW_THERMAL | NVR_HW_THERMAL)) ? GS_HEAT : 0) | ((r & (NVR_SW_POWER | NVR_HW_POWER_BRAKE)) ? GS_POWER : 0);
+}
+
+static void nv_policy(gpus_t *gs, double now)
+{
+    int any = 0, all_idle = 1, all_auto = 1;
     for (int i = 0; i < gs->n; i++) {
         gpu_t *g = &gs->g[i];
+        if (g->nv_state == NV_NONE)
+            continue;
+        any = 1;
+        all_auto &= g->pm_auto;
+        if (g->nv_state == NV_ON) {
+            if (g->util > 0 || g->util < 0)
+                g->nv_idle_t = 0;
+            else if (!g->nv_idle_t)
+                g->nv_idle_t = now;
+            all_idle &= g->nv_idle_t > 0 && now - g->nv_idle_t >= NV_IDLE_LET_GO;
+        }
+    }
+    if (!any || !all_auto) /* can't power off: NVML stays, as it always did */
+        return;
+    if (nv_live) {
+        if (all_idle && now >= gs->nv_keep_until)
+            nvml_down(gs);
+        return;
+    }
+    /* let go of: asleep now, or woken up by something, or still on? */
+    int wake = 0, stays_on = 0;
+    for (int i = 0; i < gs->n; i++) {
+        gpu_t *g = &gs->g[i];
+        if (g->nv_state == NV_NONE)
+            continue;
+        char st[32];
+        pm_read(g, st, sizeof st);
+        if (!strcmp(st, "suspended")) {
+            if (g->nv_state != NV_ASLEEP)
+                g->nv_fails = 0; /* it did power off */
+            g->nv_state = NV_ASLEEP;
+        } else if (g->nv_state == NV_ASLEEP) {
+            wake = 1; /* a game, a video, another program: worth watching */
+        } else if (now - g->nv_wait_t >= NV_WAIT_SLEEP) {
+            stays_on = 1; /* something else keeps it on: hsm isn't the reason */
+        }
+    }
+    if ((wake || stays_on) && now >= gs->nv_retry_t) {
+        if (nvml_up(gs) != 0) {
+            gs->nv_retry_t = now + 30;
+            return;
+        }
+        int fails = 0;
+        for (int i = 0; i < gs->n; i++)
+            if (gs->g[i].nv_state != NV_NONE) {
+                if (stays_on)
+                    gs->g[i].nv_fails++;
+                fails = MAX(fails, gs->g[i].nv_fails);
+            }
+        /* stays on anyway: try letting go again after 5, 10, 20, 40 min */
+        gs->nv_keep_until = stays_on ? now + 300.0 * (1 << MIN(MAX(fails - 1, 0), 3)) : now;
+    }
+}
+
+void gpus_sample(gpus_t *gs, double dt)
+{
+    double now = now_sec();
+    gs->slow_s = 0;
+    gs->slow[0] = '\0';
+    for (int i = 0; i < gs->n; i++) {
+        gpu_t *g = &gs->g[i];
+        double t0 = now_sec();
+        double mt = g->mem_total, cm = g->clk_max_mhz;
         g->util = g->mem_used = g->mem_total = -1;
         g->temp_c = g->power_w = g->power_cap_w = g->clk_mhz = g->mem_clk_mhz = g->fan_pct = g->fan_rpm = -1;
-        if (g->nvml)
+        if (g->nvml) {
             nvml_sample(g);
-        else
+        } else if (g->nv_state != NV_NONE) {
+            /* let go of / asleep: nothing to ask it without waking it */
+            g->util = 0;
+            g->power_w = g->nv_state == NV_ASLEEP ? 0 : g->last_power;
+            g->mem_total = mt; /* what it has stays known: the panel keeps its shape */
+            g->clk_max_mhz = cm;
+            g->reasons = 0;
+            g->slow_now = 0;
+            g->slow_since = 0;
+        } else {
             sysfs_sample(g);
+        }
+        double took = now_sec() - t0;
+        if (took > gs->slow_s) {
+            gs->slow_s = took;
+            str_copy(gs->slow, sizeof gs->slow, g->name);
+        }
+        /* how much of its work it did held back, by heat or by a power limit */
+        if (g->reasons_ok && g->nvml) {
+            int busy = g->util >= 30, bits = busy ? slow_bits(g->reasons) : 0;
+            if (busy && dt > 0 && dt < 30) {
+                g->busy_s += dt;
+                if (bits & GS_HEAT)
+                    g->heat_s += dt;
+                if (bits & GS_POWER)
+                    g->pwr_s += dt;
+                if (bits)
+                    g->held_s += dt;
+            }
+            g->slow_now = bits;
+            if (!bits)
+                g->slow_since = 0;
+            else if (!g->slow_since)
+                g->slow_since = now;
+        }
     }
+    if (nv_lib)
+        nv_policy(gs, now);
 }
 
 void gpus_close(gpus_t *gs)
@@ -523,8 +848,9 @@ void gpus_close(gpus_t *gs)
         for (int j = 0; j < gs->g[i].neng; j++)
             close(gs->g[i].eng[j].fd);
     if (nv_lib) {
-        if (nv_shutdown)
+        if (nv_live && nv_shutdown)
             nv_shutdown();
+        nv_live = 0;
         dlclose(nv_lib);
         nv_lib = NULL;
     }

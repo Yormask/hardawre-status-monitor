@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -272,7 +273,7 @@ typedef struct {
     char *text;
 } lev_t;
 
-static struct {
+static struct viewer {
     int loaded;
     char path[PATHBUF], name[128], err[200];
     int ncol;
@@ -287,10 +288,18 @@ static struct {
     double step; /* typical time between rows */
     double trig; /* incident: when the problem happened (0 = n/a) */
 
-    /* view */
+    /* view; col -1 = the summary */
     int col, cscroll, pin[MAX_PINS], npin, evsel, evscroll;
     double v0, v1, cur;
+
+    /* what the log shows, in a few lines (built when it's loaded) */
+    char sum[24][220];
+    unsigned char sumlvl[24]; /* 1 = worth a look (warning colour) */
+    int nsum;
+    char digest[200]; /* the gist in one line, for "Log saved" */
 } V;
+
+static void summary_build(void);
 
 static void data_free(void)
 {
@@ -550,7 +559,360 @@ static int load(const char *path)
     }
     V.trig = isnan(rel0) ? 0 : rel0;
     V.loaded = 1;
+    summary_build();
     return 0;
+}
+
+/* ============================================================ summary */
+
+static void time_text(double t, double span, char *out, size_t n);
+
+static int col_named(const char *label) /* exact label, -1 = none */
+{
+    for (int c = 0; c < V.ncol; c++)
+        if (!strcmp(V.label[c], label))
+            return c;
+    return -1;
+}
+
+static float cell(int r, int c)
+{
+    return c < 0 ? NAN : V.v[(size_t)r * V.ncol + c];
+}
+
+typedef struct {
+    double lo, hi, sum;
+    int n;
+} st_t;
+
+/* over the rows where 'busy' (if >= 0) is at least 'thr' */
+static st_t stats(int c, int busy, double thr)
+{
+    st_t x = { INFINITY, -INFINITY, 0, 0 };
+    if (c < 0)
+        return x;
+    for (int r = 0; r < V.n; r++) {
+        float v = cell(r, c);
+        if (isnan(v))
+            continue;
+        if (busy >= 0) {
+            float b = cell(r, busy);
+            if (isnan(b) || b < thr)
+                continue;
+        }
+        x.lo = MIN(x.lo, v);
+        x.hi = MAX(x.hi, v);
+        x.sum += v;
+        x.n++;
+    }
+    return x;
+}
+
+static double avg(st_t x)
+{
+    return x.n ? x.sum / x.n : NAN;
+}
+
+static void sum_add(int lvl, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void sum_add(int lvl, const char *fmt, ...)
+{
+    if (V.nsum >= 24)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(V.sum[V.nsum], sizeof V.sum[0], fmt, ap);
+    va_end(ap);
+    V.sumlvl[V.nsum++] = (unsigned char)lvl;
+}
+
+/* time the rows cover where c >= v (each row stands for the gap to the next) */
+static double time_at_least(int c, double v)
+{
+    double t = 0;
+    for (int r = 0; r < V.n; r++) {
+        float x = cell(r, c);
+        if (isnan(x) || x < v)
+            continue;
+        double gap = r + 1 < V.n ? V.t[r + 1] - V.t[r] : V.step;
+        t += MIN(gap, 3 * V.step);
+    }
+    return t;
+}
+
+static void summary_build(void)
+{
+    V.nsum = 0;
+    V.digest[0] = '\0';
+    char d[24], dg[200] = "";
+    const char *deg = U ? "°C" : " C";
+
+    /* the CPU */
+    int ct = col_named("CPU total"), tt = col_named("CPU temperature"), ck = col_named("Average CPU clock");
+    int th = col_named("CPU throttled (time)");
+    st_t cpu = stats(ct, -1, 0);
+    if (cpu.n) {
+        double thr = MAX(25.0, cpu.hi / 2); /* "busy": at least half its busiest */
+        st_t temp = stats(tt, -1, 0), tbusy = stats(tt, ct, thr), cbusy = stats(ck, ct, thr), thro = stats(th, -1, 0);
+        char line[220];
+        sfmt(line, sizeof line, "CPU: busiest %.0f%% (average %.0f%%)", cpu.hi, avg(cpu));
+        if (temp.n)
+            app(line, sizeof line, ", hottest %.0f%s", temp.hi, deg);
+        if (tbusy.n && cpu.hi >= 25)
+            app(line, sizeof line, " (%.0f%s on average while busy)", avg(tbusy), deg);
+        if (cbusy.n && cpu.hi >= 25)
+            app(line, sizeof line, ", %.2f GHz while busy", avg(cbusy) / 1000.0);
+        int throttled = thro.n && thro.hi > 0;
+        if (thro.n)
+            app(line, sizeof line, throttled ? "; throttled by heat, at worst %.0f%% of a sample" : "; never throttled", thro.hi);
+        sum_add(throttled, "%s", line);
+        if (temp.n)
+            app(dg, sizeof dg, "CPU up to %.0f%s%s", temp.hi, deg, thro.n ? (throttled ? ", throttled" : ", no throttling") : "");
+    }
+
+    /* the GPUs: "GPU1 load" ... or "GPU load" on machines with one */
+    for (int c = 0; c < V.ncol; c++) {
+        const char *lb = V.label[c];
+        size_t ll = strlen(lb);
+        if (strncmp(lb, "GPU", 3) || ll < 8 || strcmp(lb + ll - 5, " load"))
+            continue;
+        char g[16], lab[64];
+        sfmt(g, sizeof g, "%.*s", (int)(ll - 5), lb);
+        sfmt(lab, sizeof lab, "%s temperature", g);
+        int gt = col_named(lab);
+        sfmt(lab, sizeof lab, "%s clock", g);
+        int gc = col_named(lab);
+        sfmt(lab, sizeof lab, "%s power", g);
+        int gp = col_named(lab);
+        sfmt(lab, sizeof lab, "%s VRAM used", g);
+        int gv = col_named(lab);
+        sfmt(lab, sizeof lab, "%s slowed by heat", g);
+        int gh = col_named(lab);
+        sfmt(lab, sizeof lab, "%s slowed by power limit", g);
+        int gw = col_named(lab);
+        st_t load = stats(c, -1, 0);
+        if (!load.n || load.hi <= 0)
+            continue; /* asleep or unused all along */
+        st_t temp = stats(gt, -1, 0), pw = stats(gp, -1, 0), vr = stats(gv, -1, 0);
+        char line[220];
+        sfmt(line, sizeof line, "%s: busiest %.0f%%", g, load.hi);
+        if (temp.n) {
+            fmt_duration(time_at_least(gt, temp.hi - 2), d, sizeof d);
+            app(line, sizeof line, ", hottest %.0f%s (within 2%s of that for %s)", temp.hi, deg, U ? "°" : "", d);
+        }
+        if (pw.n && pw.hi > 0)
+            app(line, sizeof line, ", up to %.1f W", pw.hi);
+        if (vr.n && vr.hi > 0)
+            app(line, sizeof line, ", memory up to %.2f GB", vr.hi / 1024.0);
+        sum_add(0, "%s", line);
+        /* busy (50% or more): did its clock hold up, and did it say why not? */
+        int nb = 0;
+        for (int r = 0; r < V.n; r++)
+            nb += !isnan(cell(r, c)) && cell(r, c) >= 50;
+        char l2[220] = "";
+        int warn = 0;
+        if (gc >= 0 && nb >= 9) { /* the first third of the busy time against the last third */
+            double a = 0, b = 0;
+            int na = 0, nbb = 0;
+            for (int r = 0, k = 0; r < V.n; r++) {
+                float l = cell(r, c), cv = cell(r, gc);
+                if (isnan(l) || l < 50)
+                    continue;
+                if (!isnan(cv) && k < nb / 3)
+                    a += cv, na++;
+                if (!isnan(cv) && k >= nb - nb / 3)
+                    b += cv, nbb++;
+                k++;
+            }
+            if (na && nbb) {
+                a /= na;
+                b /= nbb;
+                double drop = 100.0 * (a - b) / a;
+                sfmt(l2, sizeof l2, "%s while busy: clock %.0f MHz at first, %.0f MHz at the end", g, a, b);
+                if (drop >= 5) {
+                    app(l2, sizeof l2, " (%.0f%% lower)", drop);
+                    warn = 1;
+                }
+            }
+        }
+        double heat = 0, pwr = 0;
+        int nbusy = 0;
+        for (int r = 0; r < V.n; r++) {
+            float l = cell(r, c), h = cell(r, gh), w = cell(r, gw);
+            if (isnan(l) || l < 50 || (isnan(h) && isnan(w)))
+                continue;
+            nbusy++;
+            heat += h > 0;
+            pwr += w > 0;
+        }
+        if (nbusy) {
+            heat = 100.0 * heat / nbusy;
+            pwr = 100.0 * pwr / nbusy;
+            char why[120];
+            if (heat < 0.5 && pwr < 0.5)
+                str_copy(why, sizeof why, "never held back by heat or its power limit");
+            else
+                sfmt(why, sizeof why, "slowed by heat %.0f%% and by its power limit %.0f%% of that time", heat, pwr);
+            if (l2[0])
+                app(l2, sizeof l2, "; %s", why);
+            else
+                sfmt(l2, sizeof l2, "%s while busy: %s", g, why);
+            warn |= heat >= 10;
+        }
+        if (l2[0])
+            sum_add(warn, "%s", l2);
+        if (temp.n) {
+            app(dg, sizeof dg, "%s%s up to %.0f%s", dg[0] ? "; " : "", g, temp.hi, deg);
+            if (nbusy && heat >= 1)
+                app(dg, sizeof dg, ", slowed by heat %.0f%% of its busy time", heat);
+        }
+    }
+
+    /* power */
+    int tp = col_named("Estimated total power"), pk = col_named("RAPL package-0"), ps = col_named("RAPL psys");
+    st_t tot = stats(tp, -1, 0), pkg = stats(pk, -1, 0), psy = stats(ps, -1, 0);
+    /* logs from before 1.8 could hold a total that wasn't one: the GPUs
+     * alone (no CPU power without root), or an unconnected psys domain */
+    int gpus_only = tot.n && pk < 0;
+    int bad_psys = tot.n && pkg.n && psy.n && avg(psy) < 0.9 * avg(pkg) && fabs(avg(tot) - avg(psy)) < 0.5;
+    if (gpus_only)
+        sum_add(0, "Power: the GPUs up to %.0f W, %.0f W on average (no CPU power in this log: that needs root)", tot.hi,
+                avg(tot));
+    else if (tot.n && !bad_psys)
+        sum_add(0, "Power: up to %.0f W, %.0f W on average (estimated, whole machine)", tot.hi, avg(tot));
+    else if (pkg.n)
+        sum_add(0, "Power: the CPU package up to %.0f W, %.0f W on average%s", pkg.hi, avg(pkg),
+                bad_psys ? " (the log's total was an unconnected psys reading: left out)" : "");
+    for (int c = 0; c < V.ncol; c++) { /* on battery */
+        size_t ll = strlen(V.label[c]);
+        if (ll > 6 && !strcmp(V.label[c] + ll - 6, " drain")) {
+            st_t b = stats(c, -1, 0);
+            if (b.n && b.hi > 0.5)
+                sum_add(0, "%s: up to %.1f W, %.1f W on average", V.label[c], b.hi, avg(b));
+        }
+    }
+
+    /* memory and waiting */
+    int mp = col_named("Memory used"), sw = col_named("Swap used");
+    st_t mem = stats(mp, -1, 0);
+    if (mem.n) {
+        char line[220];
+        sfmt(line, sizeof line, "Memory: up to %.0f%% used", mem.hi);
+        int mb = -1;
+        for (int c = 0; c < V.ncol; c++)
+            if (!strcmp(V.label[c], "Memory used") && !strcmp(V.unit[c], "MB"))
+                mb = c;
+        st_t m2 = stats(mb, -1, 0);
+        if (m2.n)
+            app(line, sizeof line, " (%.1f GB)", m2.hi / 1024.0);
+        st_t s2 = stats(sw, -1, 0);
+        if (s2.n)
+            app(line, sizeof line, s2.hi >= 1 ? ", swap up to %.0f MB" : ", no swap used", s2.hi);
+        sum_add(0, "%s", line);
+    }
+    st_t pc = stats(col_named("CPU pressure"), -1, 0), pm = stats(col_named("Memory pressure"), -1, 0),
+         pi = stats(col_named("Disk I/O pressure"), -1, 0);
+    if (pc.n || pm.n || pi.n)
+        sum_add(MAX(MAX(pc.n ? pc.hi : 0, pm.n ? pm.hi : 0), pi.n ? pi.hi : 0) >= 25,
+                "Waiting (share of time tasks waited, worst sample): CPU %.0f%%, memory %.0f%%, disk %.0f%%",
+                pc.n ? pc.hi : 0, pm.n ? pm.hi : 0, pi.n ? pi.hi : 0);
+
+    /* fans, and the hottest of the other temperatures */
+    char fans[220] = "";
+    for (int c = 0; c < V.ncol; c++)
+        if (!strcmp(V.unit[c], "RPM")) {
+            st_t f = stats(c, -1, 0);
+            if (f.n)
+                app(fans, sizeof fans, "%s%s %.0f-%.0f", fans[0] ? ", " : "", V.label[c], f.lo, f.hi);
+        }
+    if (fans[0])
+        sum_add(0, "Fans (RPM): %s", fans);
+    int oc[8], no = 0;
+    for (int c = 0; c < V.ncol && no < 8; c++) {
+        const char *lb = V.label[c];
+        if (strcmp(V.unit[c], "C") || c == tt || !strncmp(lb, "CPU", 3) || !strncmp(lb, "GPU", 3))
+            continue;
+        st_t x = stats(c, -1, 0);
+        if (x.n && x.hi > x.lo) /* the ones that never moved say nothing */
+            oc[no++] = c;
+    }
+    for (int i = 1; i < no; i++) /* hottest first */
+        for (int j = i; j > 0 && stats(oc[j], -1, 0).hi > stats(oc[j - 1], -1, 0).hi; j--) {
+            int x = oc[j];
+            oc[j] = oc[j - 1];
+            oc[j - 1] = x;
+        }
+    char ot[220] = "";
+    for (int i = 0; i < no && i < 4; i++)
+        app(ot, sizeof ot, "%s%s %.0f%s", ot[0] ? ", " : "", V.label[oc[i]], stats(oc[i], -1, 0).hi, deg);
+    if (ot[0])
+        sum_add(0, "Other temperatures, hottest: %s", ot);
+
+    /* disks and network: the busiest moments */
+    char io[220] = "";
+    for (int c = 0; c < V.ncol; c++) {
+        size_t ll = strlen(V.label[c]);
+        if (strcmp(V.unit[c], "MB/s") || ll < 6 || strcmp(V.label[c] + ll - 5, " read"))
+            continue;
+        char w[64];
+        sfmt(w, sizeof w, "%.*s write", (int)(ll - 5), V.label[c]);
+        st_t r = stats(c, -1, 0), wr = stats(col_named(w), -1, 0);
+        if ((r.n && r.hi >= 1) || (wr.n && wr.hi >= 1))
+            app(io, sizeof io, "%s%.*s %.0f MB/s read, %.0f MB/s write", io[0] ? "; " : "", (int)(ll - 5), V.label[c],
+                r.n ? r.hi : 0, wr.n ? wr.hi : 0);
+    }
+    if (io[0])
+        sum_add(0, "Disks at their busiest: %s", io);
+
+    /* freezes, and gaps in the rows (hsm or the system stood still) */
+    st_t fz = stats(col_named("System frozen (total)"), -1, 0);
+    if (fz.n && fz.hi > fz.lo)
+        sum_add(1, "The system froze for %.1f s in all (the events say when and why)", fz.hi - fz.lo);
+    int ngap = 0;
+    double gmax = 0, gat = 0;
+    for (int r = 1; r < V.n; r++) {
+        double g = V.t[r] - V.t[r - 1];
+        if (V.stride == 1 && g > MAX(3 * V.step, V.step + 2)) {
+            ngap++;
+            if (g > gmax)
+                gmax = g, gat = V.t[r - 1];
+        }
+    }
+    if (ngap) {
+        char at[24];
+        time_text(gat, 0, at, sizeof at);
+        sum_add(1, "%d gap%s in the rows, the longest %.1f s at %s: hsm (or the whole system) stood still", ngap,
+                ngap == 1 ? "" : "s", gmax, at);
+    }
+
+    /* events, by kind */
+    if (V.nev) {
+        char cats[8][12];
+        int cn[8], nc = 0;
+        for (int i = 0; i < V.nev; i++) {
+            char cat[12] = "";
+            const char *t = V.ev[i].text;
+            if (strlen(t) > 9 && t[2] == ':' && t[5] == ':')
+                t += 9;
+            sscanf(t, "%11[^:]", cat);
+            int k;
+            for (k = 0; k < nc && strcmp(cats[k], cat); k++)
+                ;
+            if (k == nc && nc < 8) {
+                str_copy(cats[nc], sizeof cats[nc], cat);
+                cn[nc++] = 0;
+            }
+            if (k < nc)
+                cn[k]++;
+        }
+        char ev[220] = "";
+        for (int k = 0; k < nc; k++)
+            app(ev, sizeof ev, "%s%d %s", k ? ", " : "", cn[k], cats[k]);
+        sum_add(1, "Events: %d (%s), listed below", V.nev, ev);
+        app(dg, sizeof dg, "%s%d event%s", dg[0] ? "; " : "", V.nev, V.nev == 1 ? "" : "s");
+    } else {
+        sum_add(0, "No events: nothing went wrong while it was recording");
+    }
+    str_copy(V.digest, sizeof V.digest, dg);
 }
 
 /* first row at or after t */
@@ -605,11 +967,28 @@ static void first_look(void)
           : strstr(n, "memory")  ? find_col(memory)
           : strstr(n, "disk")    ? find_col(disk)
                                  : find_col(cpu);
+    if (V.trig <= 0) /* not an incident: what the whole log shows first */
+        V.col = -1;
     V.cur = V.trig > 0 ? V.trig : V.nev ? V.ev[0].t : V.t[V.n - 1];
     V.evsel = 0;
     for (int i = 1; i < V.nev; i++)
         if (fabs(V.ev[i].t - V.cur) < fabs(V.ev[V.evsel].t - V.cur))
             V.evsel = i;
+}
+
+/* the gist of a log in one line, for "Log saved" ("" if it can't be read).
+ * The viewer may have another log open (l works there too): that one is put
+ * aside while this one is read, then comes back just as it was */
+void lv_digest(const char *path, char *out, size_t n)
+{
+    static struct viewer keep;
+    keep = V;
+    memset(&V, 0, sizeof V);
+    out[0] = '\0';
+    if (load(path) == 0)
+        str_copy(out, n, V.digest);
+    data_free();
+    V = keep;
 }
 
 int lv_open(ui_state_t *u, const char *path)
@@ -750,37 +1129,70 @@ void lv_draw(sys_t *s, ui_state_t *u)
          V.stride > 1 ? " (thinned out)" : "");
     box_(top, 0, H, W, V.name, info);
 
-    /* ---- columns, with the value at the cursor */
+    /* ---- the summary, then every column with its value at the cursor
+     * (list item 0 is the summary: item = column + 1) */
     int lw = CLAMP(W / 3, 24, 40), ly = top + 1, lh = H - 2;
     int cr = nearest_row(V.cur);
-    V.col = CLAMP(V.col, 0, V.ncol - 1);
-    if (V.col < V.cscroll)
-        V.cscroll = V.col;
-    if (V.col >= V.cscroll + lh)
-        V.cscroll = V.col - lh + 1;
-    V.cscroll = CLAMP(V.cscroll, 0, MAX(0, V.ncol - lh));
+    V.col = CLAMP(V.col, -1, V.ncol - 1);
+    int item = V.col + 1, nitem = V.ncol + 1;
+    if (item < V.cscroll)
+        V.cscroll = item;
+    if (item >= V.cscroll + lh)
+        V.cscroll = item - lh + 1;
+    V.cscroll = CLAMP(V.cscroll, 0, MAX(0, nitem - lh));
     hit_add(ly, 1, lh, lw - 1, HIT_SCROLL, 1, 0); /* under the rows: the wheel scrolls the list */
-    for (int i = 0; i < lh && V.cscroll + i < V.ncol; i++) {
-        int c = V.cscroll + i, yy = ly + i, sel = c == V.col, pin = -1;
-        for (int p = 0; p < V.npin; p++)
-            if (V.pin[p] == c)
-                pin = p;
+    for (int i = 0; i < lh && V.cscroll + i < nitem; i++) {
+        int c = V.cscroll + i - 1, yy = ly + i, sel = c == V.col, pin = -1;
         attr_t base = sel ? CP(C_SEL) : A_NORMAL;
         if (sel)
             fill(yy, 1, lw - 1, base);
+        hit_add(yy, 1, 1, lw - 1, HIT_COLUMN, c, 0);
+        if (c < 0) {
+            put(yy, 4, lw - 6, sel ? base | A_BOLD : CP(C_TITLE) | A_BOLD, "%s", "Summary");
+            continue;
+        }
+        for (int p = 0; p < V.npin; p++)
+            if (V.pin[p] == c)
+                pin = p;
         char v[24];
         fmt_val(V.v[(size_t)cr * V.ncol + c], V.unit[c], V.whole[c], v, sizeof v);
         int vw = utf8_cols(v);
         put(yy, 2, 2, sel ? base : g_gcol[pin >= 0 ? pin + 1 : 0], "%s", pin >= 0 ? (U ? "■" : "#") : " ");
         put(yy, 4, lw - 6 - vw, sel ? base | A_BOLD : A_NORMAL, "%s", V.label[c]);
         put(yy, lw - 1 - vw, vw, sel ? base : A_GRAY, "%s", v);
-        hit_add(yy, 1, 1, lw - 1, HIT_COLUMN, c, 0);
     }
     for (int y = ly; y < ly + lh; y++)
         put(y, lw, 1, CP(C_BORDER), "%s", U ? "│" : "|");
 
-    /* ---- graphs: the selected column, plus the pinned ones */
     int gx = lw + 2, gw = W - gx - 2;
+    if (V.col < 0) { /* the summary, then the events */
+        int evh = V.nev ? CLAMP(lh / 3, 3, 10) : 0, sy = ly, ey0 = ly + lh - evh;
+        put(sy++, gx, gw, CP(C_TITLE) | A_BOLD, "%s", "What this log shows");
+        sy++;
+        for (int i = 0; i < V.nsum && sy < ey0 - 1; i++)
+            sy += wrap_text(sy, gx, gw, MAX(1, ey0 - 1 - sy), V.sumlvl[i] ? CP(C_WARN) | A_BOLD : A_NORMAL, V.sum[i]);
+        if (sy < ey0 - 1)
+            put(ey0 - 2 > sy ? ey0 - 2 : sy, gx, gw, A_GRAY, "%s",
+                "Up/Down: the columns, each as a graph   s: save this summary as text");
+        if (!evh)
+            return;
+        put(ey0, gx, gw, CP(C_TITLE) | A_BOLD, "Events (%d)", V.nev);
+        V.evsel = CLAMP(V.evsel, 0, V.nev - 1);
+        int rows = evh - 1;
+        if (V.evsel < V.evscroll)
+            V.evscroll = V.evsel;
+        if (V.evsel >= V.evscroll + rows)
+            V.evscroll = V.evsel - rows + 1;
+        V.evscroll = CLAMP(V.evscroll, 0, MAX(0, V.nev - rows));
+        for (int i = 0; i < rows && V.evscroll + i < V.nev; i++) {
+            int e = V.evscroll + i, yy = ey0 + 1 + i;
+            put(yy, gx, gw, A_NORMAL, " %s", V.ev[e].text);
+            hit_add(yy, gx, 1, gw, HIT_FILE, -2 - e, 0);
+        }
+        return;
+    }
+
+    /* ---- graphs: the selected column, plus the pinned ones */
     int list[MAX_PINS + 1], ng = 0;
     list[ng++] = V.col;
     for (int p = 0; p < V.npin; p++)
@@ -1270,6 +1682,52 @@ static int save_svg(char *out, size_t on, char *err, size_t en)
     return 0;
 }
 
+/* the summary as a text file next to the log, to share or keep */
+static int save_summary(char *out, size_t on, char *err, size_t en)
+{
+    char base[PATHBUF];
+    str_copy(base, sizeof base, V.path);
+    char *dot = strrchr(base, '.');
+    if (dot && !strcmp(dot, ".csv"))
+        *dot = '\0';
+    sfmt(out, on, "%s-summary.txt", base);
+    int who = config_as_user(); /* the logs are the user's: so is this */
+    if (who < 0) {
+        sfmt(err, en, "%s", "can't switch to your user");
+        return -1;
+    }
+    int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+    config_as_root(who);
+    FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (!f) {
+        sfmt(err, en, "%s", strerror(errno));
+        if (fd >= 0)
+            close(fd);
+        return -1;
+    }
+    char a[40], b[40], dur[24];
+    double span = V.t[V.n - 1] - V.t[0];
+    time_t t0 = (time_t)V.t[0];
+    struct tm tm;
+    localtime_r(&t0, &tm);
+    strftime(a, sizeof a, "%a %d %b %Y %H:%M:%S", &tm);
+    time_text(V.t[V.n - 1], 0, b, sizeof b);
+    fmt_duration(span, dur, sizeof dur);
+    fprintf(f, "%s\n%s to %s (%s, %d rows) - summary by hsm %s\n\n", V.name, a, b, dur, V.n, APP_VERSION);
+    for (int i = 0; i < V.nsum; i++)
+        fprintf(f, "%s%s\n", V.sumlvl[i] ? "! " : "  ", V.sum[i]);
+    if (V.nev) {
+        fprintf(f, "\nEvents\n");
+        for (int i = 0; i < V.nev; i++)
+            fprintf(f, "  %s\n", V.ev[i].text);
+    }
+    if (fclose(f) != 0) {
+        sfmt(err, en, "%s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 int lv_key(sys_t *s, ui_state_t *u, int ch)
 {
     (void)s;
@@ -1282,10 +1740,10 @@ int lv_key(sys_t *s, ui_state_t *u, int ch)
     }
     int gw = MAX(COLS - CLAMP(COLS / 3, 24, 40) - 4, 10);
     double dt = (V.v1 - V.v0) / gw;
-    switch (ch) {
-    case KEY_UP: V.col = (V.col + V.ncol - 1) % V.ncol; break;
-    case KEY_DOWN: V.col = (V.col + 1) % V.ncol; break;
-    case KEY_PPAGE: V.col = MAX(0, V.col - 10); break;
+    switch (ch) { /* the columns, with the summary (-1) above the first */
+    case KEY_UP: V.col = V.col <= -1 ? V.ncol - 1 : V.col - 1; break;
+    case KEY_DOWN: V.col = V.col >= V.ncol - 1 ? -1 : V.col + 1; break;
+    case KEY_PPAGE: V.col = MAX(-1, V.col - 10); break;
     case KEY_NPAGE: V.col = MIN(V.ncol - 1, V.col + 10); break;
     case KEY_LEFT: V.cur -= MAX(dt, V.step); break;
     case KEY_RIGHT: V.cur += MAX(dt, V.step); break;
@@ -1330,6 +1788,10 @@ int lv_key(sys_t *s, ui_state_t *u, int ch)
         break;
     }
     case ' ': {
+        if (V.col < 0) {
+            ui_message(u, 0, "Pick a column first (Down): Space keeps its graph on screen");
+            break;
+        }
         for (int p = 0; p < V.npin; p++)
             if (V.pin[p] == V.col) { /* unpin */
                 memmove(&V.pin[p], &V.pin[p + 1], (size_t)(V.npin - p - 1) * sizeof V.pin[0]);
@@ -1350,6 +1812,15 @@ int lv_key(sys_t *s, ui_state_t *u, int ch)
         return 1;
     case 's': {
         char out[PATHBUF + 64], err[200], pp[PATHBUF];
+        if (V.col < 0) {
+            if (save_summary(out, sizeof out, err, sizeof err) == 0) {
+                config_pretty_path(out, pp, sizeof pp);
+                ui_message(u, 0, "Saved the summary as %s", pp);
+            } else {
+                ui_message(u, 1, "Could not save the summary: %s", err);
+            }
+            return 1;
+        }
         if (save_svg(out, sizeof out, err, sizeof err) == 0) {
             config_pretty_path(out, pp, sizeof pp);
             ui_message(u, 0, "Saved the graph%s as %s", V.npin ? "s" : "", pp);
@@ -1374,7 +1845,7 @@ void lv_click(ui_state_t *u, int kind, int a, int b, int x, int dbl)
     if (!V.loaded)
         return;
     if (kind == HIT_COLUMN) {
-        V.col = CLAMP(a, 0, V.ncol - 1);
+        V.col = CLAMP(a, -1, V.ncol - 1);
     } else if (kind == HIT_GRAPH && b > 0) {
         V.cur = CLAMP(V.v0 + (x - a + 0.5) * (V.v1 - V.v0) / b, V.t[0], V.t[V.n - 1]);
         if (V.nev)
@@ -1394,7 +1865,7 @@ void lv_wheel(int where, int dir)
     if (!V.loaded)
         return;
     if (where == 1) /* the column list */
-        V.col = CLAMP(V.col + dir, 0, V.ncol - 1);
+        V.col = CLAMP(V.col + dir, -1, V.ncol - 1);
     else
         zoom(dir < 0 ? 0.8 : 1.25);
 }

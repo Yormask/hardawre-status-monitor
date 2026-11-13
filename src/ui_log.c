@@ -62,7 +62,15 @@ void log_toggle_system(sys_t *s, ui_state_t *u)
         unsigned long rows = g_log.rows;
         log_stop();
         config_pretty_path(g_log.path, p, sizeof p);
-        ui_message(u, 0, "Log saved: %s (%lu rows)", p, rows);
+        char dg[200];
+        lv_digest(g_log.path, dg, sizeof dg); /* what it shows, in one line */
+        if (dg[0]) {
+            const char *b = strrchr(p, '/');
+            ui_message(u, 0, "Log saved: %s. %s. Its summary: 5, then v", b ? b + 1 : p, dg);
+            u->msg_until = now_sec() + 15; /* longer to read */
+        } else {
+            ui_message(u, 0, "Log saved: %s (%lu rows)", p, rows);
+        }
         return;
     }
     prepare(u);

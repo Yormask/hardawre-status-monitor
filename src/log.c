@@ -53,6 +53,7 @@ enum {
     CH_THROTTLE, CH_PSI, CH_OOM, CH_PCIE, CH_NVME_USED, CH_NVME_MEDIA, CH_NVME_UNSAFE, CH_NVME_WARN,
     CH_SATA_WEAR, CH_SATA_REALLOC, CH_SATA_PENDING, CH_SATA_CRC,
     CH_DISK_RLAT, CH_DISK_WLAT, CH_NET_ERR, CH_NET_SIGNAL, CH_WAKEUPS, CH_CSTATE, CH_FREEZE,
+    CH_GPU_SLOW_HEAT, CH_GPU_SLOW_POWER,
     CH_EVENTS /* stays last */
 };
 
@@ -201,25 +202,34 @@ void log_build_channels(sys_t *s, const char *skip)
         gpu_t *g = &s->gpus.g[i];
         char gn[8];
         sfmt(gn, sizeof gn, s->gpus.n > 1 ? "GPU%d" : "GPU", i);
-        if (g->util >= 0 || g->neng || !strcmp(g->driver, "i915")) {
+        /* an NVIDIA GPU may be asleep when the log starts: its columns are
+         * there anyway, for when it wakes up */
+        int nv = g->nv_state != NV_NONE;
+        if (g->util >= 0 || g->neng || !strcmp(g->driver, "i915") || nv) {
             sfmt(lab, sizeof lab, "%s load", gn);
             add("GPU", CH_GPU_LOAD, i, "", "%", lab, "gpu%d.load", i);
         }
-        if (g->temp_c >= 0) {
+        if (g->temp_c >= 0 || nv) {
             sfmt(lab, sizeof lab, "%s temperature", gn);
             add("GPU", CH_GPU_TEMP, i, "", "C", lab, "gpu%d.temp", i);
         }
-        if (g->power_w >= 0) {
+        if (g->power_w >= 0 || nv) {
             sfmt(lab, sizeof lab, "%s power", gn);
             add("GPU", CH_GPU_POWER, i, "", "W", lab, "gpu%d.power", i);
         }
-        if (g->clk_mhz >= 0) {
+        if (g->clk_mhz >= 0 || nv) {
             sfmt(lab, sizeof lab, "%s clock", gn);
             add("GPU", CH_GPU_CLOCK, i, "", "MHz", lab, "gpu%d.clock", i);
         }
-        if (g->mem_total > 0) {
+        if (g->mem_total > 0 || nv) {
             sfmt(lab, sizeof lab, "%s VRAM used", gn);
             add("GPU", CH_GPU_VRAM, i, "", "MB", lab, "gpu%d.vram", i);
+        }
+        if (nv) { /* held back, as the driver says: 100 = this whole sample, 0 = full speed */
+            sfmt(lab, sizeof lab, "%s slowed by heat", gn);
+            add("GPU", CH_GPU_SLOW_HEAT, i, "", "%", lab, "gpu%d.slow_heat", i);
+            sfmt(lab, sizeof lab, "%s slowed by power limit", gn);
+            add("GPU", CH_GPU_SLOW_POWER, i, "", "%", lab, "gpu%d.slow_power", i);
         }
     }
 
@@ -413,6 +423,17 @@ double log_chan_value(const sys_t *s, const chan_t *c)
     case CH_WAKEUPS: return s->cpu.nidle ? s->cpu.wakeups : NAN;
     case CH_CSTATE: return c->a < s->cpu.nidle ? s->cpu.idle[c->a].pct : NAN;
     case CH_FREEZE: return s->health.frozen_total;
+    case CH_GPU_SLOW_HEAT:
+    case CH_GPU_SLOW_POWER: {
+        if (c->a >= s->gpus.n)
+            return NAN;
+        const gpu_t *g = &s->gpus.g[c->a];
+        if (!g->nvml) /* asleep or let go of: certainly not held back */
+            return g->nv_state == NV_ASLEEP || g->nv_state == NV_IDLE ? 0 : NAN;
+        if (!g->reasons_ok)
+            return NAN;
+        return g->slow_now & (c->kind == CH_GPU_SLOW_HEAT ? GS_HEAT : GS_POWER) ? 100 : 0;
+    }
     case CH_EVENTS: return (double)s->health.nev;
     }
     return NAN;

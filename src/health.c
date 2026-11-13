@@ -55,15 +55,46 @@ static double wall_now(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+static void app_s(char *b, size_t n, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void app_s(char *b, size_t n, const char *fmt, ...)
+{
+    size_t l = strlen(b);
+    if (l + 1 >= n)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b + l, n - l, fmt, ap);
+    va_end(ap);
+}
+
 /* ---------------------------------------------------------------- events */
 
 static void ev_add(health_t *h, double t, int level, const char *cat, const char *text)
 {
+    /* The same line again right after the last one (the kernel retries and
+     * logs every try): counted on that one, "... (3 times)", not a new event. */
+    if (h->nev) {
+        event_t *l = &h->ev[(h->ev_head - 1 + MAX_EVENTS) % MAX_EVENTS];
+        size_t tl = strlen(text);
+        char suf[24] = "";
+        if (l->rep > 1)
+            sfmt(suf, sizeof suf, " (%d times)", l->rep);
+        if (l->level == level && !strcmp(l->cat, cat) && t >= l->t - 1 && t - l->t_rep <= 5 &&
+            tl < sizeof l->text - 16 && !strncmp(l->text, text, tl) && !strcmp(l->text + tl, suf)) {
+            char b[200];
+            l->rep = l->rep > 1 ? l->rep + 1 : 2;
+            l->t_rep = t;
+            sfmt(b, sizeof b, "%s (%d times)", text, l->rep);
+            str_copy(l->text, sizeof l->text, b);
+            return;
+        }
+    }
     event_t *e = &h->ev[h->ev_head];
     h->ev_head = (h->ev_head + 1) % MAX_EVENTS;
     if (h->nev < MAX_EVENTS)
         h->nev++;
-    e->t = t;
+    e->t = e->t_rep = t;
+    e->rep = 1;
     e->seq = ++h->ev_seq;
     e->level = level;
     str_copy(e->cat, sizeof e->cat, cat);
@@ -610,6 +641,14 @@ static const struct {
     { "Oops", "crash", EV_ERR },
     { "BUG:", "crash", EV_ERR },
     { "Kernel panic", "crash", EV_ERR },
+    /* a USB device that doesn't connect properly: a cable or a port, almost
+     * never the computer; the kernel logs these at "error" level */
+    { "device descriptor read", "usb", EV_WARN },
+    { "device not accepting address", "usb", EV_WARN },
+    { "unable to enumerate USB device", "usb", EV_WARN },
+    { "can't set config", "usb", EV_WARN },
+    { "Maybe the USB cable is bad", "usb", EV_WARN },
+    { "over-current", "usb", EV_WARN },
     { "under-voltage", "power", EV_ERR },
     { "Under-voltage", "power", EV_ERR },
     { "PM: suspend entry", "power", EV_INFO },
@@ -655,8 +694,9 @@ static void kmsg_record(health_t *h, char *rec, double boot_wall)
         if (klevel > 3) /* only errors and worse without a matching keyword */
             return;
         cat = guess_cat(msg);
-        /* firmware tables with bugs: noisy at every boot, almost always harmless */
-        level = !strncmp(msg, "ACPI", 4) || strstr(msg, "firmware") ? EV_INFO : EV_ERR;
+        /* firmware tables with bugs: noisy at every boot, almost always harmless;
+         * USB devices that misbehave: worth knowing, not a fault of the machine */
+        level = !strncmp(msg, "ACPI", 4) || strstr(msg, "firmware") ? EV_INFO : !strcmp(cat, "usb") ? EV_WARN : EV_ERR;
     }
     if (level == EV_ERR)
         h->kmsg_err++;
@@ -668,6 +708,118 @@ static void kmsg_record(health_t *h, char *rec, double boot_wall)
     char text[200];
     sfmt(text, sizeof text, "%s", msg);
     ev_add(h, t, level, cat, text);
+}
+
+/* ------------------------------------------------- events in plain words */
+
+/* "usb 3-7: ..." -> is port 3-7 a socket on the outside or a built-in device? */
+static const char *usb_port_kind(const char *text, char *port, size_t pn)
+{
+    int bus, p, len = 0;
+    port[0] = '\0';
+    if (sscanf(text, "usb %d-%d%n", &bus, &p, &len) != 2 || bus <= 0 || p <= 0)
+        return NULL;
+    sfmt(port, pn, "%d-%d", bus, p);
+    if (text[len] != ':') /* "3-7.2": behind a hub */
+        return "behind a hub";
+    char path[PATHBUF], b[32];
+    sfmt(path, sizeof path, "%s/bus/usb/devices/usb%d/%d-0:1.0/usb%d-port%d/connect_type", g_sysfs, bus, bus, bus, p);
+    if (read_line(path, b, sizeof b))
+        return NULL;
+    return !strcmp(b, "hotplug") ? "an outside socket" : !strcmp(b, "hardwired") ? "built in" : NULL;
+}
+
+int event_explain(const char *cat, const char *text, char *out, size_t n)
+{
+    out[0] = '\0';
+    if (!strcmp(cat, "usb")) {
+        char port[24], where[160] = "";
+        const char *kind = usb_port_kind(text, port, sizeof port);
+        if (kind && !strcmp(kind, "built in"))
+            sfmt(where, sizeof where, " Port %s is built in (a camera, Bluetooth or card reader): if it repeats, that part "
+                                      "has trouble.", port);
+        else if (kind)
+            sfmt(where, sizeof where, " Port %s is %s.", port, kind);
+        if (strstr(text, "over-current"))
+            sfmt(out, n, "A USB device drew more current than its port allows, so the port was switched off: unplug it or "
+                         "use a powered hub.%s", where);
+        else
+            sfmt(out, n, "A USB device%s%s didn't answer properly while connecting: usually a loose or poor cable, a "
+                         "worn port, or too little power for it. Once, while plugging something in, is harmless.%s",
+                 port[0] ? " on port " : "", port, where);
+        return 1;
+    }
+    const char *x = strstr(text, "Xid");
+    if (x && strstr(text, "NVRM")) {
+        const char *c = strstr(x, "): ");
+        int code = c ? atoi(c + 3) : 0;
+        if (code == 13 || code == 31 || code == 43)
+            sfmt(out, n, "The NVIDIA driver stopped a program's GPU work (Xid %d): nearly always a bug in that program or "
+                         "game, not the hardware.", code);
+        else if (code == 79)
+            str_copy(out, n, "The NVIDIA GPU stopped answering (Xid 79, \"fallen off the bus\"): usually power delivery, "
+                             "heat, or a loose card or riser.");
+        else if (code == 119 || code == 120)
+            sfmt(out, n, "The GPU's own firmware stopped answering (Xid %d): a driver problem; a driver update often "
+                         "helps.", code);
+        else
+            sfmt(out, n, "The NVIDIA driver reported a GPU error (Xid %d); NVIDIA's list of Xid codes says what it "
+                         "means.", code);
+        return 1;
+    }
+    if (strstr(text, "segfault at") || strstr(text, "general protection") || strstr(text, "trap invalid opcode")) {
+        str_copy(out, n, "A program crashed: a bug in it, almost never the hardware - unless many different programs "
+                         "crash, which points at memory.");
+        return 1;
+    }
+    if (strstr(text, "blocked for more than")) {
+        str_copy(out, n, "A task waited for minutes, nearly always for a disk, a USB drive or a network share that "
+                         "stopped answering.");
+        return 1;
+    }
+    if (!strcmp(cat, "disk") && strstr(text, "I/O error")) {
+        str_copy(out, n, "A disk failed to read or write. Look at its health in the Hardware view (D runs its own "
+                         "test); a loose cable does this too.");
+        return 1;
+    }
+    if (strstr(text, "temperature above threshold") || strstr(text, "clock throttled")) {
+        str_copy(out, n, "The CPU got hot enough to slow itself down: dust in the cooler, a blocked vent or dried "
+                         "thermal paste are the usual causes.");
+        return 1;
+    }
+    if (strstr(text, "Out of memory") || strstr(text, "oom-killer") || strstr(text, "Killed process")) {
+        str_copy(out, n, "Memory ran out, and the kernel ended a program to free some.");
+        return 1;
+    }
+    if (strstr(text, "AER:") || strstr(text, "PCIe Bus Error")) {
+        if (strstr(text, "Corrected") || strstr(text, "corrected"))
+            str_copy(out, n, "A PCIe device had a transfer error that was fixed on the spot: harmless unless it "
+                             "happens all the time.");
+        else
+            str_copy(out, n, "A PCIe device had an error that could not be fixed; look at the device it names and "
+                             "its slot or cable.");
+        return 1;
+    }
+    if (strstr(text, "soft lockup") || strstr(text, "hard LOCKUP") || strstr(text, "self-detected stall")) {
+        str_copy(out, n, "A CPU was stuck for many seconds, usually in a driver; a kernel or driver update may help.");
+        return 1;
+    }
+    if (strstr(text, "Machine check") || strstr(text, "Hardware Error") || strstr(text, "EDAC")) {
+        str_copy(out, n, "The CPU or the memory reported a hardware error; if it repeats, test the memory "
+                         "(memtest86+).");
+        return 1;
+    }
+    if (strstr(text, "nder-voltage")) {
+        str_copy(out, n, "The power supply delivered too little voltage: use a stronger power supply.");
+        return 1;
+    }
+    if (!strcmp(cat, "slow")) {
+        str_copy(out, n, "hsm reads everything in turn, so its screen waits for a slow reading. On laptops the "
+                         "firmware's sensors (fans, battery, ACPI) are the usual cause; if it keeps happening, hide "
+                         "that sensor in Setup > Sensor names and limits.");
+        return 1;
+    }
+    return 0;
 }
 
 static void kmsg_open(health_t *h)
@@ -1047,10 +1199,52 @@ static void temp_events(health_t *h, sensors_t *S, const procs_t *ps, double now
     }
 }
 
+/* NVIDIA GPUs say why they run below full speed: an event when one has been
+ * held back for a while (heat or its power limit is normal for a laptop
+ * GPU under load: information; a hardware slowdown is a warning) */
+static void gpu_events(health_t *h, gpus_t *gs, const procs_t *ps, double now, double mono)
+{
+    for (int i = 0; i < gs->n; i++) {
+        gpu_t *g = &gs->g[i];
+        if (!g->slow_now || !g->slow_since || mono - g->slow_since < 10 || now - g->slow_ev_t < 600)
+            continue;
+        g->slow_ev_t = now;
+        char who[80], gn[16], why[64] = "";
+        health_blame(ps, BLAME_GPU, who, sizeof who);
+        sfmt(gn, sizeof gn, gs->n > 1 ? "GPU%d" : "The GPU", i);
+        if ((g->slow_now & GS_HEAT) && g->temp_c >= 0)
+            app_s(why, sizeof why, "heat (%.0f °C)", g->temp_c);
+        else if (g->slow_now & GS_HEAT)
+            app_s(why, sizeof why, "heat");
+        if (g->slow_now & GS_POWER) {
+            if (why[0])
+                app_s(why, sizeof why, " and ");
+            if (g->power_cap_w > 0)
+                app_s(why, sizeof why, "its power limit (%.0f W)", g->power_cap_w);
+            else
+                app_s(why, sizeof why, "its power limit");
+        }
+        int hw = (g->reasons & 0xC0ULL) != 0; /* the hardware stepped in: thermal or power brake */
+        health_event(h, hw ? EV_WARN : EV_INFO, "gpu", "%s is slowing itself down: %s%s", gn, why, who);
+    }
+}
+
+/* the slowest check of this sample, for "reading X took 3 s" */
+static void slow_part(health_t *h, double t0, const char *what)
+{
+    double d = now_sec() - t0;
+    if (d > h->slow_s) {
+        h->slow_s = d;
+        str_copy(h->slow, sizeof h->slow, what);
+    }
+}
+
 void health_sample(sys_t *s)
 {
     health_t *h = &s->health;
-    double dt = s->dt, now = wall_now(), mono = now_sec();
+    double dt = s->dt, now = wall_now(), mono = now_sec(), t0;
+    h->slow_s = 0;
+    h->slow[0] = '\0';
 
     static const char *const psi_name[3] = { "cpu", "memory", "io" };
     for (int i = 0; i < 3; i++)
@@ -1072,18 +1266,23 @@ void health_sample(sys_t *s)
         h->oom_prev = s->mem.oom_kill;
     }
 
+    t0 = now_sec();
     kmsg_sample(h);
+    slow_part(h, t0, "the kernel log");
     temp_events(h, &s->sens, &s->procs, now);
     freeze_events(h, &s->procs, now);
     fan_events(h, &s->sens, now, mono);
     limit_events(h, &s->sens, now, mono);
     link_events(h, &s->net, now);
     fs_events(h, &s->disks, now);
+    gpu_events(h, &s->gpus, &s->procs, now, mono);
     leak_sample(s);
 
     if (mono >= h->next_slow) { /* every 5 s */
         h->next_slow = mono + 5.0;
+        t0 = now_sec();
         aer_sample(h, now);
+        slow_part(h, t0, "the PCIe error counters");
         char p[PATHBUF], b[128];
         sfmt(p, sizeof p, "%s/sys/fs/file-nr", g_procfs);
         unsigned long long a = 0, u = 0, m = 0;
@@ -1097,11 +1296,15 @@ void health_sample(sys_t *s)
     }
     if (h->nnvme && mono >= h->next_nvme) {
         h->next_nvme = mono + NVME_EVERY;
+        t0 = now_sec();
         nvme_sample(h);
+        slow_part(h, t0, "the NVMe drives' health");
     }
     if (h->nsata && mono >= h->next_sata) {
         h->next_sata = mono + NVME_EVERY;
+        t0 = now_sec();
         ata_sample(h);
+        slow_part(h, t0, "the SATA drives' health");
     }
     drives_tick(h); /* self-tests hsm started */
     h->primed = 1;

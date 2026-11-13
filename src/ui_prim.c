@@ -181,6 +181,10 @@ void ui_end(void)
 static short g_bg = -1, g_fg = -1; /* background, and the text colour that suits it */
 static int g_bright;               /* coloured dark background: use the bright text colours */
 static int g_plain;                /* the same, but the terminal has only 8 colours */
+/* bars (selection, header, keys, table headings) whose text is black: many
+ * terminals (Konsole, xterm) show bold black as grey, which all but vanishes
+ * on a green or cyan bar - so there bold is left out */
+static unsigned char g_bar_black[64];
 
 static short fit(short c) /* no bright colours: use the normal one */
 {
@@ -212,12 +216,17 @@ static void block_pair(short n, short bg, short fg)
     if (chosen)
         fg = fit(fg);
     if (g_bg >= 0 && bg == g_bg) { /* the bar would vanish: draw it in the screen's text colour */
-        init_pair(n, (chosen && fg != g_fg) ? fg : bg, g_fg);
+        short tf = (chosen && fg != g_fg) ? fg : bg;
+        init_pair(n, tf, g_fg);
+        if (n >= 0 && n < 64)
+            g_bar_black[n] = tf == COLOR_BLACK;
         return;
     }
     if (!chosen || fg == bg) /* text the same colour as the bar would vanish too */
         fg = is_dark(bg) ? (COLORS >= 16 ? 15 : COLOR_WHITE) : COLOR_BLACK;
     init_pair(n, fg, bg);
+    if (n >= 0 && n < 64)
+        g_bar_black[n] = fg == COLOR_BLACK;
 }
 
 static void init_colors(const layout_t *l)
@@ -362,10 +371,22 @@ attr_t graph_attr(double p)
 
 /* ================================================================== text */
 
+/* bold black text on a bar turns grey in many terminals: plain black instead */
+static attr_t legible(attr_t a)
+{
+    if (a & A_BOLD) {
+        int pn = (int)PAIR_NUMBER(a);
+        if (pn > 0 && pn < 64 && g_bar_black[pn])
+            a &= ~(attr_t)A_BOLD;
+    }
+    return a;
+}
+
 int put(int y, int x, int maxw, attr_t a, const char *fmt, ...)
 {
     if (maxw <= 0 || y < 0 || y >= LINES || x < 0 || x >= COLS)
         return 0;
+    a = legible(a);
     if (x + maxw > COLS)
         maxw = COLS - x;
     char buf[1024];
@@ -398,7 +419,7 @@ void fill(int y, int x, int w, attr_t a)
     if (x + w > COLS)
         w = COLS - x;
     if (w > 0)
-        mvhline(y, x, ' ' | a, w);
+        mvhline(y, x, ' ' | legible(a), w);
 }
 
 void kv(int y, int *x, int xmax, attr_t va, const char *key, const char *fmt, ...)

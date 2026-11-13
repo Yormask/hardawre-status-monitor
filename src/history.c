@@ -479,12 +479,27 @@ static void sample_day(sys_t *s, double dt)
             nan_max(&d->drive_temp_max, h->nvme[i].temp_c);
             d->wear = isnan(d->wear) ? h->nvme[i].used : MAX(d->wear, h->nvme[i].used);
         }
+    int smart_temp = 0;
+    for (int i = 0; i < h->nnvme; i++)
+        smart_temp |= h->nvme[i].state == 1;
     for (int i = 0; i < h->nsata; i++)
         if (h->sata[i].state == 1) {
-            if (h->sata[i].temp_c > 0)
+            if (h->sata[i].temp_c > 0) {
                 nan_max(&d->drive_temp_max, h->sata[i].temp_c);
+                smart_temp = 1;
+            }
             if (h->sata[i].wear >= 0)
                 d->wear = isnan(d->wear) ? h->sata[i].wear : MAX(d->wear, h->sata[i].wear);
+        }
+    /* without root no drive health, but the drives' own sensors are there to
+     * read: NVMe "Composite" (what SMART reports too) and drivetemp */
+    if (!smart_temp)
+        for (int i = 0; i < s->sens.n; i++) {
+            const sensor_t *t = &s->sens.s[i];
+            if (t->type != SENS_TEMP || !t->ok)
+                continue;
+            if ((!strncmp(t->chip, "nvme", 4) && !strcmp(t->label, "Composite")) || !strncmp(t->chip, "drivetemp", 9))
+                nan_max(&d->drive_temp_max, t->value);
         }
     /* counters: what was added since the last sample */
     if (h->thr_ok) {

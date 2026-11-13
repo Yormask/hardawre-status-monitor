@@ -110,6 +110,9 @@ static void report_health(sys_t *s)
         localtime_r(&t, &tm);
         strftime(ts, sizeof ts, "%m-%d %H:%M:%S", &tm);
         printf("    %s  %-8s %s%s\n", ts, e->cat, e->level == EV_ERR ? "! " : "", e->text);
+        char ex[400];
+        if (e->level != EV_INFO && event_explain(e->cat, e->text, ex, sizeof ex))
+            printf("              %s\n", ex);
     }
 }
 
@@ -184,6 +187,10 @@ void report_print(sys_t *s, int nproc)
     for (int i = 0; i < s->gpus.n; i++) {
         gpu_t *g = &s->gpus.g[i];
         printf("  %d %s [%s%s%s]\n", i, g->name, g->driver, g->pci[0] ? " " : "", g->pci);
+        if (g->nv_state == NV_ASLEEP || g->nv_state == NV_IDLE) { /* not woken up for a snapshot */
+            printf("    state   %s\n", g->note[0] ? g->note : g->nv_state == NV_ASLEEP ? "asleep (powered off)" : "idle");
+            continue;
+        }
         if (g->util >= 0) {
             printf("    load    %s%.1f%%%s", g->util_est ? "~" : "", g->util, g->util_est ? " (estimated from RC6 sleep time)" : "");
             for (int e = 0; e < g->neng; e++)
@@ -199,8 +206,12 @@ void report_print(sys_t *s, int nproc)
         }
         if (g->clk_mhz >= 0)
             printf("    clock   %.0f MHz\n", g->clk_mhz);
-        if (g->temp_c >= 0)
+        if (g->temp_c >= 0 && g->temp_lim > 0)
+            printf("    temp    %.1f C (slows down from %.0f C)\n", g->temp_c, g->temp_lim);
+        else if (g->temp_c >= 0)
             printf("    temp    %.1f C\n", g->temp_c);
+        if (g->slow_now)
+            printf("    slowing %s\n", g->slow_now == (GS_HEAT | GS_POWER) ? "heat, power limit" : g->slow_now & GS_HEAT ? "heat" : "power limit");
         if (g->power_w >= 0)
             printf("    power   %.1f W\n", g->power_w);
     }
@@ -209,9 +220,13 @@ void report_print(sys_t *s, int nproc)
     printf("\nPower\n");
     if (s->total_w >= 0)
         printf("  estimate  %.1f W (%s)\n", s->total_w, s->total_w_src);
+    else if (s->total_why[0])
+        printf("  estimate  the CPU part %s (sudo)\n", s->total_why);
     for (int i = 0; i < p->nrapl; i++) {
         rapl_t *z = &p->z[i];
-        if (z->readable && z->watts >= 0)
+        if (z->readable && z->watts >= 0 && p->psys_bad && !strcmp(z->name, "psys"))
+            printf("  %s%-10s%.2f W (less than the CPU: not connected, left out)\n", z->depth ? "  " : "", z->name, z->watts);
+        else if (z->readable && z->watts >= 0)
             printf("  %s%-10s%.2f W\n", z->depth ? "  " : "", z->name, z->watts);
         else if (!z->readable)
             printf("  %s%-10sno permission (run as root)\n", z->depth ? "  " : "", z->name);
@@ -225,6 +240,8 @@ void report_print(sys_t *s, int nproc)
             printf(", health %.0f%%", bt->health);
         if (bt->cycles >= 0)
             printf(", %ld cycles", bt->cycles);
+        if (bt->lim_end > 0)
+            printf(", charge limit %d%%", bt->lim_end);
         printf("\n");
     }
     if (!p->nrapl && !p->nbat)

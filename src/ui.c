@@ -159,7 +159,7 @@ static void footer(ui_state_t *u)
     static const hint_t viewkeys[] = {
         { "Left/Right", "Cursor", 0 }, { "Up/Dn", "Column", 0 }, { "+/-", "Zoom", 0 },  { "0", "Fit", '0' },
         { "n/N", "Next/prev event", 0 }, { "[ ]", "Scroll", 0 }, { "Space", "Pin graph", ' ' },
-        { "s", "Save SVG", 's' },        { "Esc", "Back", 27 },   { "q", "Quit", 'q' },
+        { "s", "Save", 's' },            { "Esc", "Back", 27 },   { "q", "Quit", 'q' },
     };
     static const hint_t vkeys[] = {
         { "Enter", "Show processes", '\n' }, { "c/m/d/n/t", "Sort", 0 }, { "/", "Filter", '/' }, { "Esc", "Clear", 27 },
@@ -189,7 +189,7 @@ static void footer(ui_state_t *u)
     };
     static const hint_t senskeys[] = {
         { "Up/Dn", "Select", 0 }, { "Enter", "Rename", '\n' }, { "l", "Limit", 'l' }, { "h", "Hide", 'h' },
-        { "d", "Undo yours", 'd' }, { "Esc", "Back", 27 },     { "q", "Quit", 'q' },
+        { "H", "Hide unchanging", 'H' }, { "d", "Undo yours", 'd' }, { "Esc", "Back", 27 }, { "q", "Quit", 'q' },
     };
     static const hint_t skeys[] = {
         { "Up/Dn", "Select", 0 }, { "Enter", "Toggle", '\n' }, { "Left/Right", "Column / value", 0 },
@@ -252,7 +252,7 @@ static void help_overlay(void)
         { "/", "filter by name, command, user or PID (Esc clears)" },
         { "f k", "follow the process, not the row / kernel threads" },
         { "b", "CPU core bars: usage, temperature or clock speed" },
-        { "v (5)", "saved logs: graph one, jump to events, s saves it" },
+        { "v (5)", "saved logs: a summary, graphs, events; s saves it" },
         { "D C (3)", "Hardware view: drive self-tests, cooling check" },
         { "+ -", "slower / faster refresh" },
         { "Space", "pause / resume sampling" },

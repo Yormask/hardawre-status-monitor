@@ -192,6 +192,8 @@ typedef struct {
     int ngeng;         /* GPU engine names seen in fdinfo ("render", "gfx"...) */
     char geng[8][24];
     double gcap[8];    /* engine capacity (parallel units) */
+    pid_t slow_pid;    /* the process that took longest to read this time, and how long */
+    double slow_s;
 } procs_t;
 
 void procs_init(procs_t *ps);
@@ -223,12 +225,18 @@ typedef struct {
     int hidden;         /* left out of the screen and the logs */
     double lim_t;       /* health: since when it is past your limit, 0 = it isn't */
     int lim_flagged;    /* health: reported */
+    /* a reading that never moves while the others do: a placeholder the
+     * firmware fills in (ACPI's 27.8 °C), or an input with nothing on it */
+    double vmin, vmax, t_first;
+    int still;
 } sensor_t;
 
 typedef struct {
     int n;
     sensor_t s[MAX_SENSORS];
     int cpu_idx; /* sensor used as "CPU temperature", -1 = none */
+    char slow[32]; /* the chip that took longest to read this time, and how long */
+    double slow_s;
 } sensors_t;
 
 /* your settings for one sensor, kept even while it isn't there (a USB
@@ -249,6 +257,7 @@ void sensors_sample(sensors_t *s);
 double sensors_cpu_temp(const sensors_t *s);
 double sensors_core_temp(const sensors_t *s, int pkg, int core); /* coretemp "Core N", -1 */
 void sensors_chip_name(const char *chip, char *out, size_t n); /* "nvme#2" -> "NVMe 2" */
+void sensor_short_name(const sensors_t *S, int i, char *out, size_t n); /* "ACPI 2", "BAT1", "Core 3" */
 
 /* ------------------------------------------------------------------ GPU */
 #define MAX_GPUS 8
@@ -274,17 +283,41 @@ typedef struct {
     unsigned long long rc6_prev;
     double rc6_t;
 
+    /* NVIDIA (NVML): sleeping, limits, why it runs slower than it could */
+    int nv_state;          /* NV_* below; NV_NONE for other GPUs */
+    double temp_lim;       /* slows itself down from here (max operating temperature), -1 = unknown */
+    double temp_slow, temp_shut; /* hardware slowdown / shutdown temperatures, -1 = unknown */
+    int reasons_ok;        /* the driver says why the clock is held back */
+    unsigned long long reasons; /* NVML clock event reasons now */
+    int slow_now;          /* held back now: GS_HEAT | GS_POWER */
+    double slow_since;     /* monotonic: held back without a break since, 0 = not now */
+    double busy_s, heat_s, pwr_s, held_s; /* since start: seconds busy, and held back by heat / power / either while busy */
+    double slow_ev_t;      /* when the last "slowing down" event was raised */
+
     /* private */
     char dev[PATHBUF], hwmon[PATHBUF], drm[PATHBUF];
     unsigned long long p_energy;
     double p_energy_t;
-    void *nvml; /* nvmlDevice_t when the GPU is driven through NVML */
+    void *nvml; /* nvmlDevice_t while the GPU is read through NVML */
     unsigned long long nv_ts; /* NVML per-process samples already seen */
+    char pm_path[PATHBUF];    /* its PCI device's power/runtime_status: asleep or not, without waking it */
+    int pm_auto;              /* the kernel may power it off when idle (power/control = auto, driver agrees) */
+    double nv_idle_t;         /* monotonic: idle (0% load) without a break since, 0 = busy */
+    double nv_wait_t;         /* NV_IDLE: when NVML let go of it */
+    double last_power;        /* NV_IDLE: the last figure, for the totals */
+    int nv_fails;             /* let go of it, and it stayed on anyway (something else uses it) */
 } gpu_t;
+
+enum { NV_NONE, NV_ON, NV_IDLE, NV_ASLEEP };
+enum { GS_HEAT = 1, GS_POWER = 2 };
 
 typedef struct {
     int n;
     gpu_t g[MAX_GPUS];
+    double nv_keep_until; /* NVML stays attached until then (the GPU didn't sleep when let go) */
+    double nv_retry_t;    /* NVML init failed: try again from then */
+    char slow[96];        /* the GPU that took longest to read this time */
+    double slow_s;
 } gpus_t;
 
 void gpus_init(gpus_t *g);
@@ -300,6 +333,7 @@ typedef struct {
     char name[32], path[PATHBUF];
     int depth, readable, primed;
     unsigned long long max_range, prev;
+    double prev_t; /* when prev was read: watts come from the time between two reads */
     double watts;
 } rapl_t;
 
@@ -307,7 +341,13 @@ typedef struct {
     char name[16], status[24], path[PATHBUF];
     double watts, capacity, time_left; /* -1 = unknown; time_left in s */
     double health;                     /* full charge now vs. new, %, -1 = unknown */
+    double full_wh, design_wh;         /* what a full charge holds now / when new, -1 = unknown */
     long cycles;                       /* charge cycles, -1 = unknown */
+    /* a charge limit (laptops that can stop charging early to slow wear) */
+    int lim_ok;              /* the battery has the setting ... */
+    char lim_file[40];       /* ... in this file */
+    int lim_end, lim_start;  /* stops at / starts again below, %; -1 = not set */
+    double lim_t;            /* when it was last read (monotonic) */
 } battery_t;
 
 typedef struct {
@@ -319,6 +359,11 @@ typedef struct {
     char ac_path[PATHBUF];
     int ac_online; /* -1 = unknown */
     double pkg_w, core_w, uncore_w, dram_w, psys_w; /* -1 = unknown */
+    /* the "psys" (whole platform) domain is left unconnected by some laptop
+     * firmware: it then reads far less than the CPU package inside it */
+    int psys_low, psys_bad;
+    char slow[40]; /* the part that took longest to read this time, for slow-reading events */
+    double slow_s;
 } power_t;
 
 void power_init(power_t *p);
@@ -340,6 +385,8 @@ typedef struct {
     int level;         /* EV_* */
     char cat[10];      /* "thermal", "memory", "disk", "gpu", "pcie", "crash", "kernel"... */
     char text[200];
+    int rep;           /* the same line came this many times in a row ("... (3 times)") */
+    double t_rep;      /* when it came last */
 } event_t;
 
 /* pressure stall information: share of time tasks waited for a resource */
@@ -435,6 +482,9 @@ typedef struct {
     double fan_last, link_last, ro_last;      /* a fan is stopped / a link dropped / a disk went read-only */
     double ulim_last;                         /* a sensor is past the limit you gave it */
 
+    char slow[40];  /* the check that took longest this time, and how long */
+    double slow_s;
+
     /* private */
     int kmsg_fd, kmsg_file, primed, thr_tried;
     long kmsg_off;
@@ -449,6 +499,8 @@ typedef struct {
 void health_init(health_t *h);
 void health_event(health_t *h, int level, const char *cat, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
 const event_t *health_event_at(const health_t *h, int i); /* 0 = newest, NULL past the end */
+/* what an event means, in plain words, for the ones that need it; 0 = none */
+int event_explain(const char *cat, const char *text, char *out, size_t n);
 /* active problems for the header: throttling now, OOM kill just now... "" = none */
 int health_alert(const health_t *h, char *out, size_t n);
 /* the busiest process right now, for event texts: " while firefox used 180% CPU" ("" = none) */
@@ -560,11 +612,24 @@ typedef struct {
     health_t health;
     svcs_t svc;
 
-    double total_w; /* best whole-machine power estimate, -1 = unknown */
+    double total_w; /* best whole-machine power estimate, -1 = unknown (never a partial sum) */
     const char *total_w_src;
+    const char *total_why; /* why it's unknown: "needs root" (the CPU part), "" */
+    int pw_partial;        /* the power history holds only the GPUs (no total known) */
+    double part_w;         /* ... and what they draw */
 
     hist_t h_cpu, h_mem, h_gpu[MAX_GPUS], h_dr, h_dw, h_rx, h_tx, h_pw, h_temp;
     double next_slow;
+
+    /* a reading that took a second or more: reported once the next sample
+     * shows the whole system didn't stand still meanwhile (that's a freeze) */
+    char slow_what[96];
+    double slow_dur;
+    int slow_frz, slow_susp;
+    struct {
+        char what[96];
+        double t;
+    } slow_seen[8]; /* each one at most every 10 minutes */
 } sys_t;
 
 void sys_init(sys_t *s);

@@ -172,6 +172,29 @@ void metrics_write(FILE *f, sys_t *s)
             sfmt(b, sizeof b, "%d", i);
             one("gpu_power_watts", "gpu", b, nn(s->gpus.g[i].power_w));
         }
+        int any = 0;
+        for (int i = 0; i < s->gpus.n; i++)
+            any |= s->gpus.g[i].reasons_ok;
+        if (any) {
+            help("gpu_slowed_down", "gauge", "1 while the GPU holds its clock back for this reason (heat, power)");
+            for (int i = 0; i < s->gpus.n; i++)
+                if (s->gpus.g[i].reasons_ok) {
+                    sfmt(b, sizeof b, "%d", i);
+                    two("gpu_slowed_down", "gpu", b, "reason", "heat", (s->gpus.g[i].slow_now & GS_HEAT) ? 1 : 0);
+                    two("gpu_slowed_down", "gpu", b, "reason", "power", (s->gpus.g[i].slow_now & GS_POWER) ? 1 : 0);
+                }
+        }
+        any = 0;
+        for (int i = 0; i < s->gpus.n; i++)
+            any |= s->gpus.g[i].nv_state != NV_NONE;
+        if (any) {
+            help("gpu_asleep", "gauge", "1 while the GPU is powered off to save power");
+            for (int i = 0; i < s->gpus.n; i++)
+                if (s->gpus.g[i].nv_state != NV_NONE) {
+                    sfmt(b, sizeof b, "%d", i);
+                    one("gpu_asleep", "gpu", b, s->gpus.g[i].nv_state == NV_ASLEEP ? 1 : 0);
+                }
+        }
     }
 
     /* power */

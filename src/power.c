@@ -105,8 +105,9 @@ void power_init(power_t *p)
                 battery_t *b = &p->bat[p->nbat++];
                 str_copy(b->name, sizeof b->name, e->d_name);
                 str_copy(b->path, sizeof b->path, dir);
-                b->watts = b->capacity = b->time_left = b->health = -1;
+                b->watts = b->capacity = b->time_left = b->health = b->full_wh = b->design_wh = -1;
                 b->cycles = -1;
+                b->lim_end = b->lim_start = -1;
             } else if (!strcmp(type, "Mains") && !p->ac_path[0]) {
                 sfmt(p->ac_path, sizeof p->ac_path, "%s/online", dir);
             }
@@ -148,12 +149,42 @@ static void battery_sample(battery_t *b)
     }
     /* wear: what a full charge holds now compared with when it was new */
     long long des, fl;
-    b->health = -1;
-    if ((battr(b, "energy_full_design", &des) == 0 && battr(b, "energy_full", &fl) == 0) ||
-        (battr(b, "charge_full_design", &des) == 0 && battr(b, "charge_full", &fl) == 0))
-        if (des > 0 && fl > 0)
+    b->health = b->full_wh = b->design_wh = -1;
+    if (battr(b, "energy_full_design", &des) == 0 && battr(b, "energy_full", &fl) == 0) {
+        if (des > 0 && fl > 0) {
             b->health = CLAMP(100.0 * (double)fl / (double)des, 0, 150);
+            b->full_wh = (double)fl / 1e6;
+            b->design_wh = (double)des / 1e6;
+        }
+    } else if (battr(b, "charge_full_design", &des) == 0 && battr(b, "charge_full", &fl) == 0) {
+        if (des > 0 && fl > 0) {
+            b->health = CLAMP(100.0 * (double)fl / (double)des, 0, 150);
+            if (battr(b, "voltage_min_design", &volt) == 0 && volt > 0) {
+                b->full_wh = (double)fl * (double)volt / 1e12;
+                b->design_wh = (double)des * (double)volt / 1e12;
+            }
+        }
+    }
     b->cycles = battr(b, "cycle_count", &v) == 0 && v > 0 ? (long)v : -1;
+
+    /* a charge limit, if the laptop has one (ASUS, ThinkPad, Dell, Huawei...);
+     * it hardly ever changes and some firmware is slow to answer: once a minute */
+    double mono = now_sec();
+    if (!b->lim_t || mono - b->lim_t >= 60) {
+        b->lim_t = mono;
+        long long e = -1, s = -1;
+        int he = 0;
+        static const char *const ends[] = { "charge_control_end_threshold", "charge_stop_threshold" };
+        for (int k = 0; k < 2 && !he; k++)
+            if (battr(b, ends[k], &e) == 0) {
+                he = 1;
+                str_copy(b->lim_file, sizeof b->lim_file, ends[k]);
+            }
+        int hs = battr(b, "charge_control_start_threshold", &s) == 0 || battr(b, "charge_start_threshold", &s) == 0;
+        b->lim_ok = he;
+        b->lim_end = he && e > 0 && e < 100 ? (int)e : -1;
+        b->lim_start = hs && s > 0 && s < 100 ? (int)s : -1;
+    }
 
     b->time_left = -1;
     if (b->watts > 0.1 && e_now >= 0) {
@@ -164,26 +195,50 @@ static void battery_sample(battery_t *b)
     }
 }
 
+/* the slowest part of this sample so far (for "reading X took 3 s" events) */
+static void note_slow(power_t *p, double t0, const char *what)
+{
+    double d = now_sec() - t0;
+    if (d > p->slow_s) {
+        p->slow_s = d;
+        str_copy(p->slow, sizeof p->slow, what);
+    }
+}
+
 void power_sample(power_t *p, double dt)
 {
+    (void)dt; /* each meter keeps the time of its own last read instead */
     double pkg = 0, core = 0, unc = 0, dram = 0, psys = 0;
     int hp = 0, hc = 0, hu = 0, hd = 0, hs = 0;
+    p->slow_s = 0;
+    p->slow[0] = '\0';
+    double t0 = now_sec();
     for (int i = 0; i < p->nrapl; i++) {
         rapl_t *z = &p->z[i];
         unsigned long long e;
-        z->watts = -1;
-        if (!z->readable || read_ull(z->path, &e))
+        if (!z->readable || read_ull(z->path, &e)) {
+            z->watts = -1;
             continue;
-        if (z->primed && dt > 0) {
+        }
+        /* Energy divided by the time between this read and the last one,
+         * both taken right here: if something earlier in the sample was
+         * slow, a stall can't turn into a fake spike of power. */
+        double t = now_sec();
+        if (!z->primed) {
+            z->watts = -1;
+            z->prev = e;
+            z->prev_t = t;
+            z->primed = 1;
+        } else if (t - z->prev_t >= 0.2) {
             unsigned long long de;
             if (e >= z->prev)
                 de = e - z->prev;
             else /* counter wrapped */
                 de = z->max_range > z->prev ? z->max_range - z->prev + e : 0;
-            z->watts = (double)de / 1e6 / dt;
-        }
-        z->prev = e;
-        z->primed = 1;
+            z->watts = (double)de / 1e6 / (t - z->prev_t);
+            z->prev = e;
+            z->prev_t = t;
+        } /* else read again right away: too short to measure, keep the last figure */
         if (z->watts < 0)
             continue;
         if (!strncmp(z->name, "package", 7) && z->depth == 0) {
@@ -208,11 +263,28 @@ void power_sample(power_t *p, double dt)
     p->uncore_w = hu ? unc : -1;
     p->dram_w = hd ? dram : -1;
     p->psys_w = hs ? psys : -1;
+    /* psys covers the whole platform, the CPU package included: well below
+     * the package means the firmware never connected it (0.08 W next to an
+     * 8 W CPU on some laptops). A few samples in a row, then it's ignored. */
+    if (hs && hp && pkg > 1.0 && !p->psys_bad) {
+        p->psys_low = psys < 0.9 * pkg ? p->psys_low + 1 : 0;
+        if (p->psys_low >= 3)
+            p->psys_bad = 1;
+    }
+    if (p->nrapl)
+        note_slow(p, t0, "the CPU power meters (RAPL)");
 
-    for (int i = 0; i < p->nbat; i++)
+    for (int i = 0; i < p->nbat; i++) {
+        char what[40];
+        double tb = now_sec();
         battery_sample(&p->bat[i]);
+        sfmt(what, sizeof what, "battery %s", p->bat[i].name);
+        note_slow(p, tb, what);
+    }
     if (p->ac_path[0]) {
         long long v;
+        double ta = now_sec();
         p->ac_online = read_ll(p->ac_path, &v) == 0 ? (int)v : -1;
+        note_slow(p, ta, "the AC adapter");
     }
 }

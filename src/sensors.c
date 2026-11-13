@@ -222,12 +222,58 @@ void sensors_init(sensors_t *S)
     }
 }
 
+/* Readings that never change: a temperature that stayed put to the tenth
+ * of a degree for 5 minutes while another moved by 10 °C or more, or an
+ * input at exactly 0 V for a minute. */
+static void still_update(sensors_t *S, double now)
+{
+    static double after = -1;
+    if (after < 0) { /* test hook: HSM_STILL_AFTER=10 */
+        const char *e = secure_getenv("HSM_STILL_AFTER");
+        after = e && atof(e) > 0 ? atof(e) : 300;
+    }
+    double moved = 0;
+    for (int i = 0; i < S->n; i++)
+        if (S->s[i].type == SENS_TEMP && S->s[i].t_first)
+            moved = MAX(moved, S->s[i].vmax - S->s[i].vmin);
+    for (int i = 0; i < S->n; i++) {
+        sensor_t *t = &S->s[i];
+        if (!t->ok || !t->t_first) {
+            t->still = 0;
+            continue;
+        }
+        if (t->type == SENS_TEMP)
+            t->still = t->vmax == t->vmin && now - t->t_first >= after && moved >= 10;
+        else if (t->type == SENS_VOLT)
+            t->still = t->vmax == 0 && t->vmin == 0 && now - t->t_first >= MIN(after, 60);
+        else
+            t->still = 0;
+    }
+}
+
 void sensors_sample(sensors_t *S)
 {
+    /* how long each chip takes: a slow one (laptop firmware) gets named */
+    double chip_s = 0, t = now_sec();
+    S->slow_s = 0;
+    S->slow[0] = '\0';
     for (int i = 0; i < S->n; i++) {
         sensor_t *s = &S->s[i];
         long long v;
+        if (i && S->s[i - 1].chip_idx != s->chip_idx)
+            chip_s = 0;
+        if (s->hidden) { /* not even read: hiding one that is slow to answer helps */
+            s->ok = 0;
+            continue;
+        }
         s->ok = read_ll(s->path, &v) == 0;
+        double t2 = now_sec();
+        chip_s += t2 - t;
+        t = t2;
+        if (chip_s > S->slow_s) {
+            S->slow_s = chip_s;
+            str_copy(S->slow, sizeof S->slow, s->chip);
+        }
         if (!s->ok)
             continue;
         switch (s->type) {
@@ -238,7 +284,15 @@ void sensors_sample(sensors_t *S)
         }
         if (s->value > s->peak)
             s->peak = s->value;
+        if (!s->t_first) {
+            s->t_first = t;
+            s->vmin = s->vmax = s->value;
+        } else {
+            s->vmin = MIN(s->vmin, s->value);
+            s->vmax = MAX(s->vmax, s->value);
+        }
     }
+    still_update(S, t);
 }
 
 /* Intel coretemp exposes one "Core N" sensor per physical core; the n-th
@@ -322,6 +376,16 @@ void sensors_chip_name(const char *chip, char *out, size_t n)
                 { "amdgpu", "GPU" },   { "radeon", "GPU" },    { "nouveau", "GPU" },   { "i915", "GPU" },
                 { "xe", "GPU" },       { "nvme", "NVMe" },     { "acpitz", "ACPI" },   { "pch_", "PCH" },
                 { "iwlwifi", "WiFi" }, { "thinkpad", "ThinkPad" }, { "drivetemp", "Drive" } };
+    /* USB-C ports' power supplies: "ucsi_source_psy_USBC000:001" is port 1 */
+    if (!strncmp(chip, "ucsi_source_psy", 15)) {
+        const char *colon = strrchr(chip, ':');
+        int port = colon ? atoi(colon + 1) : 0;
+        if (port > 0)
+            sfmt(out, n, "USB-C %d", port);
+        else
+            str_copy(out, n, "USB-C");
+        return;
+    }
     const char *nm = chip;
     for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
         if (!strncmp(chip, map[i].prefix, strlen(map[i].prefix))) {
@@ -333,4 +397,65 @@ void sensors_chip_name(const char *chip, char *out, size_t n)
         sfmt(out, n, "%s %s", nm, hash + 1);
     else
         str_copy(out, n, nm);
+}
+
+/* "temp1", "in0", "fan2", "power1", "curr1": a number, no real name */
+static int generic_label(const char *l, const char **digits)
+{
+    static const char *const pre[] = { "temp", "in", "fan", "power", "curr" };
+    for (size_t i = 0; i < sizeof pre / sizeof pre[0]; i++) {
+        size_t pl = strlen(pre[i]);
+        if (strncmp(l, pre[i], pl) || !l[pl])
+            continue;
+        const char *q = l + pl;
+        while (*q >= '0' && *q <= '9')
+            q++;
+        if (!*q) {
+            *digits = l + pl;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* A short name for the panels that tells sensors apart: your name, else
+ * the chip's own label where it has one ("Core 3", "NVMe Sensor 1"), the
+ * chip alone for its only reading ("WiFi", "BAT1", "USB-C 1"), or the chip
+ * and a number when it has several unnamed ones ("ACPI 1", "ACPI 2"). */
+void sensor_short_name(const sensors_t *S, int i, char *out, size_t n)
+{
+    const sensor_t *t = &S->s[i];
+    if (t->name[0]) {
+        str_copy(out, n, t->name);
+        return;
+    }
+    char chip[32];
+    sensors_chip_name(t->chip, chip, sizeof chip);
+    if (!strncmp(t->chip, "coretemp", 8)) {
+        if (!strncmp(t->label, "Package id ", 11)) {
+            int k = atoi(t->label + 11);
+            if (k)
+                sfmt(out, n, "CPU %d", k);
+            else
+                str_copy(out, n, "CPU");
+        } else {
+            str_copy(out, n, t->label); /* "Core 3" */
+        }
+        return;
+    }
+    const char *dg = NULL;
+    int comp = !strcmp(t->label, "Composite"); /* NVMe: the drive's own figure */
+    if (comp || generic_label(t->label, &dg)) {
+        int same = 0;
+        for (int k = 0; k < S->n; k++)
+            same += S->s[k].chip_idx == t->chip_idx && S->s[k].type == t->type;
+        if (comp || same <= 1)
+            str_copy(out, n, chip);
+        else if (t->type == SENS_TEMP)
+            sfmt(out, n, "%s %s", chip, dg);
+        else
+            sfmt(out, n, "%s %s", chip, t->label);
+        return;
+    }
+    sfmt(out, n, "%s %s", chip, t->label);
 }

@@ -278,7 +278,7 @@ void events_view(sys_t *s, ui_state_t *u)
         put(iy + 1, ix, iw, A_GRAY, "%s",
             history_writer() || !E.n ? "Saved in events.log from now on; nothing saved before this run"
                                      : "Only this run: events.log can't be read");
-    int ly = iy + 2, detail = 3, rows = ih - 2 - detail;
+    int ly = iy + 2, detail = 5, rows = ih - 2 - detail;
     if (!g_nidx) {
         put(ly, ix, iw, A_GRAY, "%s",
             E.n ? "No events match. Esc clears the filter, e shows more levels."
@@ -361,11 +361,15 @@ void events_view(sys_t *s, ui_state_t *u)
     sfmt(full, sizeof full, "%s  %s  %s: %s", ts, LEVEL_NAME[CLAMP(x->level, 0, 2)], x->cat, x->text);
     put(dy, ix, iw, A_GRAY, "%s", U ? "────" : "----");
     const char *q = full;
-    for (int line = 1; line < detail && *q; line++) {
+    int line = 1;
+    for (; line < 3 && *q; line++) {
         size_t nb = utf8_bytes_for_cols(q, iw);
         put(dy + line, ix, iw, A_NORMAL, "%.*s", (int)nb, q);
         q += nb;
     }
+    char ex[400]; /* what it means, for the kernel's cryptic ones */
+    if (event_explain(x->cat, x->text, ex, sizeof ex))
+        wrap_text(dy + line, ix, iw, detail - line, CP(C_INFO), ex);
 }
 
 int events_key(ui_state_t *u, int ch)

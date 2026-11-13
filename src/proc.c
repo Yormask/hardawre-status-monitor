@@ -307,10 +307,24 @@ void procs_sample(procs_t *ps, double dt, unsigned long long memtotal)
     ps->gpu_any = 0;
     char rel[64], buf[2048];
     struct dirent *e;
+    /* the time between two entries goes to the process before: one stuck
+     * in the kernel (its memory map locked) can hold up reading its files */
+    double tp = now_sec();
+    pid_t prevpid = 0;
+    ps->slow_s = 0;
+    ps->slow_pid = 0;
     while ((e = readdir(d)) != NULL) {
+        double tn = now_sec();
+        if (prevpid && tn - tp > ps->slow_s) {
+            ps->slow_s = tn - tp;
+            ps->slow_pid = prevpid;
+        }
+        tp = tn;
+        prevpid = 0;
         if (!isdigit((unsigned char)e->d_name[0]))
             continue;
         pid_t pid = (pid_t)atoi(e->d_name);
+        prevpid = pid;
         sfmt(rel, sizeof rel, "%s/stat", e->d_name);
         if (read_at(dfd, rel, buf, sizeof buf) <= 0)
             continue; /* exited meanwhile */
@@ -433,6 +447,10 @@ void procs_sample(procs_t *ps, double dt, unsigned long long memtotal)
             sorted = 0;
         last = pid;
         ps->n++;
+    }
+    if (prevpid && now_sec() - tp > ps->slow_s) { /* the last one */
+        ps->slow_s = now_sec() - tp;
+        ps->slow_pid = prevpid;
     }
     if (!sorted)
         qsort(ps->p, (size_t)ps->n, sizeof *ps->p, cmp_pid);

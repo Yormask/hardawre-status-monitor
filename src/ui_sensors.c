@@ -112,7 +112,8 @@ static int cur_rule(const ui_state_t *u, srule_t *r, const sensor_t **t)
 
 static void store(ui_state_t *u, const srule_t *r, const char *what)
 {
-    config_set_srule(u, r);
+    if (r) /* NULL: the rules are set already, just apply and save them */
+        config_set_srule(u, r);
     if (g_s)
         sensors_apply(&g_s->sens, u->srule, u->nsrule);
     if (config_save(u) != 0)
@@ -373,6 +374,34 @@ int sensors_page_key(ui_state_t *u, int ch)
             store(u, &r, msg);
         }
         return 1;
+    case 'H': { /* hide every one that never changes */
+        if (!g_s)
+            return 1;
+        int n = 0;
+        for (int i = 0; i < g_s->sens.n; i++) {
+            const sensor_t *x = &g_s->sens.s[i];
+            if (!x->still || x->hidden)
+                continue;
+            srule_t nr;
+            memset(&nr, 0, sizeof nr);
+            str_copy(nr.id, sizeof nr.id, x->id);
+            const srule_t *old = config_srule(u, x->id);
+            if (old)
+                nr = *old;
+            nr.hide = 1;
+            config_set_srule(u, &nr);
+            n++;
+        }
+        if (!n) {
+            ui_message(u, 0, "No sensor has read the same all along (that takes a few minutes to tell)");
+            return 1;
+        }
+        char msg[120];
+        sfmt(msg, sizeof msg, "Hid %d sensor%s that %s changed (h on one shows it again)", n, n == 1 ? "" : "s",
+             n == 1 ? "hasn't" : "haven't");
+        store(u, NULL, msg); /* save once for all of them */
+        return 1;
+    }
     case KEY_DC:
     case 'd':
         if (cur_rule(u, &r, &t)) {
@@ -482,7 +511,7 @@ void sensors_page(sys_t *s, ui_state_t *u)
             sfmt(v, sizeof v, t->type == SENS_VOLT ? "%.3f %s" : t->type == SENS_POWER ? "%.1f %s" : "%.0f %s",
                  t->value, UNIT[t->type]);
         else
-            str_copy(v, sizeof v, t ? "n/a" : "away");
+            str_copy(v, sizeof v, !t ? "away" : r.hide ? "-" : "n/a"); /* hidden ones aren't read */
         attr_t va = sel ? base | A_BOLD
                   : !t || !t->ok || r.hide ? A_GRAY
                   : sensor_bad(t) ? CP(C_CRIT) | A_BOLD
@@ -509,14 +538,23 @@ void sensors_page(sys_t *s, ui_state_t *u)
         }
         if (r.hide && x4 + c4 - lx > 8)
             put(y, ix + iw - 6, 6, sel ? base : CP(C_WARN), "hidden");
+        else if (t && t->still && x4 + c4 - lx > 16)
+            put(y, ix + iw - 14, 14, sel ? base : A_GRAY, "hasn't changed");
     }
     if (NR > rows) {
         char m[32];
         sfmt(m, sizeof m, " %d%s ", NR - rows, U ? " more ↑↓" : " more");
         put(top + H - 1, W - 2 - utf8_cols(m), utf8_cols(m), A_GRAY, "%s", m);
     }
-    int hy = iy + ih - 2;
-    wrap_text(hy, ix, iw, 2, A_GRAY,
-              "Your names show in every panel, the Hardware view, events and new logs. Past a limit of yours the value "
-              "turns red and raises an event; hidden sensors are left out everywhere.");
+    int hy = iy + ih - 2, nstill = 0;
+    for (int i = 0; i < S->n; i++)
+        nstill += S->s[i].still && !S->s[i].hidden;
+    if (nstill)
+        wrap_text(hy, ix, iw, 2, A_GRAY,
+                  "\"hasn't changed\": the same reading since hsm started while others moved - a placeholder, or "
+                  "nothing connected. H hides all of them; hidden sensors aren't even read.");
+    else
+        wrap_text(hy, ix, iw, 2, A_GRAY,
+                  "Your names show in every panel, the Hardware view, events and new logs. Past a limit of yours the value "
+                  "turns red and raises an event; hidden sensors are left out everywhere.");
 }

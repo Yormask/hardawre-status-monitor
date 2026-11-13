@@ -151,6 +151,7 @@ void lv_draw(sys_t *s, ui_state_t *u);
 int lv_key(sys_t *s, ui_state_t *u, int ch);
 void lv_click(ui_state_t *u, int kind, int a, int b, int x, int dbl);
 void lv_wheel(int where, int dir);
+void lv_digest(const char *path, char *out, size_t n); /* the gist of a log, one line */
 void log_toggle_system(sys_t *s, ui_state_t *u);  /* key l */
 void log_toggle_process(sys_t *s, ui_state_t *u); /* key L */
 

@@ -292,11 +292,19 @@ static int gpu_need(sys_t *s, ui_state_t *u, int w)
     return n;
 }
 
+/* "heat", "power limit", "heat, power limit": why the GPU is held back now */
+static const char *slow_words(int bits)
+{
+    return bits == (GS_HEAT | GS_POWER) ? "heat, power limit" : bits & GS_HEAT ? "heat" : bits & GS_POWER ? "power limit" : "";
+}
+
 static void gpu_details(int y, int x, int w, const gpu_t *g)
 {
     int xx = x, xm = x + w;
     if (g->temp_c >= 0)
-        kv(y, &xx, xm, temp_attr(g->temp_c) | A_BOLD, "", "%.0f%s", g->temp_c, DEG);
+        kv(y, &xx, xm, temp_attr_lim(g->temp_c, g->temp_lim) | A_BOLD, "", "%.0f%s", g->temp_c, DEG);
+    if (g->slow_now) /* the driver says why it isn't at full speed */
+        kv(y, &xx, xm, g->slow_now & GS_HEAT ? CP(C_WARN) | A_BOLD : A_BOLD, "slowing:", "%s", slow_words(g->slow_now));
     if (g->power_w >= 0) {
         if (g->power_cap_w > 0)
             kv(y, &xx, xm, CP(C_WARN) | A_BOLD, "", "%.1f/%.0f W", g->power_w, g->power_cap_w);
@@ -338,6 +346,21 @@ static void panel_gpu(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
             put(iy + r++, ix, iw, A_BOLD, "%d %s", k, g->name);
         if (r >= ih)
             break;
+        if (g->nv_state == NV_ASLEEP || g->nv_state == NV_IDLE) {
+            /* powered off, or left alone so it can be: no figures without waking it */
+            int xx = ix + put(iy + r, ix, iw, CP(C_INFO), "Load  ");
+            put(iy + r++, xx, ix + iw - xx, g->note[0] ? CP(C_WARN) : A_GRAY, "%s",
+                g->note[0] ? g->note
+                : g->nv_state == NV_ASLEEP ? "asleep: powered off to save power"
+                                           : "idle: hsm let go of it so it can power off");
+            if (r < ih && g->mem_total > 0) /* the same rows as when it's awake */
+                meter(iy + r++, ix, iw, "VRAM", 6, 0, "-", 11, A_GRAY);
+            if (r < ih && g->clk_max_mhz > 0)
+                meter(iy + r++, ix, iw, "Clock", 6, 0, "-", 15, A_GRAY);
+            if (r < ih)
+                r++;
+            continue;
+        }
         if (g->util >= 0) {
             char v[16];
             sfmt(v, sizeof v, "%5.1f%%", g->util);
@@ -472,7 +495,7 @@ static int build_power(sys_t *s, pline_t *L, int max)
     }
     if (p->dram_w >= 0)
         n = pl_add(L, n, max, A_BOLD, 0, "DRAM", "%.1f W", p->dram_w);
-    if (p->psys_w >= 0)
+    if (p->psys_w >= 0 && !p->psys_bad) /* not when the firmware left it unconnected */
         n = pl_add(L, n, max, CP(C_WARN) | A_BOLD, 0, "Platform (psys)", "%.1f W", p->psys_w);
     for (int i = 0; i < s->gpus.n; i++) {
         gpu_t *g = &s->gpus.g[i];
@@ -480,7 +503,9 @@ static int build_power(sys_t *s, pline_t *L, int max)
             continue; /* Intel iGPU already shown as uncore */
         char lab[48];
         sfmt(lab, sizeof lab, "GPU%d %s", i, g->vendor);
-        if (g->power_cap_w > 0)
+        if (g->nv_state == NV_ASLEEP || g->nv_state == NV_IDLE)
+            n = pl_add(L, n, max, A_GRAY, 0, lab, "%s", g->nv_state == NV_ASLEEP ? "asleep" : "idle");
+        else if (g->power_cap_w > 0)
             n = pl_add(L, n, max, CP(C_WARN) | A_BOLD, 0, lab, "%.1f/%.0f W", g->power_w, g->power_cap_w);
         else
             n = pl_add(L, n, max, CP(C_WARN) | A_BOLD, 0, lab, "%.1f W", g->power_w);
@@ -498,6 +523,8 @@ static int build_power(sys_t *s, pline_t *L, int max)
         }
         if (b->health >= 0)
             app(lab, sizeof lab, "%shealth %.0f%%", SEP, b->health);
+        if (b->lim_end > 0)
+            app(lab, sizeof lab, "%slimit %d%%", SEP, b->lim_end);
         attr_t va = !strcmp(b->status, "Discharging") ? CP(C_WARN) | A_BOLD : CP(C_OK) | A_BOLD;
         if (b->watts >= 0)
             n = pl_add(L, n, max, va, 0, lab, "%.1f W", b->watts);
@@ -524,6 +551,8 @@ static void panel_power(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
     char info[64] = "";
     if (s->total_w >= 0)
         sfmt(info, sizeof info, "%s%.1f W (%s)", U ? "≈ " : "~", s->total_w, s->total_w_src);
+    else if (s->total_why[0]) /* the GPUs alone are no total */
+        sfmt(info, sizeof info, "total %s", s->total_why);
     box_(y, x, h, w, "Power", info);
     int ix = x + 2, iw = w - 4, iy = y + 1, ih = h - 2, r = 0;
     if (ih <= 0)
@@ -540,7 +569,7 @@ static void panel_power(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         double mx = hist_max(&s->h_pw, graph_span(iw)) * 1.1;
         graph(iy + r, ix, ih - r, iw, &s->h_pw, mx, CP(C_WARN), 0);
         if (ih - r >= 2 && mx > 0 && g_lay->graph_style != GRAPH_OFF)
-            put(iy + r, ix, iw, A_GRAY, "%.0f W", mx);
+            put(iy + r, ix, iw, A_GRAY, "%s%.0f W", s->pw_partial ? "GPU " : "", mx);
     }
 }
 
@@ -667,10 +696,20 @@ typedef struct {
 } tent_t;
 
 
-static int generic_label(const char *l)
+/* the same name twice in one panel (two chips that call themselves alike):
+ * number the later ones */
+static void unique_names(char (*nm)[40], int n)
 {
-    return (!strncmp(l, "temp", 4) || !strncmp(l, "fan", 3)) && l[strcspn(l, "0123456789")] != '\0' &&
-           strlen(l) <= 6;
+    for (int i = 1; i < n; i++) {
+        int same = 1;
+        for (int j = 0; j < i; j++)
+            same += !strcmp(nm[j], nm[i]);
+        if (same > 1) {
+            char b[40];
+            sfmt(b, sizeof b, "%.33s #%d", nm[i], same);
+            str_copy(nm[i], 40, b);
+        }
+    }
 }
 
 static int temps_list(sys_t *s, tent_t *T, int max)
@@ -685,25 +724,36 @@ static int temps_list(sys_t *s, tent_t *T, int max)
         T[n].mine = t->uhi > 0;
         n++;
     }
+    /* then GPUs with no hwmon chip of their own (NVIDIA, read through NVML) */
+    for (int i = 0; i < s->gpus.n && n < max; i++) {
+        const gpu_t *g = &s->gpus.g[i];
+        if (g->temp_c < 0 || g->hwmon[0])
+            continue;
+        if (s->gpus.n > 1)
+            sfmt(T[n].name, sizeof T[n].name, "GPU%d %s", i, g->vendor);
+        else
+            str_copy(T[n].name, sizeof T[n].name, "GPU");
+        T[n].v = g->temp_c;
+        T[n].crit = g->temp_lim > 0 ? g->temp_lim : 0; /* where it starts slowing itself down */
+        T[n].mine = 0;
+        n++;
+    }
     for (int i = 0; i < S->n && n < max; i++) {
         sensor_t *t = &S->s[i];
         if (t->type != SENS_TEMP || !t->ok || i == S->cpu_idx || t->hidden)
             continue;
-        char chip[24];
-        sensors_chip_name(t->chip, chip, sizeof chip);
-        if (t->name[0])
-            str_copy(T[n].name, sizeof T[n].name, t->name);
-        else if (!strncmp(t->chip, "coretemp", 8))
-            str_copy(T[n].name, sizeof T[n].name, t->label); /* "Core 3" */
-        else if (generic_label(t->label) || !strcmp(t->label, "Composite"))
-            str_copy(T[n].name, sizeof T[n].name, chip);
-        else
-            sfmt(T[n].name, sizeof T[n].name, "%s %s", chip, t->label);
+        sensor_short_name(S, i, T[n].name, sizeof T[n].name); /* "ACPI 2", "NVMe", "Core 3" */
         T[n].v = t->value;
         T[n].crit = t->uhi > 0 ? t->uhi : t->crit;
         T[n].mine = t->uhi > 0;
         n++;
     }
+    char nm[64][40];
+    for (int i = 0; i < n && i < 64; i++)
+        str_copy(nm[i], sizeof nm[i], T[i].name);
+    unique_names(nm, MIN(n, 64));
+    for (int i = 0; i < n && i < 64; i++)
+        str_copy(T[i].name, sizeof T[i].name, nm[i]);
     return n;
 }
 
@@ -776,12 +826,7 @@ static int fans_list(sys_t *s, fent_t *F, int max)
         sensor_t *t = &S->s[i];
         if (t->type != SENS_FAN || !t->ok || t->hidden)
             continue;
-        char chip[24];
-        sensors_chip_name(t->chip, chip, sizeof chip);
-        if (t->name[0])
-            str_copy(F[n].name, sizeof F[n].name, t->name);
-        else
-            sfmt(F[n].name, sizeof F[n].name, "%s %s", chip, t->label);
+        sensor_short_name(S, i, F[n].name, sizeof F[n].name); /* "asus cpu_fan", "nct6798 fan2" */
         F[n].min = t->ulo;
         F[n].v = t->value;
         /* bar scale: the fan's rated max if the driver exposes it,
@@ -967,6 +1012,23 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         if (all && !since)
             kv(iy + r, &kx, km, A_GRAY, "", "(%llu since boot)", all);
     }
+    /* the GPU: held back by heat or a power limit (NVIDIA's own reasons) */
+    for (int i = 0; i < s->gpus.n; i++) {
+        const gpu_t *g = &s->gpus.g[i];
+        if (!g->reasons_ok || g->busy_s <= 0)
+            continue; /* never busy since start: nothing to say */
+        char k[16];
+        sfmt(k, sizeof k, s->gpus.n > 1 ? "GPU%d" : "GPU", i);
+        double share = 100.0 * g->held_s / g->busy_s;
+        if (g->slow_now)
+            kv(iy + r, &kx, km, g->slow_now & GS_HEAT ? CP(C_WARN) | A_BOLD : A_BOLD, k, "slowing now (%s)",
+               slow_words(g->slow_now));
+        else if (g->held_s >= 5)
+            kv(iy + r, &kx, km, g->heat_s >= g->pwr_s ? CP(C_WARN) : A_BOLD, k, "held back %.0f%% of its busy time", share);
+        else
+            kv(iy + r, &kx, km, CP(C_OK), k, "%s", "full speed");
+        break;
+    }
     if (s->mem.oom_ok) {
         unsigned long long since = s->mem.oom_kill - H->oom_start;
         if (H->oom_last > 0 && now - H->oom_last < 60)
@@ -1049,6 +1111,11 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
     } else {
         kv(iy + r, &kx, km, A_GRAY, "Kernel log", "%s", H->kmsg == -1 ? "needs root" : "n/a");
     }
+    for (int i = 0; i < s->power.nbat; i++) { /* a worn battery: there for good, so said once here */
+        const battery_t *b = &s->power.bat[i];
+        if (b->health > 0 && b->health < 80)
+            kv(iy + r, &kx, km, b->health < 60 ? CP(C_CRIT) | A_BOLD : CP(C_WARN), "Battery", "worn, %.0f%% left", b->health);
+    }
     r++;
 
     /* the rest: the latest problems, newest first */
@@ -1104,10 +1171,10 @@ static void panel_volt(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         sensor_t *t = &s->sens.s[idx[k]];
         int cy = iy + k % rows, cx = ix + (k / rows) * cw, aw = cw - (cols > 1 ? 3 : 0);
         int bad = sensor_bad(t);
-        char chip[24], v[24];
-        sensors_chip_name(t->chip, chip, sizeof chip);
+        char nm[48], v[24];
+        sensor_short_name(&s->sens, idx[k], nm, sizeof nm); /* "BAT1", "USB-C 1": not two "in0" */
         sfmt(v, sizeof v, "%.3f V", t->value);
-        put(cy, cx, aw - 9, A_NORMAL, "%s", sensor_label(t));
+        put(cy, cx, aw - 9, A_NORMAL, "%s", nm);
         put(cy, cx + aw - utf8_cols(v), utf8_cols(v), bad ? CP(C_CRIT) | A_BOLD : A_BOLD, "%s", v);
     }
 }

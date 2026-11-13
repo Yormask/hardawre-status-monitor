@@ -148,7 +148,7 @@ typedef struct {
     char kill_desc[160], kill_user[32];
 
     /* one-line status message in the footer */
-    char msg[160];
+    char msg[320];
     double msg_until;
     int msg_err;
     int bell;        /* ring the terminal bell at the next redraw (alerts) */
