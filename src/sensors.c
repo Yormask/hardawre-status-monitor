@@ -105,6 +105,13 @@ static int scan_chip(sensors_t *S, const char *dir, const char *chip, int chip_i
         sfmt(p, sizeof p, "%s/%s%d_label", dir, prefix[s->type], c[i].num);
         if (read_line(p, s->label, sizeof s->label) || !s->label[0])
             sfmt(s->label, sizeof s->label, "%s%d", prefix[s->type], c[i].num);
+        for (char *q = s->label; *q; q++) /* '|' separates the fields of a "sensor =" line */
+            if (*q == '|' || (unsigned char)*q < 32)
+                *q = '/';
+        sfmt(s->id, sizeof s->id, "%s/%s", chip, s->label);
+        for (int k = S->n - added, dup = 1; k < S->n; k++) /* the same label twice on one chip */
+            if (!strcmp(S->s[k].id, s->id))
+                sfmt(s->id, sizeof s->id, "%s/%s (%d)", chip, s->label, ++dup);
         if (s->type == SENS_FAN) {
             long long v;
             sfmt(p, sizeof p, "%s/fan%d_max", dir, c[i].num);
@@ -260,6 +267,50 @@ double sensors_cpu_temp(const sensors_t *S)
     if (S->cpu_idx < 0 || !S->s[S->cpu_idx].ok)
         return -1;
     return S->s[S->cpu_idx].value;
+}
+
+/* your names, limits and hidden sensors from the config file */
+void sensors_apply(sensors_t *S, const srule_t *r, int n)
+{
+    for (int i = 0; i < S->n; i++) {
+        sensor_t *t = &S->s[i];
+        t->name[0] = '\0';
+        t->ulo = t->uhi = 0;
+        t->hidden = 0;
+        for (int k = 0; k < n; k++)
+            if (!strcmp(r[k].id, t->id)) {
+                str_copy(t->name, sizeof t->name, r[k].name);
+                t->ulo = r[k].lo;
+                t->uhi = r[k].hi;
+                t->hidden = r[k].hide;
+                break;
+            }
+        if (!t->ulo && !t->uhi) /* no limits (any more): nothing to report */
+            t->lim_t = 0, t->lim_flagged = 0;
+    }
+}
+
+const char *sensor_label(const sensor_t *t)
+{
+    return t->name[0] ? t->name : t->label;
+}
+
+int sensor_bad(const sensor_t *t)
+{
+    if (!t->ok)
+        return 0;
+    double lo = t->ulo, hi = t->uhi;
+    if (t->type == SENS_VOLT) { /* your range replaces the one the chip reports */
+        if (lo <= 0 && hi <= 0) {
+            lo = t->lo;
+            hi = t->hi;
+        }
+    } else if (t->type == SENS_FAN) {
+        hi = 0; /* fans: only a minimum */
+    } else {
+        lo = 0; /* temperatures, power: only a maximum */
+    }
+    return (hi > 0 && t->value >= hi) || (lo > 0 && t->value < lo);
 }
 
 /* "coretemp" -> "CPU", "nvme#2" -> "NVMe 2", ... */

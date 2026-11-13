@@ -19,8 +19,10 @@
  */
 /* ui.c - header, footer, help, the signal dialog, key handling and view dispatch */
 #define _GNU_SOURCE
+#include "cooling.h"
 #include "log.h"
 #include "ui_int.h"
+#include "watch.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -48,10 +50,23 @@ static void header(sys_t *s, ui_state_t *u)
     int x = 0;
     x += put(0, x, COLS - x, CP(C_HDR) | A_BOLD, " %s ", APP_NAME);
     x += 1;
-    static const char *const SHORT[VIEW_COUNT] = { "Dash", "Procs", "HW", "Setup", "Log", "Svc" };
+    static const char *const SHORT[VIEW_COUNT] = { "Dash", "Procs", "HW", "Setup", "Log", "Svc", "Events", "Hist" };
+    /* full names, short ones, or only the numbers with the open view's name:
+     * whatever leaves room for the clock and an alert on the right */
+    int room = COLS - x - 24, style = 0;
+    for (; style < 2; style++) {
+        int need = 0;
+        for (int v = 0; v < VIEW_COUNT; v++)
+            need += 4 + (int)strlen(style ? SHORT[v] : VIEW_NAMES[v]);
+        if (need <= room)
+            break;
+    }
     for (int v = 0; v < VIEW_COUNT; v++) {
         attr_t a = v == u->view ? CP(C_HDR) | A_BOLD : A_GRAY;
-        x += put(0, x, COLS - x, a, " %d %s ", v + 1, COLS < 100 ? SHORT[v] : VIEW_NAMES[v]);
+        const char *nm = style == 0 ? VIEW_NAMES[v] : style == 1 || v == u->view ? SHORT[v] : NULL;
+        int w = nm ? put(0, x, COLS - x, a, " %d %s ", v + 1, nm) : put(0, x, COLS - x, a, " %d ", v + 1);
+        hit_add(0, x, 1, w, HIT_VIEW, v, 0);
+        x += w;
     }
     x += 2;
     char rec[40] = "", clock[16], up[24];
@@ -91,9 +106,21 @@ static void header(sys_t *s, ui_state_t *u)
 static void footer(ui_state_t *u)
 {
     int y = LINES - 1, x = 0;
-    if (u->filter_edit) {
+    if (u->view == VIEW_SETUP && u->sens_open && u->sens_edit) {
+        x += put(y, x, COLS, CP(C_KEY), " %s ", u->sens_edit == 1 ? "Name" : "Limit");
+        if (u->msg_err && u->msg[0] && now_sec() < u->msg_until) { /* what was wrong with the input */
+            put(y, x, COLS - x, CP(C_CRIT) | A_BOLD, " %s", u->msg);
+            return;
+        }
+        x += put(y, x, COLS - x, A_NORMAL, " %s", u->sens_prompt);
+        put(y, x, COLS - x, A_GRAY, "   Enter: save   Esc: cancel%s",
+            u->sens_edit == 1 ? "   (empty: the chip's name)" : "   (empty: none)");
+        return;
+    }
+    if (u->filter_edit) { /* what is typed goes to the filter of the view */
+        const char *f = u->view == VIEW_SVC ? u->svc_filter : u->view == VIEW_EVENTS ? u->ev_filter : u->filter;
         x += put(y, x, COLS, CP(C_KEY), " Filter ");
-        x += put(y, x, COLS - x, A_BOLD, " %s", u->filter);
+        x += put(y, x, COLS - x, A_BOLD, " %s", f);
         x += put(y, x, 1, A_REVERSE, " ");
         put(y, x, COLS - x, A_GRAY, "   Enter: keep   Esc: clear");
         return;
@@ -110,55 +137,126 @@ static void footer(ui_state_t *u)
         return;
     }
 
-    static const char *const keys[][2] = {
-        { "q", "Quit" },     { "?", "Help" },     { "s", "Setup" },       { "l", "Log" },
-        { "L", "Log proc" }, { "x", "Kill" },     { "1-6", "View" },      { "c/m/d/g/o/p/n/t", "Sort" },
-        { "/", "Filter" },   { "b", "CPU bars" }, { "k", "Kthreads" },    { "f", "Follow" },
-        { "+/-", "Interval" }, { "Spc", "Pause" },
+    typedef struct {
+        const char *k, *l;
+        int code; /* the key a click presses, 0 = none */
+    } hint_t;
+    static const hint_t keys[] = {
+        { "q", "Quit", 'q' },     { "?", "Help", '?' },      { "s", "Setup", 's' },        { "l", "Log", 'l' },
+        { "Enter", "Details", '\n' },
+        { "x", "Kill", 'x' },     { "N", "Nice", 'N' },      { "T", "Tree", 'T' },         { "L", "Log proc", 'L' },
+        { "1-8", "View", 0 },     { "c/m/d/g/o/p/n/t", "Sort", 0 }, { "/", "Filter", '/' }, { "b", "CPU bars", 'b' },
+        { "k", "Kthreads", 'k' }, { "f", "Follow", 'f' },    { "+/-", "Interval", 0 },     { "Spc", "Pause", ' ' },
     };
-    static const char *const lkeys[][2] = {
-        { "l", "Start/stop" }, { "Space", "Select" }, { "a", "All" }, { "n", "None" },
-        { "i", "Interval" },   { "L", "Log process (view 2)" }, { "q", "Quit" },
+    static const hint_t lkeys[] = {
+        { "l", "Start/stop", 'l' }, { "Space", "Select", ' ' }, { "v", "Saved logs", 'v' }, { "r", "Recorder", 'r' },
+        { "d", "Delete after", 'd' }, { "a", "All", 'a' },      { "n", "None", 'n' },        { "i", "Interval", 'i' },
+        { "q", "Quit", 'q' },
     };
-    static const char *const vkeys[][2] = {
-        { "Enter", "Show processes" }, { "c/m/d/n/t", "Sort" }, { "/", "Filter" }, { "Esc", "Clear" },
-        { "1-6", "View" },             { "?", "Help" },         { "q", "Quit" },
+    static const hint_t listkeys[] = {
+        { "Enter", "Open", '\n' }, { "Up/Dn", "Select", 0 }, { "Esc", "Back", 27 }, { "q", "Quit", 'q' },
     };
-    static const char *const skeys[][2] = {
-        { "Up/Dn", "Select" }, { "Enter", "Toggle" }, { "Left/Right", "Column / value" },
-        { "[ ]", "Move" },     { "R", "Reset all" },     { "Esc", "Back" },  { "q", "Quit" },
+    static const hint_t viewkeys[] = {
+        { "Left/Right", "Cursor", 0 }, { "Up/Dn", "Column", 0 }, { "+/-", "Zoom", 0 },  { "0", "Fit", '0' },
+        { "n/N", "Next/prev event", 0 }, { "[ ]", "Scroll", 0 }, { "Space", "Pin graph", ' ' },
+        { "s", "Save SVG", 's' },        { "Esc", "Back", 27 },   { "q", "Quit", 'q' },
     };
-    const char *const(*k)[2] = u->view == VIEW_SETUP ? skeys : u->view == VIEW_LOG ? lkeys : u->view == VIEW_SVC ? vkeys : keys;
-    size_t nk = u->view == VIEW_SETUP ? sizeof skeys / sizeof skeys[0]
-              : u->view == VIEW_LOG   ? sizeof lkeys / sizeof lkeys[0]
-              : u->view == VIEW_SVC   ? sizeof vkeys / sizeof vkeys[0]
-                                      : sizeof keys / sizeof keys[0];
+    static const hint_t vkeys[] = {
+        { "Enter", "Show processes", '\n' }, { "c/m/d/n/t", "Sort", 0 }, { "/", "Filter", '/' }, { "Esc", "Clear", 27 },
+        { "1-8", "View", 0 },                 { "?", "Help", '?' },        { "q", "Quit", 'q' },
+    };
+    static const hint_t evkeys[] = {
+        { "Up/Dn", "Select", 0 }, { "/", "Search", '/' }, { "e", "Levels", 'e' }, { "Esc", "Clear", 27 },
+        { "1-8", "View", 0 },     { "?", "Help", '?' },   { "q", "Quit", 'q' },
+    };
+    static const hint_t hikeys[] = {
+        { "Up/Dn", "Scroll", 0 }, { "1-8", "View", 0 }, { "?", "Help", '?' }, { "q", "Quit", 'q' },
+    };
+    static const hint_t hwkeys[] = {
+        { "Up/Dn", "Scroll", 0 }, { "D", "Drive tests", 'D' }, { "C", "Cooling check", 'C' },
+        { "1-8", "View", 0 },     { "?", "Help", '?' },        { "q", "Quit", 'q' },
+    };
+    static const hint_t drvkeys[] = {
+        { "Up/Dn", "Drive", 0 }, { "s", "Short test", 's' }, { "e", "Extended test", 'e' }, { "a", "Stop test", 'a' },
+        { "r", "Read again", 'r' }, { "Esc", "Back", 27 },   { "q", "Quit", 'q' },
+    };
+    static const hint_t coolkeys[] = {
+        { "Enter", "Start", '\n' }, { "Esc", "Stop / back", 27 }, { "q", "Quit", 'q' },
+    };
+    static const hint_t pdkeys[] = {
+        { "Esc", "Back", 27 }, { "Up/Dn", "Scroll", 0 }, { "x", "Kill", 'x' }, { "N", "Nice", 'N' },
+        { "L", "Log it", 'L' }, { "q", "Quit", 'q' },
+    };
+    static const hint_t senskeys[] = {
+        { "Up/Dn", "Select", 0 }, { "Enter", "Rename", '\n' }, { "l", "Limit", 'l' }, { "h", "Hide", 'h' },
+        { "d", "Undo yours", 'd' }, { "Esc", "Back", 27 },     { "q", "Quit", 'q' },
+    };
+    static const hint_t skeys[] = {
+        { "Up/Dn", "Select", 0 }, { "Enter", "Toggle", '\n' }, { "Left/Right", "Column / value", 0 },
+        { "[ ]", "Move", 0 },     { "R", "Reset all", 0 },     { "Esc", "Back", 27 },  { "q", "Quit", 'q' },
+    };
+#define PICK(t) (k = (t), nk = sizeof(t) / sizeof(t)[0])
+    const hint_t *k;
+    size_t nk;
+    if (u->pd_open && u->view == u->pd_view)
+        PICK(pdkeys);
+    else if (u->view == VIEW_HW && u->drv_open)
+        PICK(drvkeys);
+    else if (u->view == VIEW_HW && u->cool_open)
+        PICK(coolkeys);
+    else if (u->view == VIEW_HW)
+        PICK(hwkeys);
+    else if (u->view == VIEW_SETUP && u->sens_open)
+        PICK(senskeys);
+    else if (u->view == VIEW_SETUP)
+        PICK(skeys);
+    else if (u->view == VIEW_LOG)
+        u->log_mode == 1 ? PICK(listkeys) : u->log_mode == 2 ? PICK(viewkeys) : PICK(lkeys);
+    else if (u->view == VIEW_SVC)
+        PICK(vkeys);
+    else if (u->view == VIEW_EVENTS)
+        PICK(evkeys);
+    else if (u->view == VIEW_HIST)
+        PICK(hikeys);
+    else
+        PICK(keys);
+#undef PICK
     for (size_t i = 0; i < nk && x < xm; i++) {
-        int need = (int)strlen(k[i][0]) + (int)strlen(k[i][1]) + 3;
+        int need = (int)strlen(k[i].k) + (int)strlen(k[i].l) + 3;
         if (x + need > xm)
             break;
-        x += put(y, x, xm - x, CP(C_KEY), "%s", k[i][0]);
-        x += put(y, x, xm - x, A_NORMAL, " %s  ", k[i][1]);
+        int x0 = x;
+        x += put(y, x, xm - x, CP(C_KEY), "%s", k[i].k);
+        x += put(y, x, xm - x, A_NORMAL, " %s  ", k[i].l);
+        if (k[i].code)
+            hit_add(y, x0, 1, x - x0 - 2, HIT_KEY, k[i].code, 0);
     }
 }
 
 static void help_overlay(void)
 {
     static const char *const L[][2] = {
-        { "1 - 6, Tab", "Dashboard, Processes, Hardware, Setup, Logging, Services" },
+        { "1 - 6, Tab", "Dashboard Processes Hardware Setup Logging Services" },
+        { "7 8", "Events (kept across runs) / History (a line per day)" },
+        { "Enter", "everything about the selected process (Esc: back)" },
         { "s, F2", "Setup: choose, arrange and style the panels" },
         { "Up Down PgUp PgDn", "move the selection or scroll (Home / End too)" },
         { "l", "start / stop logging sensors to a CSV file" },
         { "L", "start / stop logging the selected process" },
         { "x, F9", "send a signal to (kill) the selected process" },
+        { "N, F7 F8", "priority (nice) of the selected process" },
+        { "T, F5", "process tree: which process started which" },
         { "c m d p n t", "sort: CPU mem I/O PID name time (twice: reverse)" },
         { "g o", "sort by GPU use / by open files" },
         { "Enter (6)", "Services: show the processes of the selected one" },
         { "/", "filter by name, command, user or PID (Esc clears)" },
         { "f k", "follow the process, not the row / kernel threads" },
-        { "b", "CPU core bars: usage, clock, temperature, or a mix" },
+        { "b", "CPU core bars: usage, temperature or clock speed" },
+        { "v (5)", "saved logs: graph one, jump to events, s saves it" },
+        { "D C (3)", "Hardware view: drive self-tests, cooling check" },
         { "+ -", "slower / faster refresh" },
         { "Space", "pause / resume sampling" },
+        { "Mouse", "click tabs, rows and headings; the wheel scrolls" },
         { "q, F10", "quit" },
     };
     int n = (int)(sizeof L / sizeof L[0]);
@@ -172,7 +270,7 @@ static void help_overlay(void)
         put(y + 2 + i, x + 22, w - 25, A_NORMAL, "%s", L[i][1]);
     }
     put(y + h - 5, x + 3, w - 6, A_GRAY, "Run as root (sudo hsm) for CPU power, exact Intel GPU load, the kernel");
-    put(y + h - 4, x + 3, w - 6, A_GRAY, "log, NVMe drive health and other users' processes.");
+    put(y + h - 4, x + 3, w - 6, A_GRAY, "log, NVMe and SATA drive health and other users' processes.");
     put(y + h - 3, x + 3, w - 6, A_BOLD, "%s (%s)  %s", APP_NAME, APP_LONG_NAME, APP_COPYRIGHT);
     put(y + h - 2, x + 3, w - 6, A_GRAY, "ABSOLUTELY NO WARRANTY. Free software: GPL v3 or later (see LICENSE).");
 }
@@ -210,11 +308,13 @@ static void kill_dialog(ui_state_t *u)
         put(y + 4, x + 3, iw, CP(C_WARN), "This is %s itself.", APP_NAME);
     else if (u->kill_pid == 1)
         put(y + 4, x + 3, iw, CP(C_WARN), "PID 1 is the init system: the kernel protects it.");
+    hit_add(y, x, h, w, HIT_SCROLL, -1, 0); /* clicks inside the dialog stay in it */
     for (int i = 0; i < NSIGS && 5 + i < h - 2; i++) {
         int yy = y + 5 + i, sel = i == u->kill_sel;
         attr_t a = sel ? CP(C_SEL) : A_NORMAL;
         if (sel)
             fill(yy, x + 2, w - 4, a);
+        hit_add(yy, x + 2, 1, w - 4, HIT_SIGNAL, i, 0);
         int cx = x + 3;
         cx += put(yy, cx, iw, a | A_BOLD, "%2d %-8s", SIGS[i].sig, SIGS[i].name);
         put(yy, cx + 1, x + 3 + iw - cx - 1, sel ? a : (i == 1 ? CP(C_CRIT) : A_GRAY), "%s", SIGS[i].desc);
@@ -272,6 +372,253 @@ static void kill_key(ui_state_t *u, int ch)
     }
 }
 
+/* ======================================================== renice dialog */
+
+static int proc_view(const ui_state_t *u)
+{
+    return u->view == VIEW_PROCS || (u->view == VIEW_DASH && u->lay.show_procs);
+}
+
+static proc_t *selected_proc(sys_t *s, const ui_state_t *u)
+{
+    if (!u->sel_pid)
+        return NULL;
+    for (int i = 0; i < s->procs.n; i++)
+        if (s->procs.p[i].pid == u->sel_pid && s->procs.p[i].start == u->sel_start)
+            return &s->procs.p[i];
+    return NULL;
+}
+
+static void nice_apply(ui_state_t *u, pid_t pid, unsigned long long start, int old, int val, const char *desc)
+{
+    char who[48];
+    str_copy(who, sizeof who, desc);
+    int rc = proc_renice(pid, start, val);
+    if (!rc)
+        ui_message(u, 0, "PID %d (%s): nice %d -> %d%s", (int)pid, who, old, val,
+                   val < old ? ", higher priority" : val > old ? ", lower priority" : "");
+    else if ((rc == EACCES || rc == EPERM) && val < old)
+        ui_message(u, 1, "Only root can raise a priority (lower its nice value): run hsm with sudo");
+    else if (rc == EACCES || rc == EPERM)
+        ui_message(u, 1, "Permission denied: PID %d belongs to another user. Run hsm with sudo.", (int)pid);
+    else if (rc == ESRCH)
+        ui_message(u, 1, "PID %d has already exited", (int)pid);
+    else
+        ui_message(u, 1, "Could not change the priority of PID %d: %s", (int)pid, strerror(rc));
+}
+
+static proc_t *nice_target(sys_t *s, ui_state_t *u)
+{
+    if (!proc_view(u)) {
+        ui_message(u, 1, "Open the process list first (press 2)");
+        return NULL;
+    }
+    proc_t *p = selected_proc(s, u);
+    if (!p)
+        ui_message(u, 1, "No process selected");
+    else if (p->kthread)
+        ui_message(u, 1, "[%s] is a kernel thread: its priority is the kernel's business", p->comm);
+    return p && !p->kthread ? p : NULL;
+}
+
+static void nice_open(sys_t *s, ui_state_t *u)
+{
+    proc_t *p = nice_target(s, u);
+    if (!p)
+        return;
+    u->nice_open = 1;
+    u->nice_pid = p->pid;
+    u->nice_start = p->start;
+    u->nice_old = u->nice_val = p->nice;
+    str_copy(u->nice_desc, sizeof u->nice_desc, u->sel_desc);
+}
+
+/* F7 / F8: one step at a time, no dialog (like htop) */
+static void nice_step(sys_t *s, ui_state_t *u, int dir)
+{
+    proc_t *p = nice_target(s, u);
+    if (!p)
+        return;
+    int v = CLAMP(p->nice + dir, -20, 19);
+    if (v != p->nice)
+        nice_apply(u, p->pid, p->start, p->nice, v, u->sel_desc);
+}
+
+static void nice_dialog(ui_state_t *u)
+{
+    int w = MIN(66, COLS), h = MIN(13, LINES);
+    int y = MAX(0, (LINES - h) / 2), x = MAX(0, (COLS - w) / 2), iw = w - 6;
+    for (int r = 0; r < h; r++)
+        fill(y + r, x, w, A_NORMAL);
+    box_(y, x, h, w, "Priority (nice)", NULL);
+    hit_add(y, x, h, w, HIT_SCROLL, -1, 0);
+    int xx = x + 3;
+    xx += put(y + 2, xx, iw, A_GRAY, "PID ");
+    put(y + 2, xx, x + 3 + iw - xx, A_BOLD, "%d", (int)u->nice_pid);
+    put(y + 3, x + 3, iw, A_NORMAL, "%s", u->nice_desc);
+
+    /* -20 ━━━━━━━●━━━━━━━ 19: click anywhere on it */
+    int sw = MIN(iw - 8, 40), sx = x + 3 + 4, v = u->nice_val;
+    put(y + 5, x + 3, 4, A_GRAY, "-20");
+    for (int i = 0; i < sw; i++) {
+        int val = -20 + (int)((i + 0.5) * 40 / sw);
+        int here = val == v || (i == (v + 20) * sw / 40);
+        put(y + 5, sx + i, 1, here ? CP(C_TITLE) | A_BOLD : i == (u->nice_old + 20) * sw / 40 ? A_BOLD : A_GRAY, "%s",
+            here ? (U ? "●" : "O") : i == (u->nice_old + 20) * sw / 40 ? "|" : (U ? "━" : "-"));
+        hit_add(y + 5, sx + i, 1, 1, HIT_NICE, CLAMP(val, -20, 19), 0);
+    }
+    put(y + 5, sx + sw + 1, 3, A_GRAY, "19");
+
+    xx = x + 3;
+    hit_add(y + 7, xx, 1, 2, HIT_NICE, 0, -1);
+    xx += put(y + 7, xx, iw, CP(C_INFO) | A_BOLD, "%s", U ? "◀ " : "< ");
+    xx += put(y + 7, xx, x + 3 + iw - xx, A_BOLD, "nice %d", v);
+    hit_add(y + 7, xx, 1, 2, HIT_NICE, 0, 1);
+    xx += put(y + 7, xx, x + 3 + iw - xx, CP(C_INFO) | A_BOLD, "%s", U ? " ▶" : " >");
+    if (v != u->nice_old)
+        put(y + 7, xx, x + 3 + iw - xx, A_GRAY, "   now %d", u->nice_old);
+    put(y + 8, x + 3, iw, v < 0 ? CP(C_WARN) : A_NORMAL, "%s",
+        v < 0   ? "Higher priority: it gets the CPU before the others."
+        : v > 0 ? "Lower priority: it gives way when others want the CPU."
+                : "Normal priority.");
+    if (geteuid() != 0 && v < u->nice_old)
+        put(y + 9, x + 3, iw, CP(C_WARN), "Raising a priority (lowering nice) needs root: sudo hsm");
+    xx = x + 3;
+    xx += key_hint(y + h - 2, xx, x + w - 2, "Left/Right", "change", 0);
+    xx += key_hint(y + h - 2, xx, x + w - 2, "Enter", "apply", '\n');
+    key_hint(y + h - 2, xx, x + w - 2, "Esc", "cancel", 27);
+}
+
+static void nice_key(ui_state_t *u, int ch)
+{
+    switch (ch) {
+    case KEY_LEFT:
+    case '-': u->nice_val--; break;
+    case KEY_RIGHT:
+    case '+':
+    case '=': u->nice_val++; break;
+    case KEY_HOME: u->nice_val = -20; break;
+    case KEY_END: u->nice_val = 19; break;
+    case '\n':
+    case '\r':
+    case KEY_ENTER:
+        u->nice_open = 0;
+        if (u->nice_val != u->nice_old)
+            nice_apply(u, u->nice_pid, u->nice_start, u->nice_old, u->nice_val, u->nice_desc);
+        break;
+    case 27:
+    case 'q':
+    case 'N': u->nice_open = 0; break;
+    }
+    u->nice_val = CLAMP(u->nice_val, -20, 19);
+}
+
+/* ============================================= notice about the last session */
+
+static void notice_dialog(void)
+{
+    int n = g_notice.n;
+    int w = MIN(80, COLS), h = MIN(n + 6, LINES);
+    int y = MAX(0, (LINES - h) / 2), x = MAX(0, (COLS - w) / 2);
+    for (int r = 0; r < h; r++)
+        fill(y + r, x, w, A_NORMAL);
+    box_(y, x, h, w, g_notice.title, NULL);
+    hit_add(y, x, h, w, HIT_KEY, 27, 0);
+    for (int i = 0; i < n && 2 + i < h - 2; i++)
+        put(y + 2 + i, x + 3, w - 6, i == 0 ? CP(C_CRIT) | A_BOLD : A_NORMAL, "%s", g_notice.line[i]);
+    int xx = x + 3;
+    if (g_notice.log[0])
+        xx += key_hint(y + h - 2, xx, x + w - 2, "v", "graph that log", 'v');
+    key_hint(y + h - 2, xx, x + w - 2, "any key", "closes", 0);
+}
+
+/* ================================================================== mouse */
+
+static int g_click_y = -1, g_click_x;
+static double g_click_t;
+
+static int mouse_event(sys_t *s, ui_state_t *u)
+{
+    MEVENT ev;
+    if (getmouse(&ev) != OK)
+        return 1;
+    const hit_t *h = hit_at(ev.y, ev.x);
+    int dir = ev.bstate & BUTTON4_PRESSED ? -1 : 0;
+#ifdef BUTTON5_PRESSED
+    if (ev.bstate & BUTTON5_PRESSED)
+        dir = 1;
+#endif
+    if (dir) { /* the wheel scrolls (or zooms the graph in the log viewer) */
+        if (u->help || u->notice_open || u->nice_open)
+            return 1;
+        if (u->kill_open)
+            return ui_key(s, u, dir < 0 ? KEY_UP : KEY_DOWN);
+        if (u->view == VIEW_LOG && u->log_mode == 2) {
+            lv_wheel(h && h->kind == HIT_SCROLL ? h->a : h && h->kind == HIT_COLUMN ? 1 : 0, dir);
+            return 1;
+        }
+        for (int i = 0; i < 3; i++)
+            ui_key(s, u, dir < 0 ? KEY_UP : KEY_DOWN);
+        return 1;
+    }
+    if (!(ev.bstate & (BUTTON1_PRESSED | BUTTON1_CLICKED | BUTTON1_DOUBLE_CLICKED)))
+        return 1;
+    double now = now_sec();
+    int dbl = (ev.bstate & BUTTON1_DOUBLE_CLICKED) ||
+              (now - g_click_t < 0.45 && ev.y == g_click_y && abs(ev.x - g_click_x) <= 3);
+    g_click_t = dbl ? 0 : now; /* a third click starts over */
+    g_click_y = ev.y;
+    g_click_x = ev.x;
+    if (u->help) {
+        u->help = 0;
+        return 1;
+    }
+    if (!h)
+        return 1;
+    if ((u->kill_open || u->nice_open || u->notice_open) && h->kind == HIT_SCROLL)
+        return 1;
+    switch (h->kind) {
+    case HIT_KEY: return ui_key(s, u, h->a);
+    case HIT_VIEW:
+        if (h->a == VIEW_LOG && u->view == VIEW_LOG) /* the tab of the view you're in: back to its start */
+            u->log_mode = 0;
+        u->view = h->a;
+        break;
+    case HIT_PROC:
+        if (dbl && h->a == u->sel_idx && u->sel_pid) /* double click: the details */
+            pdetail_open(u, u->sel_pid, u->sel_start);
+        else
+            u->sel_delta = h->a - u->sel_idx;
+        break;
+    case HIT_PROC_SORT: return ui_key(s, u, -1000 - h->a);
+    case HIT_SVC: services_click(s, u, h->a, dbl); break;
+    case HIT_SVC_SORT: services_sort_click(u, h->a); break;
+    case HIT_SETUP: setup_click(u, h->a, h->b, dbl); break;
+    case HIT_SENSOR: sensors_page_click(u, h->a, dbl); break;
+    case HIT_PD: pdetail_click(s, u, h->a); break;
+    case HIT_EVENT: events_click(u, h->a); break;
+    case HIT_DRIVE: drives_click(u, h->a); break;
+    case HIT_LOGCH: log_click(s, u, h->a, h->b, dbl); break;
+    case HIT_FILE:
+        if (u->log_mode == 1)
+            lv_list_click(u, h->a, dbl);
+        else
+            lv_click(u, HIT_FILE, h->a, 0, ev.x, dbl);
+        break;
+    case HIT_COLUMN:
+    case HIT_GRAPH: lv_click(u, h->kind, h->a, h->b, ev.x, dbl); break;
+    case HIT_SIGNAL:
+        u->kill_sel = h->a;
+        if (dbl)
+            kill_key(u, '\n');
+        break;
+    case HIT_NICE:
+        u->nice_val = CLAMP(h->b ? u->nice_val + h->b : h->a, -20, 19);
+        break;
+    }
+    return 1;
+}
+
 /* ================================================================= main */
 
 void ui_draw(sys_t *s, ui_state_t *u)
@@ -279,6 +626,7 @@ void ui_draw(sys_t *s, ui_state_t *u)
     g_lay = &u->lay;
     colors_sync(&u->lay);
     erase();
+    hit_reset();
     if (COLS < 60 || LINES < 16) {
         put(0, 0, COLS, A_BOLD, "Terminal too small (%dx%d), need at least 60x16", COLS, LINES);
         refresh();
@@ -290,21 +638,65 @@ void ui_draw(sys_t *s, ui_state_t *u)
         log_build_channels(s, u->log_skip);
     last_view = u->view;
     g_log.every = u->log_every;
-    if (g_log.note_new) { /* e.g. a logged process exited */
-        ui_message(u, g_log.note_err, "%s", g_log.note);
-        g_log.note_new = 0;
+    char note[200];
+    int nerr, shown_err = 0;
+    while (log_note_pop(note, sizeof note, &nerr)) /* e.g. a logged process exited */
+        if (nerr || !shown_err) { /* an error stays over a later plain note */
+            ui_message(u, nerr, "%s", note);
+            shown_err |= nerr;
+        }
+    if (u->bell) {
+        beep();
+        u->bell = 0;
+    }
+    if (u->pd_open && u->view != u->pd_view) /* another view: the details page closes */
+        u->pd_open = 0;
+    static int was_events;
+    if (was_events && u->view != VIEW_EVENTS)
+        events_release();
+    was_events = u->view == VIEW_EVENTS;
+    if (u->view != VIEW_HW && (u->drv_open || u->cool_open)) { /* ... and the Hardware view's pages */
+        u->drv_open = u->drv_confirm = 0;
+        if (u->cool_open) {
+            cooling_stop(); /* no CPU load left running behind your back */
+            cooling_stopped_event(&s->health);
+        }
+        u->cool_open = 0;
     }
     switch (u->view) {
-    case VIEW_DASH: dashboard(s, u); break;
+    case VIEW_DASH:
+        if (u->pd_open)
+            pdetail_view(s, u);
+        else
+            dashboard(s, u);
+        break;
     case VIEW_LOG: log_view(s, u); break;
-    case VIEW_PROCS: draw_procs(s, u, 1, 0, LINES - 2, COLS, 1); break;
-    case VIEW_HW: hardware(s, u); break;
+    case VIEW_PROCS:
+        if (u->pd_open)
+            pdetail_view(s, u);
+        else
+            draw_procs(s, u, 1, 0, LINES - 2, COLS, 1);
+        break;
+    case VIEW_HW:
+        if (u->drv_open)
+            drives_view(s, u);
+        else if (u->cool_open)
+            cool_view(s, u);
+        else
+            hardware(s, u);
+        break;
     case VIEW_SETUP: setup_view(s, u); break;
     case VIEW_SVC: services_view(s, u); break;
+    case VIEW_EVENTS: events_view(s, u); break;
+    case VIEW_HIST: history_view(s, u); break;
     }
     footer(u);
     if (u->kill_open)
         kill_dialog(u);
+    if (u->nice_open)
+        nice_dialog(u);
+    if (u->notice_open && g_notice.n)
+        notice_dialog();
     if (u->help)
         help_overlay();
     refresh();
@@ -322,9 +714,28 @@ static void set_sort(ui_state_t *u, int s)
 
 int ui_key(sys_t *s, ui_state_t *u, int ch)
 {
+    if (ch == KEY_MOUSE)
+        return mouse_event(s, u);
+    if (ch <= -1000) { /* a click on a column heading */
+        set_sort(u, -1000 - ch);
+        return 1;
+    }
+    if (u->notice_open) {
+        u->notice_open = 0;
+        if (ch == 'v' && g_notice.log[0])
+            lv_open(u, g_notice.log);
+        return 1;
+    }
+    if (u->nice_open) {
+        nice_key(u, ch);
+        return 1;
+    }
     if (u->filter_edit) { /* typing a filter: processes, or services in view 6 */
-        char *f = u->view == VIEW_SVC ? u->svc_filter : u->filter;
-        size_t cap = u->view == VIEW_SVC ? sizeof u->svc_filter : sizeof u->filter, len = strlen(f);
+        char *f = u->view == VIEW_SVC ? u->svc_filter : u->view == VIEW_EVENTS ? u->ev_filter : u->filter;
+        size_t cap = u->view == VIEW_SVC      ? sizeof u->svc_filter
+                   : u->view == VIEW_EVENTS ? sizeof u->ev_filter
+                                            : sizeof u->filter,
+               len = strlen(f);
         if (ch == 27) {
             f[0] = '\0';
             u->filter_edit = 0;
@@ -339,6 +750,7 @@ int ui_key(sys_t *s, ui_state_t *u, int ch)
         }
         u->sel_idx = u->scroll = 0;
         u->svc_sel = u->svc_scroll = 0;
+        u->ev_sel = u->ev_scroll = 0;
         return 1;
     }
     if (u->kill_open) {
@@ -349,11 +761,31 @@ int ui_key(sys_t *s, ui_state_t *u, int ch)
         u->help = 0;
         return 1;
     }
+    if (u->pd_open && u->view == u->pd_view && pdetail_key(u, ch))
+        return 1;
+    if (u->view == VIEW_HW) {
+        if (u->drv_open && drives_key(u, ch))
+            return 1;
+        if (u->cool_open && cool_key(s, u, ch))
+            return 1;
+        if (!u->drv_open && !u->cool_open && ch == 'D') {
+            drives_open(s, u);
+            return 1;
+        }
+        if (!u->drv_open && !u->cool_open && ch == 'C') {
+            u->cool_open = 1;
+            return 1;
+        }
+    }
     if (u->view == VIEW_SETUP && setup_key(u, ch))
         return 1;
     if (u->view == VIEW_LOG && log_view_key(s, u, ch))
         return 1;
     if (u->view == VIEW_SVC && ch != '/' && services_key(s, u, ch))
+        return 1;
+    if (u->view == VIEW_EVENTS && events_key(u, ch))
+        return 1;
+    if (u->view == VIEW_HIST && history_key(u, ch))
         return 1;
 
     static const double steps[] = { 0.25, 0.5, 1, 2, 3, 5, 10 };
@@ -374,23 +806,40 @@ int ui_key(sys_t *s, ui_state_t *u, int ch)
     case KEY_F(2): u->view = VIEW_SETUP; break;
     case '5': u->view = VIEW_LOG; break;
     case '6': u->view = VIEW_SVC; break;
+    case '7': u->view = VIEW_EVENTS; break;
+    case '8': u->view = VIEW_HIST; break;
     case 'l': log_toggle_system(s, u); break;
     case 'L': log_toggle_process(s, u); break;
     case '\t': u->view = (u->view + 1) % VIEW_COUNT; break;
     case KEY_BTAB: u->view = (u->view + VIEW_COUNT - 1) % VIEW_COUNT; break;
+    case '\n':
+    case '\r':
+    case KEY_ENTER: /* everything about the selected process */
+        if ((u->view == VIEW_PROCS || (u->view == VIEW_DASH && u->lay.show_procs)) && u->sel_pid)
+            pdetail_open(u, u->sel_pid, u->sel_start);
+        break;
     case 'x':
     case KEY_F(9): kill_open(u); break;
-    case 'b': { /* cycle through every combination of CPU core bars */
-        static const int combos[] = { CPUBAR_USAGE, CPUBAR_CLOCK, CPUBAR_TEMP,
-                                      CPUBAR_USAGE | CPUBAR_CLOCK, CPUBAR_USAGE | CPUBAR_TEMP,
-                                      CPUBAR_CLOCK | CPUBAR_TEMP, CPUBAR_ALL };
-        int i = 0, nc = (int)(sizeof combos / sizeof combos[0]);
-        while (i < nc && combos[i] != u->lay.cpu_bars)
-            i++;
-        u->lay.cpu_bars = combos[i < nc ? (i + 1) % nc : 0];
-        char d[48];
-        cpubar_desc(u->lay.cpu_bars, d, sizeof d);
-        ui_message(u, 0, "CPU core bars: %s", d);
+    case 'N': nice_open(s, u); break;
+    case KEY_F(7): nice_step(s, u, -1); break;
+    case KEY_F(8): nice_step(s, u, 1); break;
+    case 'T':
+    case KEY_F(5):
+        u->tree ^= 1;
+        if (!proc_view(u))
+            u->view = VIEW_PROCS;
+        ui_message(u, 0, u->tree ? "Process tree: children under the process that started them (T again: list)"
+                                 : "Process list (T: tree)");
+        break;
+    case 'b': { /* what the per-core CPU bars show: usage -> temperature -> clock */
+        int m = core_bar_metric(s, u->lay.core_bar);
+        for (int k = 0; k < CORE_COUNT; k++) { /* skip what this CPU doesn't report */
+            m = (m + 1) % CORE_COUNT;
+            if (core_bar_metric(s, m) == m)
+                break;
+        }
+        u->lay.core_bar = m;
+        ui_message(u, 0, "CPU core bars show: %s   (b again for the next; Setup has more)", CORE_NAME[m]);
         break;
     }
     case 'c': set_sort(u, SORT_CPU); break;
@@ -406,7 +855,7 @@ int ui_key(sys_t *s, ui_state_t *u, int ch)
     case 'f': u->follow ^= 1; break;
     case '/':
         u->filter_edit = 1;
-        if (u->view != VIEW_DASH && u->view != VIEW_SVC)
+        if (u->view != VIEW_DASH && u->view != VIEW_SVC && u->view != VIEW_EVENTS)
             u->view = VIEW_PROCS;
         break;
     case 27:

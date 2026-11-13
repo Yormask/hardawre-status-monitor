@@ -241,5 +241,8 @@ void fs_sample(disks_t *ds)
         f->total = (unsigned long long)sv.f_blocks * sv.f_frsize;
         f->avail = (unsigned long long)sv.f_bavail * sv.f_frsize;
         f->used = (unsigned long long)(sv.f_blocks - sv.f_bfree) * sv.f_frsize;
+        f->files = sv.f_files; /* 0 on btrfs, vfat...: no fixed number of files */
+        f->ffree = sv.f_ffree <= sv.f_files ? sv.f_ffree : sv.f_files;
+        f->readonly = (sv.f_flag & ST_RDONLY) != 0;
     }
 }

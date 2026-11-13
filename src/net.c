@@ -49,6 +49,10 @@ static void if_link(netif_t *f)
         str_copy(f->state, sizeof f->state, "?");
     /* tun/wireguard/ppp report "unknown" while working */
     f->up = !strcmp(f->state, "up") || !strcmp(f->state, "unknown");
+    if (!f->is_virtual) { /* Linux 4.16+: every time the cable / Wi-Fi link was lost */
+        sfmt(p, sizeof p, "%s/class/net/%s/carrier_down_count", g_sysfs, f->name);
+        f->link_downs = read_ll(p, &v) == 0 && v >= 0 ? v : -1;
+    }
     if (strcmp(old, f->state)) {
         sfmt(p, sizeof p, "%s/class/net/%s/speed", g_sysfs, f->name);
         f->speed = (f->up && !read_ll(p, &v) && v > 0) ? (int)v : -1;
@@ -98,6 +102,7 @@ void net_sample(net_t *nt, double dt)
             sfmt(path, sizeof path, "%s/class/net/%s/wireless", g_sysfs, name);
             f->wireless = path_exists(path);
             f->quality = -1;
+            f->link_downs = f->downs_seen = -1;
         }
         f->seen = 1;
         if_link(f);

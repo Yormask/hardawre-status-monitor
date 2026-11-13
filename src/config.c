@@ -30,6 +30,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,30 +74,25 @@ const char *const BAR_NAME[BAR_COUNT] = { "Blocks", "Squares", "Line", "Classic"
 const char *const GRAPH_NAME[GRAPH_COUNT] = { "Blocks", "Braille (fine)", "Off" };
 const char *const COLOR_NAME[COLOR_COUNT] = { "By value", "Gradient", "Single colour", "Monochrome" };
 
-void cpubar_desc(int mask, char *out, size_t n)
-{
-    out[0] = '\0';
-    static const char *const nm[3] = { "usage", "clock", "temperature" };
-    for (int b = 0, k = 0; b < 3; b++)
-        if (mask & (1 << b)) {
-            size_t l = strlen(out);
-            snprintf(out + l, n - l, "%s%s", k++ ? " + " : "", nm[b]);
-        }
-}
+const char *const CORE_NAME[CORE_COUNT] = { "Usage", "Temperature", "Clock speed" };
 
 
 static const char *const BAR_KEY[BAR_COUNT] = { "blocks", "squares", "line", "classic" };
 static const char *const GRAPH_KEY[GRAPH_COUNT] = { "blocks", "braille", "off" };
 static const char *const COLOR_KEY[COLOR_COUNT] = { "value", "gradient", "single", "mono" };
-static const char *const CPUBAR_KEY[3] = { "usage", "clock", "temp" };
+static const char *const CORE_KEY[CORE_COUNT] = { "usage", "temp", "clock" };
+static const char *const NOTIFY_KEY[ALERT_COUNT] = { "off", "desktop", "bell", "both" };
 static const char *const SORT_KEY[SORT_COUNT] = { "cpu", "memory", "io", "pid", "name", "time", "gpu", "files" };
 
 /* what was last loaded from / written to the file, to know if anything changed */
 typedef struct {
     layout_t lay;
     double interval, log_every;
-    int sort, reverse, kthreads;
-    char log_dir[PATHBUF], log_skip[4096];
+    int sort, reverse, kthreads, tree, keep, rec_on, rec_min;
+    int a_notify, a_temp, a_disk, a_mem, a_full, a_thr, a_prob;
+    char log_dir[PATHBUF], log_skip[8192], a_cmd[PATHBUF];
+    srule_t srule[MAX_SRULES];
+    int nsrule;
 } snap_t;
 static snap_t g_snap;
 
@@ -109,8 +105,28 @@ static void snapshot(const ui_state_t *u, snap_t *s)
     s->sort = u->sort;
     s->reverse = u->reverse;
     s->kthreads = u->show_kthreads;
+    s->tree = u->tree;
+    s->keep = u->log_keep_days;
+    s->rec_on = u->rec_on;
+    s->rec_min = u->rec_minutes;
+    s->a_notify = u->alert_notify;
+    s->a_temp = u->alert_cpu_temp;
+    s->a_disk = u->alert_disk_ms;
+    s->a_mem = u->alert_mem_pct;
+    s->a_full = u->alert_disk_full;
+    s->a_thr = u->alert_throttle;
+    s->a_prob = u->alert_problems;
     str_copy(s->log_dir, sizeof s->log_dir, u->log_dir);
     str_copy(s->log_skip, sizeof s->log_skip, u->log_skip);
+    str_copy(s->a_cmd, sizeof s->a_cmd, u->alert_command);
+    s->nsrule = u->nsrule;
+    for (int i = 0; i < u->nsrule && i < MAX_SRULES; i++) { /* field by field: no stray bytes after the text */
+        str_copy(s->srule[i].id, sizeof s->srule[i].id, u->srule[i].id);
+        str_copy(s->srule[i].name, sizeof s->srule[i].name, u->srule[i].name);
+        s->srule[i].lo = u->srule[i].lo;
+        s->srule[i].hi = u->srule[i].hi;
+        s->srule[i].hide = u->srule[i].hide;
+    }
 }
 
 int config_changed(const ui_state_t *u)
@@ -132,7 +148,65 @@ void layout_defaults(layout_t *l)
     for (int p = 0; p < P_COUNT; p++)
         l->on[p] = p != P_TEMPS && p != P_FANS && p != P_FS && p != P_SVC && p != P_VOLT;
     l->show_procs = 1;
-    l->cpu_bars = CPUBAR_USAGE;
+    l->core_bar = CORE_USAGE;
+    l->core_values = 1;
+    l->mouse = 1;
+}
+
+static void other_defaults(ui_state_t *u)
+{
+    u->log_keep_days = 0;
+    u->rec_on = 1;
+    u->rec_minutes = 10;
+    u->alert_notify = ALERT_DESKTOP;
+    u->alert_cpu_temp = 90;
+    u->alert_disk_ms = 500;
+    u->alert_mem_pct = 5;
+    u->alert_disk_full = 95;
+    u->alert_throttle = 1;
+    u->alert_problems = 1;
+    u->alert_command[0] = '\0';
+    u->tree = 0;
+}
+
+/* add, change or (when it holds nothing any more) remove the rule for r->id */
+void config_set_srule(ui_state_t *u, const srule_t *r)
+{
+    int i = 0;
+    while (i < u->nsrule && strcmp(u->srule[i].id, r->id))
+        i++;
+    int empty = !r->name[0] && r->lo <= 0 && r->hi <= 0 && !r->hide;
+    if (empty) {
+        if (i < u->nsrule) {
+            memmove(&u->srule[i], &u->srule[i + 1], (size_t)(u->nsrule - i - 1) * sizeof *r);
+            u->nsrule--;
+        }
+        return;
+    }
+    if (i == u->nsrule) {
+        if (u->nsrule >= MAX_SRULES)
+            return;
+        u->nsrule++;
+    }
+    srule_t c;
+    memset(&c, 0, sizeof c);
+    str_copy(c.id, sizeof c.id, r->id);
+    str_copy(c.name, sizeof c.name, r->name);
+    for (char *q = c.name; *q; q++) /* '|' separates the fields in the file */
+        if (*q == '|' || (unsigned char)*q < 32)
+            *q = '/';
+    c.lo = MAX(0, r->lo);
+    c.hi = MAX(0, r->hi);
+    c.hide = r->hide;
+    u->srule[i] = c;
+}
+
+const srule_t *config_srule(const ui_state_t *u, const char *id)
+{
+    for (int i = 0; i < u->nsrule; i++)
+        if (!strcmp(u->srule[i].id, id))
+            return &u->srule[i];
+    return NULL;
 }
 
 void config_reset_all(ui_state_t *u)
@@ -144,6 +218,7 @@ void config_reset_all(ui_state_t *u)
     u->sort = SORT_CPU;
     u->reverse = 0;
     u->show_kthreads = 0;
+    other_defaults(u);
 }
 
 void config_defaults(ui_state_t *u)
@@ -157,12 +232,13 @@ void config_defaults(ui_state_t *u)
     u->log_every = 1.0;
     u->log_dir[0] = '\0';
     u->log_skip[0] = '\0';
+    other_defaults(u);
     snapshot(u, &g_snap);
 }
 
 /* ------------------------------------------------------------ location */
 
-static char g_path[PATHBUF], g_dir[PATHBUF], g_logdir[PATHBUF], g_home[PATHBUF];
+static char g_path[PATHBUF], g_dir[PATHBUF], g_logdir[PATHBUF], g_home[PATHBUF], g_state[PATHBUF];
 
 static uid_t g_uid = (uid_t)-1;
 static gid_t g_gid = (gid_t)-1;
@@ -197,9 +273,26 @@ static void resolve(void)
     /* logs: $XDG_STATE_HOME/hsm/logs, default ~/.local/state/hsm/logs */
     const char *st = g_uid == (uid_t)-1 ? getenv("XDG_STATE_HOME") : NULL;
     if (st && st[0] == '/')
-        sfmt(g_logdir, sizeof g_logdir, "%s/hsm/logs", st);
+        sfmt(g_state, sizeof g_state, "%s/hsm", st);
     else
-        sfmt(g_logdir, sizeof g_logdir, "%s/.local/state/hsm/logs", home);
+        sfmt(g_state, sizeof g_state, "%s/.local/state/hsm", home);
+    sfmt(g_logdir, sizeof g_logdir, "%s/logs", g_state);
+}
+
+const char *config_state_dir(void)
+{
+    resolve();
+    return g_state;
+}
+
+int config_user_ids(uid_t *uid, gid_t *gid)
+{
+    resolve();
+    if (g_uid == (uid_t)-1)
+        return 0;
+    *uid = g_uid;
+    *gid = g_gid;
+    return 1;
 }
 
 const char *config_log_dir(const ui_state_t *u)
@@ -283,6 +376,41 @@ static int find_key(const char *const *keys, int n, const char *v)
     return -1;
 }
 
+/* "sensor = coretemp/Package id 0 | name CPU package | max 95 | hide" */
+static void parse_srule(ui_state_t *u, char *v)
+{
+    srule_t r;
+    memset(&r, 0, sizeof r);
+    char *save = NULL;
+    int first = 1;
+    for (char *f = strtok_r(v, "|", &save); f; f = strtok_r(NULL, "|", &save), first = 0) {
+        f = trim(f);
+        if (first)
+            str_copy(r.id, sizeof r.id, f);
+        else if (!strncmp(f, "name ", 5))
+            str_copy(r.name, sizeof r.name, trim(f + 5));
+        else if (!strncmp(f, "min ", 4))
+            r.lo = atof(f + 4);
+        else if (!strncmp(f, "max ", 4))
+            r.hi = atof(f + 4);
+        else if (!strcmp(f, "hide"))
+            r.hide = 1;
+    }
+    if (!strchr(r.id, '/') || !isfinite(r.lo) || !isfinite(r.hi) || r.lo < 0 || r.hi < 0 || r.lo > 1e6 || r.hi > 1e6)
+        return; /* not "chip/label", or a nonsense number */
+    config_set_srule(u, &r);
+}
+
+/* a number, or "off" for 0 */
+static int parse_off(const char *v)
+{
+    if (!strcasecmp(v, "off") || !strcasecmp(v, "no") || !strcasecmp(v, "false"))
+        return 0;
+    char *e;
+    long n = strtol(v, &e, 10);
+    return e == v ? -1 : n < 0 || n > 1000000 ? -1 : (int)n;
+}
+
 static int parse_bool(const char *v)
 {
     return !strcasecmp(v, "1") || !strcasecmp(v, "on") || !strcasecmp(v, "yes") || !strcasecmp(v, "true");
@@ -353,18 +481,22 @@ int config_load(ui_state_t *u)
             l->graph_style = i;
         } else if (!strcmp(k, "colors") && (i = find_key(COLOR_KEY, COLOR_COUNT, v)) >= 0) {
             l->color_mode = i;
-        } else if (!strcmp(k, "cpu_bars")) { /* "usage, temp", "all" */
-            int m = 0;
+        } else if (!strcmp(k, "cpu_bars")) { /* 1.5 and older: "usage, temp", "all" */
             char *save = NULL;
+            int best = -1;
             for (char *t = strtok_r(v, ",+ ", &save); t; t = strtok_r(NULL, ",+ ", &save)) {
-                if (!strcasecmp(t, "all"))
-                    m = CPUBAR_ALL;
-                else if ((i = find_key(CPUBAR_KEY, 3, t)) >= 0)
-                    m |= 1 << i;
+                int b = !strcasecmp(t, "all") ? CORE_USAGE : find_key(CORE_KEY, CORE_COUNT, t);
+                if (b >= 0 && (best < 0 || b < best))
+                    best = b;
             }
-            if (m)
-                l->cpu_bars = m;
-
+            if (best >= 0)
+                l->core_bar = best;
+        } else if (!strcmp(k, "core_bars") && (i = find_key(CORE_KEY, CORE_COUNT, v)) >= 0) {
+            l->core_bar = i;
+        } else if (!strcmp(k, "core_values")) {
+            l->core_values = parse_bool(v);
+        } else if (!strcmp(k, "mouse")) {
+            l->mouse = parse_bool(v);
         } else if (!strcmp(k, "interval")) {
             double d = atof(v);
             if (d >= 0.1 && d <= 60)
@@ -393,6 +525,44 @@ int config_load(ui_state_t *u)
                 u->log_every = d;
         } else if (!strcmp(k, "log_skip")) {
             str_copy(u->log_skip, sizeof u->log_skip, v);
+        } else if (!strcmp(k, "log_keep_days")) {
+            i = !strcasecmp(v, "forever") ? 0 : atoi(v);
+            if (i >= 0 && i <= 3650)
+                u->log_keep_days = i;
+        } else if (!strcmp(k, "recorder")) {
+            u->rec_on = parse_bool(v);
+        } else if (!strcmp(k, "recorder_minutes")) {
+            i = atoi(v);
+            if (i >= 1 && i <= 60)
+                u->rec_minutes = i;
+        } else if (!strcmp(k, "process_tree")) {
+            u->tree = parse_bool(v);
+        } else if (!strcmp(k, "alert_notify") && (i = find_key(NOTIFY_KEY, ALERT_COUNT, v)) >= 0) {
+            u->alert_notify = i;
+        } else if (!strcmp(k, "alert_cpu_temp")) {
+            i = parse_off(v);
+            if (i >= 0 && i <= 150)
+                u->alert_cpu_temp = i;
+        } else if (!strcmp(k, "alert_disk_ms")) {
+            i = parse_off(v);
+            if (i >= 0 && i <= 60000)
+                u->alert_disk_ms = i;
+        } else if (!strcmp(k, "alert_low_memory")) {
+            i = parse_off(v);
+            if (i >= 0 && i <= 50)
+                u->alert_mem_pct = i;
+        } else if (!strcmp(k, "alert_disk_full")) {
+            i = parse_off(v);
+            if (i == 0 || (i >= 50 && i <= 100))
+                u->alert_disk_full = i;
+        } else if (!strcmp(k, "alert_throttling")) {
+            u->alert_throttle = parse_bool(v);
+        } else if (!strcmp(k, "alert_problems")) {
+            u->alert_problems = parse_bool(v);
+        } else if (!strcmp(k, "alert_command")) {
+            str_copy(u->alert_command, sizeof u->alert_command, v);
+        } else if (!strcmp(k, "sensor")) {
+            parse_srule(u, v);
         }
     }
     fclose(f);
@@ -428,6 +598,14 @@ int config_load(ui_state_t *u)
 }
 
 /* ---------------------------------------------------------------- save */
+
+static void put_off(FILE *f, const char *key, int v)
+{
+    if (v > 0)
+        fprintf(f, "%s = %d\n", key, v);
+    else
+        fprintf(f, "%s = off\n", key);
+}
 
 static void write_list(FILE *f, const char *key, const layout_t *l, int c)
 {
@@ -467,7 +645,8 @@ int config_save(const ui_state_t *u)
         if (f) {
             const layout_t *l = &u->lay;
             fprintf(f, "# hsm settings. Changed from the Setup screen (key s); safe to edit by hand.\n");
-            fprintf(f, "# Panels: cpu gpu memory power disk network temps fans filesystems\n\n");
+            fprintf(f, "# Panels: cpu gpu health memory power disk network temps fans filesystems\n"
+                       "#         services voltages\n\n");
             write_list(f, "left", l, 0);
             write_list(f, "right", l, 1);
             fprintf(f, "hidden =");
@@ -479,17 +658,17 @@ int config_save(const ui_state_t *u)
                 fprintf(f, "left_width = %d\n", l->left_pct);
             else
                 fprintf(f, "left_width = auto\n");
-            fprintf(f, "\nbars = %s\ngraphs = %s\ncolors = %s\ncpu_bars =", BAR_KEY[l->bar_style],
+            fprintf(f, "\nbars = %s\ngraphs = %s\ncolors = %s\n", BAR_KEY[l->bar_style],
                     GRAPH_KEY[l->graph_style], COLOR_KEY[l->color_mode]);
-            for (int b = 0, k = 0; b < 3; b++)
-                if (l->cpu_bars & (1 << b))
-                    fprintf(f, "%s %s", k++ ? "," : "", CPUBAR_KEY[b]);
-            fprintf(f, "\n");
+            fprintf(f, "# per-core bars show usage, temp or clock; core_values prints the other two\n");
+            fprintf(f, "core_bars = %s\ncore_values = %s\nmouse = %s\n", CORE_KEY[l->core_bar],
+                    l->core_values ? "on" : "off", l->mouse ? "on" : "off");
             fprintf(f, "single_color = %s\nhighlight = %s\nselected_text = %s\ntitles = %s\nbackground = %s\n",
                     SINGLE_KEY[l->single_color], SINGLE_KEY[l->highlight], TXT_KEY[l->sel_text],
                     TXT_KEY[l->title_color], BG_KEY[l->background]);
-            fprintf(f, "\ninterval = %g\nsort = %s\nreverse = %s\nkernel_threads = %s\n", u->interval,
-                    SORT_KEY[u->sort], u->reverse ? "on" : "off", u->show_kthreads ? "on" : "off");
+            fprintf(f, "\ninterval = %g\nsort = %s\nreverse = %s\nkernel_threads = %s\nprocess_tree = %s\n",
+                    u->interval, SORT_KEY[u->sort], u->reverse ? "on" : "off", u->show_kthreads ? "on" : "off",
+                    u->tree ? "on" : "off");
             fprintf(f, "\n# Logging (view 5): folder, seconds between rows (refresh = every update),\n"
                        "# and the channels that are switched off\n");
             fprintf(f, "log_dir = %s\n", u->log_dir[0] ? u->log_dir : "default");
@@ -498,6 +677,37 @@ int config_save(const ui_state_t *u)
             else
                 fprintf(f, "log_every = refresh\n");
             fprintf(f, "log_skip = %s\n", u->log_skip);
+            if (u->log_keep_days > 0)
+                fprintf(f, "log_keep_days = %d\n", u->log_keep_days);
+            else
+                fprintf(f, "log_keep_days = forever\n");
+            fprintf(f, "\n# Flight recorder: keeps the last minutes in memory and saves them as an\n"
+                       "# incident log (hsm-incident-....csv, next to the other logs) when something goes wrong\n");
+            fprintf(f, "recorder = %s\nrecorder_minutes = %d\n", u->rec_on ? "on" : "off", u->rec_minutes);
+            fprintf(f, "\n# Alerts: alert_notify = desktop, bell, both or off. A limit of off switches\n"
+                       "# that check off. alert_command is run by sh on every alert, with $1 the title,\n"
+                       "# $2 the details and $3 \"warning\" or \"error\", e.g. notify a phone with curl.\n");
+            fprintf(f, "alert_notify = %s\n", NOTIFY_KEY[u->alert_notify]);
+            put_off(f, "alert_cpu_temp", u->alert_cpu_temp);
+            put_off(f, "alert_disk_ms", u->alert_disk_ms);
+            put_off(f, "alert_low_memory", u->alert_mem_pct);
+            put_off(f, "alert_disk_full", u->alert_disk_full);
+            fprintf(f, "alert_throttling = %s\nalert_problems = %s\nalert_command = %s\n",
+                    u->alert_throttle ? "on" : "off", u->alert_problems ? "on" : "off", u->alert_command);
+            fprintf(f, "\n# Sensors: your own name and limits for a sensor, or \"hide\" to leave it out\n"
+                       "# (Setup > Sensor names and limits). min and max are in the sensor's unit\n"
+                       "# (C, RPM, V, W); for a fan, min is the slowest a working fan turns.\n");
+            for (int i = 0; i < u->nsrule; i++) {
+                const srule_t *r = &u->srule[i];
+                fprintf(f, "sensor = %s", r->id);
+                if (r->name[0])
+                    fprintf(f, " | name %s", r->name);
+                if (r->lo > 0)
+                    fprintf(f, " | min %g", r->lo);
+                if (r->hi > 0)
+                    fprintf(f, " | max %g", r->hi);
+                fprintf(f, "%s\n", r->hide ? " | hide" : "");
+            }
             if (fclose(f) == 0 && rename(tmp, g_path) == 0) {
                 rc = 0;
                 snapshot(u, &g_snap);

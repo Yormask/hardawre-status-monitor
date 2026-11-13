@@ -139,6 +139,154 @@ static int proc_match(proc_t *p, const char *f)
     return !strcmp(b, f);
 }
 
+/* ---------------------------------------------------------- process tree */
+
+/* per row of the tree: depth, the levels whose line continues below, and
+ * whether the row is only there to show where a match came from */
+#define TREE_DEPTH 48
+static unsigned char *g_depth, *g_last, *g_ctx;
+static unsigned long long *g_cont;
+static int g_tcap, g_tree_ok; /* g_tree_ok: the arrays above describe the rows drawn now */
+
+static int find_pid(const procs_t *ps, pid_t pid) /* ps->p is sorted by PID */
+{
+    int lo = 0, hi = ps->n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (ps->p[mid].pid == pid)
+            return mid;
+        if (ps->p[mid].pid < pid)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+    return -1;
+}
+
+/* Reorder ord[0..n) (the processes to show, already sorted) as a tree:
+ * children under their parent, brothers in sort order. With ancestors set,
+ * the parents of each process are added (greyed) so you see where it came
+ * from. Returns the new row count. */
+static int tree_order(procs_t *ps, int *ord, int n, int ancestors)
+{
+    static int *inc, *par, *kids, *kstart, *kn, *all, *st, *ci;
+    static int cap;
+    int N = ps->n;
+    g_tree_ok = 0;
+    if (N <= 0 || n <= 0)
+        return n;
+    if (cap < N) {
+        int nc = N + 256;
+#define GROW(p) do { void *q = realloc(p, (size_t)nc * sizeof *(p)); if (!q) return n; p = q; } while (0)
+        GROW(inc); GROW(par); GROW(kids); GROW(kstart); GROW(kn); GROW(all); GROW(st); GROW(ci);
+#undef GROW
+        cap = nc;
+    }
+    if (g_tcap < N) {
+        int nc = N + 256;
+        void *a = realloc(g_depth, (size_t)nc), *b = realloc(g_last, (size_t)nc), *c = realloc(g_ctx, (size_t)nc);
+        g_depth = a ? a : g_depth;
+        g_last = b ? b : g_last;
+        g_ctx = c ? c : g_ctx;
+        void *d = realloc(g_cont, (size_t)nc * sizeof *g_cont);
+        g_cont = d ? d : g_cont;
+        if (!a || !b || !c || !d)
+            return n;
+        g_tcap = nc;
+    }
+    memset(inc, 0, (size_t)N * sizeof *inc);
+    for (int k = 0; k < n; k++)
+        inc[ord[k]] = 1;
+    if (ancestors)
+        for (int k = 0; k < n; k++)
+            for (int j = find_pid(ps, ps->p[ord[k]].ppid), guard = 0; j >= 0 && !inc[j] && guard < 64; guard++) {
+                inc[j] = 2;
+                j = ps->p[j].ppid != ps->p[j].pid ? find_pid(ps, ps->p[j].ppid) : -1;
+            }
+    int na = 0;
+    for (int i = 0; i < N; i++)
+        if (inc[i])
+            all[na++] = i;
+    if (na > 1)
+        qsort(all, (size_t)na, sizeof *all, cmp_proc); /* brothers come out in sort order */
+    for (int i = 0; i < N; i++)
+        kn[i] = 0;
+    for (int k = 0; k < na; k++) {
+        int i = all[k], p = find_pid(ps, ps->p[i].ppid);
+        par[i] = p >= 0 && inc[p] && p != i ? p : -1;
+        if (par[i] >= 0)
+            kn[par[i]]++;
+    }
+    for (int i = 0, sum = 0; i < N; i++) {
+        kstart[i] = sum;
+        sum += kn[i];
+        kn[i] = 0;
+    }
+    for (int k = 0; k < na; k++) {
+        int i = all[k];
+        if (par[i] >= 0)
+            kids[kstart[par[i]] + kn[par[i]]++] = i;
+    }
+    /* depth-first walk from each root */
+    int out = 0;
+    unsigned long long cont = 0;
+    for (int k = 0; k < na; k++) {
+        int r = all[k];
+        if (par[r] >= 0)
+            continue;
+        g_depth[out] = 0;
+        g_last[out] = 1;
+        g_cont[out] = 0;
+        g_ctx[out] = inc[r] == 2;
+        ord[out++] = r;
+        int sp = 0;
+        st[sp] = r;
+        ci[sp++] = 0;
+        while (sp > 0 && out < N) {
+            int node = st[sp - 1];
+            if (ci[sp - 1] >= kn[node]) {
+                sp--;
+                continue;
+            }
+            int c = kids[kstart[node] + ci[sp - 1]++];
+            int depth = sp, last = ci[sp - 1] == kn[node];
+            g_depth[out] = (unsigned char)MIN(depth, 255);
+            g_last[out] = (unsigned char)last;
+            g_cont[out] = cont & ((1ULL << MIN(depth, 63)) - 1);
+            g_ctx[out] = inc[c] == 2;
+            ord[out++] = c;
+            if (depth < 63) { /* below this row, the line at this level goes on unless it was the last */
+                if (last)
+                    cont &= ~(1ULL << depth);
+                else
+                    cont |= 1ULL << depth;
+            }
+            if (sp < N) {
+                st[sp] = c;
+                ci[sp++] = 0;
+            }
+        }
+    }
+    g_tree_ok = 1;
+    return out;
+}
+
+/* "│  ├─ " in front of a process in the tree; returns columns used */
+static int tree_prefix(int y, int x, int w, int row, attr_t a)
+{
+    int d = g_depth[row], used = 0;
+    if (!d)
+        return 0;
+    int shown = MIN(d, TREE_DEPTH);
+    for (int l = 1; l < shown && used + 3 <= w; l++, used += 3)
+        put(y, x + used, 3, a, "%s", (g_cont[row] >> l) & 1 ? (U ? "│  " : "|  ") : "   ");
+    if (used + 3 <= w) {
+        put(y, x + used, 3, a, "%s", g_last[row] ? (U ? "└─ " : "`- ") : (U ? "├─ " : "|- "));
+        used += 3;
+    }
+    return used;
+}
+
 static void fmt_time(unsigned long long ticks, long hz, char *out, size_t n)
 {
     double s = (double)ticks / (double)hz;
@@ -180,7 +328,13 @@ static void cell_text(proc_t *p, int k, long hz, char *o, size_t n, attr_t *a)
         *a = p->mem < 0.05 ? A_GRAY : p->mem >= 25 ? CP(C_WARN) | A_BOLD : A_NORMAL;
         break;
     case K_VIRT: fmt_bytes((double)p->vsize, o, n); *a = A_GRAY; break;
-    case K_RSS: fmt_bytes((double)p->rss, o, n); break;
+    case K_RSS:
+        fmt_bytes((double)p->rss, o, n);
+        if (leak_growing(p->pid, p->start)) { /* only ever grows: see the events, or Enter */
+            app(o, n, "%s", U ? "↑" : "^");
+            *a = CP(C_WARN) | A_BOLD;
+        }
+        break;
     case K_RD:
     case K_WR: {
         double v = k == K_RD ? p->rd_bps : p->wr_bps;
@@ -219,10 +373,26 @@ static void cell_text(proc_t *p, int k, long hz, char *o, size_t n, attr_t *a)
     }
 }
 
-static void draw_cmd(int y, int x, int w, proc_t *p, int full, attr_t base, int sel)
+static void draw_cmd(int y, int x, int w, proc_t *p, int full, attr_t base, int sel, int row, int tree)
 {
     if (w <= 0)
         return;
+    if (tree) {
+        int m = tree_prefix(y, x, w, row, sel ? base : A_GRAY);
+        x += m;
+        w -= m;
+        if (g_ctx[row] && !sel) { /* only here to show where a match came from: greyed */
+            const char *c = p->kthread ? "" : proc_cmdline(p);
+            if (!*c) {
+                put(y, x, w, A_GRAY, "[%s]", p->comm);
+                return;
+            }
+            const char *sl = memrchr(c, '/', strcspn(c, " "));
+            put(y, x, w, A_GRAY, "%s", sl ? sl + 1 : c);
+            return;
+        }
+        full = 0; /* the tree shows the family; the program's path takes too much room */
+    }
     if (g_log.nplog && log_proc_find(p->pid, p->start) >= 0) { /* being logged */
         int m = put(y, x, w, sel ? base | A_BOLD : CP(C_CRIT) | A_BOLD, "%s ", U ? "●" : "*");
         x += m;
@@ -282,6 +452,9 @@ void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full)
     g_pa = ps->p;
     if (n > 1)
         qsort(ord, (size_t)n, sizeof *ord, cmp_proc);
+    int matches = n;
+    if (u->tree) /* a filter keeps the parents in view, greyed; a service's processes stand alone */
+        n = tree_order(ps, ord, n, u->filter[0] && !u->svc_path[0]);
 
     char info[256] = "";
     app(info, sizeof info, "%d tasks, %d thr, %d running", ps->n, ps->threads, ps->running);
@@ -290,12 +463,14 @@ void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full)
     if (ps->zombie)
         app(info, sizeof info, ", %d zombie", ps->zombie);
     app(info, sizeof info, "%ssort %s%s", SEP, SORT_NAMES[u->sort], u->reverse ? " (rev)" : "");
+    if (u->tree)
+        app(info, sizeof info, "%stree", SEP);
     if (u->follow)
         app(info, sizeof info, "%sfollow", SEP);
     if (u->filter[0])
-        app(info, sizeof info, "%sfilter \"%s\": %d", SEP, u->filter, n);
+        app(info, sizeof info, "%sfilter \"%s\": %d", SEP, u->filter, matches);
     if (u->svc_path[0])
-        app(info, sizeof info, "%s%s: %d (Esc: all)", SEP, u->svc_name, n);
+        app(info, sizeof info, "%s%s: %d (Esc: all)", SEP, u->svc_name, matches);
     if (ps->io_denied && geteuid() != 0)
         app(info, sizeof info, "%sI/O of other users' processes needs root", SEP);
     box_(y, x, h, w, "Processes", info);
@@ -315,12 +490,24 @@ void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full)
             }
     if (sel < 0)
         sel = u->sel_idx;
+    int moved = u->sel_delta;
     sel += u->sel_delta;
     u->sel_delta = 0;
     if (sel >= n)
         sel = n - 1;
     if (sel < 0)
         sel = 0;
+    int tree = u->tree && g_tree_ok;
+    if (tree && n > matches) { /* greyed parents can't be selected: on to the nearest match */
+        int dir = moved < 0 ? -1 : 1, k = sel;
+        while (k >= 0 && k < n && g_ctx[k])
+            k += dir;
+        if (k < 0 || k >= n)
+            for (k = sel; k >= 0 && k < n && g_ctx[k]; k -= dir)
+                ;
+        if (k >= 0 && k < n)
+            sel = k;
+    }
     u->sel_idx = sel;
     u->sel_pid = n ? ps->p[ord[sel]].pid : 0;
     if (n) { /* remembered for the signal dialog */
@@ -371,18 +558,22 @@ void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full)
             }
     }
 
-    /* header */
+    /* header; a click on a heading sorts by it */
     fill(iy, ix, iw, CP(C_THEAD));
     int cx = ix;
     for (int i = 0; i < nc; i++) {
         int k = cols[i], cw = k == K_CMD ? ix + iw - cx : COLDEF[k].w;
         attr_t a = CP(C_THEAD) | (COLDEF[k].sort == u->sort ? A_BOLD | A_UNDERLINE : 0);
+        const char *hd = k == K_CMD && u->tree ? "COMMAND (tree)" : COLDEF[k].h;
         if (COLDEF[k].right)
-            put(iy, cx, cw, a, "%*s", cw, COLDEF[k].h);
+            put(iy, cx, cw, a, "%*s", cw, hd);
         else
-            put(iy, cx, cw, a, "%-*s", cw, COLDEF[k].h);
+            put(iy, cx, cw, a, "%-*s", cw, hd);
+        if (COLDEF[k].sort >= 0)
+            hit_add(iy, cx, 1, cw + 1, HIT_PROC_SORT, COLDEF[k].sort, 0);
         cx += cw + 1;
     }
+    hit_add(iy + 1, ix, rows, iw, HIT_SCROLL, 0, 0);
 
     /* rows */
     for (int r = 0; r < rows; r++) {
@@ -394,11 +585,12 @@ void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full)
         attr_t base = issel ? CP(C_SEL) : A_NORMAL;
         if (issel)
             fill(yy, ix, iw, base);
+        hit_add(yy, ix, 1, iw, HIT_PROC, k, 0);
         cx = ix;
         for (int i = 0; i < nc; i++) {
             int c = cols[i];
             if (c == K_CMD) {
-                draw_cmd(yy, cx, ix + iw - cx, p, full, base, issel);
+                draw_cmd(yy, cx, ix + iw - cx, p, full, base, issel, k, tree);
                 break;
             }
             char t[48];
@@ -407,8 +599,8 @@ void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full)
             if (issel)
                 a = base | (a & A_BOLD);
             int cw = COLDEF[c].w;
-            if (COLDEF[c].right)
-                put(yy, cx, cw, a, "%*s", cw, t);
+            if (COLDEF[c].right) /* printf pads by bytes: make up for multi-byte characters */
+                put(yy, cx, cw, a, "%*s", cw + (int)strlen(t) - utf8_cols(t), t);
             else
                 put(yy, cx, cw, a, "%-*.*s", cw, cw, t);
             cx += cw + 1;

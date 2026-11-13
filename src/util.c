@@ -252,8 +252,10 @@ void fmt_duration(double s, char *out, size_t n)
         snprintf(out, n, "%ldd %02ldh", d, h);
     else if (h)
         snprintf(out, n, "%ldh %02ldm", h, m);
-    else
+    else if (m)
         snprintf(out, n, "%ldm %02lds", m, sec);
+    else
+        snprintf(out, n, "%lds", sec);
 }
 
 int utf8_cols(const char *s)

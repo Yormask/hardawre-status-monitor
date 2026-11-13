@@ -27,7 +27,7 @@
 
 #define APP_NAME "hsm"
 #define APP_LONG_NAME "hardware status monitor"
-#define APP_VERSION "1.5.0"
+#define APP_VERSION "1.7.0"
 #define APP_COPYRIGHT "Copyright (C) 2026 Yormask"
 #define PATHBUF 512
 
@@ -64,7 +64,7 @@ double now_sec(void); /* CLOCK_MONOTONIC in seconds */
 void fmt_bytes(double v, char *out, size_t n);    /* "12.3G"   (max 5 cols) */
 void fmt_rate(double v, char *out, size_t n);     /* "12.3M/s" (max 7 cols) */
 void fmt_si(double v, char *out, size_t n);       /* "12.3k"                */
-void fmt_duration(double s, char *out, size_t n); /* "3d 04h", "12m 05s"    */
+void fmt_duration(double s, char *out, size_t n); /* "3d 04h", "12m 05s", "5s" */
 
 /* UTF-8 aware column counting (every code point counted as one column). */
 int utf8_cols(const char *s);

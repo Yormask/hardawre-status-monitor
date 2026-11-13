@@ -47,6 +47,7 @@ typedef struct {
     FILE *f;
     unsigned long rows;
     double t0, last_row;
+    int day; /* date of the file (YYYYMMDD): a new file starts at midnight */
 } plog_t;
 
 typedef struct {
@@ -59,6 +60,7 @@ typedef struct {
     unsigned long rows;
     double t0, last_row, last_sync;
     unsigned long ev_seq; /* events up to this one are already in the log */
+    int day;              /* date of the file (YYYYMMDD): a new file starts at midnight */
 
     int nplog;
     plog_t pl[MAX_PLOG];
@@ -66,9 +68,9 @@ typedef struct {
     double every;       /* seconds between rows, 0 = every sample */
     char dir[PATHBUF];  /* where new files go */
 
-    /* a note for the UI (e.g. "process exited, log closed") */
-    char note[200];
-    int note_err, note_new;
+    /* notes for the UI (e.g. "process exited, log closed"), oldest first */
+    char note[4][200];
+    int note_err[4], nnote;
 } logger_t;
 
 extern logger_t g_log;
@@ -87,5 +89,22 @@ void log_proc_stop(int i);
 void log_tick(sys_t *s); /* call after every sample: writes the rows that are due */
 void log_close_all(void);
 long log_file_size(const char *path);
+
+/* a message for the screen (or stderr without one) */
+void log_note(int err, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+int log_note_pop(char *out, size_t n, int *err); /* 1 = got one */
+
+/* shared with the flight recorder */
+int log_chan_is_events(const chan_t *c);
+int log_day_key(double wall);                           /* YYYYMMDD, local time */
+FILE *log_create(double wall, const char *base, char *path, size_t pn, char *err, size_t en);
+void log_put_header(FILE *f, const char *first, int all); /* all: every channel, not only the selected */
+void log_put_time(FILE *f, double wall);                  /* "2026-11-12 01:23:40,+01:00" */
+void log_put_value(FILE *f, const chan_t *c, double v);   /* ",12.3" (or "," when unknown) */
+void log_put_events(FILE *f, const health_t *h, unsigned long after, unsigned long upto);
+
+/* Delete logs older than keep_days (0 = never) from dir: date folders and,
+ * from before 1.6, loose files. Only hsm's own CSV files. Returns how many. */
+int log_housekeeping(const char *dir, int keep_days);
 
 #endif

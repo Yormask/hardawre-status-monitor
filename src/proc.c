@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -445,11 +446,12 @@ void procs_sample(procs_t *ps, double dt, unsigned long long memtotal)
 /* Signal a process, but only if it is still the one that was selected:
  * between the user's choice and now it may have exited and its PID been
  * reused by something else. "start" is its start time from /proc/PID/stat. */
-int proc_send_signal(pid_t pid, unsigned long long start, int sig)
+/* still the same process (the PID was not reused by another one)? 0 or ESRCH */
+static int same_process(pid_t pid, unsigned long long start)
 {
     char path[PATHBUF], buf[2048];
     if (pid <= 0)
-        return EINVAL;
+        return ESRCH;
     sfmt(path, sizeof path, "%s/%d/stat", g_procfs, (int)pid);
     if (read_file(path, buf, sizeof buf) <= 0)
         return ESRCH;
@@ -458,9 +460,50 @@ int proc_send_signal(pid_t pid, unsigned long long start, int sig)
     if (!rp || !rp[1] ||
         sscanf(rp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu", &st) != 1)
         return ESRCH;
-    if (start && st != start)
-        return ESRCH;
+    return start && st != start ? ESRCH : 0;
+}
+
+int proc_send_signal(pid_t pid, unsigned long long start, int sig)
+{
+    if (pid <= 0)
+        return EINVAL;
+    int r = same_process(pid, start);
+    if (r)
+        return r;
     return kill(pid, sig) == 0 ? 0 : errno;
+}
+
+/* Set the nice value of every thread of a process (setpriority() on a PID
+ * changes one thread only, renice(1) style). 0 or an errno. */
+int proc_renice(pid_t pid, unsigned long long start, int nice)
+{
+    if (pid <= 0 || nice < -20 || nice > 19)
+        return EINVAL;
+    int r = same_process(pid, start);
+    if (r)
+        return r;
+    char path[PATHBUF];
+    sfmt(path, sizeof path, "%s/%d/task", g_procfs, (int)pid);
+    DIR *d = opendir(path);
+    int done = 0, err = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL) {
+        char *end;
+        long tid = strtol(e->d_name, &end, 10);
+        if (*end || tid <= 0)
+            continue;
+        if (setpriority(PRIO_PROCESS, (id_t)tid, nice) == 0)
+            done++;
+        else if (errno != ESRCH)
+            err = errno;
+    }
+    if (d)
+        closedir(d);
+    if (!done && !err && setpriority(PRIO_PROCESS, (id_t)pid, nice) != 0) /* no task list to read */
+        err = errno;
+    else if (!done && !err)
+        done = 1;
+    return done ? 0 : err ? err : ESRCH;
 }
 
 const char *proc_cmdline(proc_t *p)

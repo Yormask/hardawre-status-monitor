@@ -4,11 +4,13 @@ BIN     := hsm
 CC      ?= cc
 PREFIX  ?= /usr/local
 CFLAGS  ?= -O2 -pipe
-CFLAGS  += -std=gnu11 -Wall -Wextra -Wshadow -Wno-unused-parameter
+# needed whatever CFLAGS you give (make CFLAGS=... replaces the line above)
+REQ     := -std=gnu11 -pthread
+WARN    := -Wall -Wextra -Wshadow -Wno-unused-parameter
 
 NCURSES_CFLAGS := $(shell pkg-config --cflags ncursesw 2>/dev/null)
 NCURSES_LIBS   := $(shell pkg-config --libs ncursesw 2>/dev/null || echo -lncursesw)
-LDLIBS  += $(NCURSES_LIBS) -ldl -lm
+LDLIBS  += $(NCURSES_LIBS) -ldl -lm -pthread
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:src/%.c=build/%.o)
@@ -20,13 +22,13 @@ $(BIN): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
 build/%.o: src/%.c $(HDR) | build
-	$(CC) $(CFLAGS) $(NCURSES_CFLAGS) -c -o $@ $<
+	$(CC) $(REQ) $(CFLAGS) $(WARN) $(NCURSES_CFLAGS) -c -o $@ $<
 
 build:
 	mkdir -p build
 
 # Build with AddressSanitizer + UBSan for development
-debug: CFLAGS = -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -std=gnu11 -Wall -Wextra -Wshadow -Wno-unused-parameter
+debug: CFLAGS = -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
 debug: LDFLAGS += -fsanitize=address,undefined
 debug: clean $(BIN)
 

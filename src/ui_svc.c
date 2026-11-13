@@ -138,14 +138,18 @@ void services_view(sys_t *s, ui_state_t *u)
     int pathx = ix + namew + 1 + fixed, pathw = ix + iw - pathx - 1; /* where it lives, if there's room */
     fill(iy, ix, iw, CP(C_THEAD));
     int cx = ix + put(iy, ix, namew + 1, CP(C_THEAD) | (g_sort == SORT_NAME ? A_BOLD | A_UNDERLINE : 0), " NAME");
+    hit_add(iy, ix, 1, namew + 1, HIT_SVC_SORT, SORT_NAME, 0);
     cx = ix + namew + 1;
     for (int i = 0; i < nc; i++) {
         if (i == 1 && !show_user)
             continue;
         attr_t a = CP(C_THEAD) | (C[i].sort == g_sort ? A_BOLD | A_UNDERLINE : 0);
         put(iy, cx, C[i].w, a, i < 2 ? "%-*s" : "%*s", C[i].w, C[i].h);
+        if (C[i].sort >= 0)
+            hit_add(iy, cx, 1, C[i].w + 1, HIT_SVC_SORT, C[i].sort, 0);
         cx += C[i].w + 1;
     }
+    hit_add(iy + 1, ix, rows, iw, HIT_SCROLL, 0, 0);
     if (pathw >= 12)
         put(iy, pathx + 1, pathw, CP(C_THEAD), "CGROUP");
     if (!n) {
@@ -159,6 +163,7 @@ void services_view(sys_t *s, ui_state_t *u)
         attr_t base = sel ? CP(C_SEL) : A_NORMAL;
         if (sel)
             fill(yy, ix, iw, base);
+        hit_add(yy, ix, 1, iw, HIT_SVC, k, 0);
         put(yy, ix + 1, namew - 1, base | A_BOLD, "%s", e->name);
         cx = ix + namew + 1;
         char t[32];
@@ -272,6 +277,19 @@ int services_key(sys_t *s, ui_state_t *u, int ch)
     if (u->svc_sel < 0)
         u->svc_sel = 0;
     return 1;
+}
+
+/* a click on a row selects it; a double click shows its processes */
+void services_click(sys_t *s, ui_state_t *u, int row, int dbl)
+{
+    u->svc_sel = row;
+    if (dbl)
+        services_key(s, u, '\n');
+}
+
+void services_sort_click(ui_state_t *u, int sort)
+{
+    set_sort(u, sort);
 }
 
 /* --------------------------------------------------- dashboard panel */

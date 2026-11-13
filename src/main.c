@@ -20,8 +20,11 @@
 
 /* main.c - argument parsing and the main loop */
 #define _GNU_SOURCE
+#include "cooling.h"
 #include "log.h"
+#include "serve.h"
 #include "ui.h"
+#include "watch.h"
 
 #include <errno.h>
 #include <langinfo.h>
@@ -50,21 +53,30 @@ static void usage(FILE *f)
             "Usage: %s [options]\n"
             "  -d, --delay SEC   refresh interval in seconds (default: saved setting or 1)\n"
             "  -1, --once        print one plain-text snapshot and exit\n"
-            "  -n, --top N       processes listed by --once (default 15)\n"
+            "  -j, --json        print one snapshot as JSON (for scripts) and exit\n"
+            "  -n, --top N       processes listed by --once (default 15) or --json (default all)\n"
+            "  --view FILE       open a saved log in the log viewer\n"
             "  -a, --ascii       draw with plain ASCII instead of Unicode\n"
             "  -h, --help        show this help\n"
             "  -v, --version     show version\n\n"
-            "Logging without the screen (runs until Ctrl+C, kill, or the processes exit):\n"
+            "Without the screen (runs until Ctrl+C or kill; these can be combined):\n"
+            "  --watch           flight recorder, alerts, freeze and crash detection, and the\n"
+            "                    events and daily history (views 7 and 8)\n"
             "  --log             log the values chosen in the Logging view (5) to a CSV file\n"
             "  --log-pid PID     log one process's usage (can be given up to %d times)\n"
             "  --log-every SEC   seconds between rows (default: the saved setting)\n"
-            "  --log-dir DIR     where to write the files (default: %s)\n\n"
-            "Keys: 1-6 views (6 = services), s setup, l log sensors, L log the selected process,\n"
-            "      x kill, c/m/d/g/o/p/n/t sort, / filter, b CPU bars, k kernel threads,\n"
-            "      +/- interval, space pause, ? help, q quit\n\n"
+            "  --log-dir DIR     where to write the files (default: %s)\n"
+            "  --serve [ADDR:]PORT  answer over HTTP: /metrics (Prometheus), /json; only this\n"
+            "                    machine unless ADDR says otherwise (0.0.0.0:9101: everyone)\n\n"
+            "  --cooling-check   a minute of full CPU load: does the cooling keep up? (exit 1: no)\n\n"
+            "Keys: 1-8 views (6 services, 7 events, 8 history), Enter process details, s setup,\n"
+            "      l log sensors, L log the selected process, x kill, N priority (nice),\n"
+            "      T process tree, c/m/d/g/o/p/n/t sort, / filter, b CPU core bars,\n"
+            "      v (in view 5) saved logs, +/- interval, space pause, ? help, q quit\n"
+            "      The mouse works too: tabs, rows, column headings, the wheel.\n\n"
             "Settings are saved in %s\n\n"
             "Run as root (sudo %s) to also see CPU power (RAPL), exact Intel GPU load,\n"
-            "the kernel log, NVMe drive health and other users' processes.\n\n"
+            "the kernel log, NVMe and SATA drive health and other users' processes.\n\n"
             "%s. This program comes with ABSOLUTELY NO WARRANTY.\n"
             "It is free software under the GNU GPL v3 or later; see the LICENSE file.\n",
             APP_NAME, APP_LONG_NAME, APP_VERSION, APP_NAME, MAX_PLOG, config_log_dir(NULL), config_path(),
@@ -80,10 +92,11 @@ static void sleep_sec(double s)
 
 static void print_note(void)
 {
-    if (g_log.note_new) {
-        fprintf(stderr, "%s: %s\n", APP_NAME, g_log.note);
-        g_log.note_new = 0;
-    }
+    char m[200];
+    int err;
+    while (log_note_pop(m, sizeof m, &err))
+        fprintf(err ? stderr : stdout, "%s: %s\n", APP_NAME, m);
+    fflush(stdout);
 }
 
 static const char *pretty(const char *path)
@@ -93,8 +106,19 @@ static const char *pretty(const char *path)
     return b;
 }
 
-/* hsm --log / --log-pid: record to CSV files without drawing anything */
-static int headless(ui_state_t *u, int sys_log, const pid_t *pids, int npid, double every, const char *dir)
+static void print_notice(void)
+{
+    if (!g_notice.n)
+        return;
+    printf("%s\n", g_notice.title);
+    for (int i = 0; i < g_notice.n; i++)
+        printf("  %s\n", g_notice.line[i]);
+    fflush(stdout);
+}
+
+/* hsm --log / --log-pid / --watch / --serve: record (or answer) without drawing anything */
+static int headless(ui_state_t *u, int sys_log, const pid_t *pids, int npid, double every, const char *dir, int watch,
+                    const char *serve)
 {
     char err[PATHBUF + 64];
     if (dir) {
@@ -109,14 +133,39 @@ static int headless(ui_state_t *u, int sys_log, const pid_t *pids, int npid, dou
             sfmt(u->log_dir, sizeof u->log_dir, "%s/%s", cwd, dir);
         }
     }
+    int sfd = -1;
+    if (serve) {
+        char shown[160] = "";
+        sfd = serve_open(serve, err, sizeof err, shown, sizeof shown);
+        if (sfd < 0) {
+            fprintf(stderr, "%s: --serve: %s\n", APP_NAME, err);
+            return 1;
+        }
+        printf("Serving on http://%s/  (/metrics for Prometheus, /json)\n", shown);
+        if (strncmp(shown, "127.", 4) && strncmp(shown, "[::1]", 5))
+            printf("Anyone who can reach this address can read the figures: there is no password.\n");
+    }
     if (every <= 0)
         every = u->log_every > 0 ? u->log_every : u->interval;
+    /* watching needs a sample a second (recorder, alerts); logs keep their own pace */
+    double sample = watch || serve ? MIN(every, 1.0) : every;
     str_copy(g_log.dir, sizeof g_log.dir, config_log_dir(u));
-    g_log.every = 0; /* a row on every sample: we sample at the log interval */
+    g_log.every = every > sample + 1e-9 ? every : 0; /* 0: a row on every sample */
 
     sleep_sec(0.25);
     sys_sample(&S);
     log_build_channels(&S, u->log_skip);
+    if (watch) {
+        u->rec_on = 1; /* that's what --watch is for, whatever the screen's setting */
+        watch_start(&S, u, sys_log || npid ? "log+watch" : "watch", 0);
+        print_notice();
+        print_note();
+        char p[PATHBUF];
+        config_pretty_path(config_log_dir(u), p, sizeof p);
+        printf("Watching: flight recorder (the last %d minutes), alerts (%s), crash detection,\n"
+               "freezes, events and daily history. Incident logs go to %s\n",
+               u->rec_minutes, (const char *const[]){ "off", "desktop", "bell", "desktop + bell" }[u->alert_notify], p);
+    }
     if (sys_log) {
         if (log_start(&S, err, sizeof err) != 0) {
             fprintf(stderr, "%s: %s\n", APP_NAME, err);
@@ -139,27 +188,35 @@ static int headless(ui_state_t *u, int sys_log, const pid_t *pids, int npid, dou
             printf("Logging PID %d (%s) every %g s to %s\n", (int)p->pid, p->comm, every,
                    g_log.pl[g_log.nplog - 1].path);
     }
-    if (!g_log.f && !g_log.nplog) {
+    if (!watch && sfd < 0 && !g_log.f && !g_log.nplog) {
         log_close_all();
         return 1;
     }
     printf("Press Ctrl+C to stop.\n");
     fflush(stdout);
 
-    double next = now_sec() + every;
-    while (!g_quit && (g_log.f || g_log.nplog)) {
+    double next = now_sec() + sample;
+    while (!g_quit && (watch || sfd >= 0 || g_log.f || g_log.nplog)) {
         double d = next - now_sec();
-        if (d > 0)
+        if (d > 0 && sfd >= 0)
+            serve_wait(sfd, d, &S, &g_quit); /* answers requests while it waits */
+        else if (d > 0)
             sleep_sec(d);
         if (g_quit)
             break;
         sys_sample(&S);
         log_tick(&S);
+        if (watch)
+            watch_tick(&S, u);
         print_note();
-        next += every;
+        next += sample;
         if (next < now_sec()) /* fell behind (suspend, slow disk): don't try to catch up */
-            next = now_sec() + every;
+            next = now_sec() + sample;
     }
+    if (watch)
+        watch_end();
+    if (sfd >= 0)
+        close(sfd);
     print_note();
     if (g_log.f)
         printf("Saved %lu rows to %s\n", g_log.rows, pretty(g_log.path));
@@ -172,11 +229,12 @@ static int headless(ui_state_t *u, int sys_log, const pid_t *pids, int npid, dou
 int main(int argc, char **argv)
 {
     double interval = -1; /* -1: use the saved setting */
-    int once = 0, ascii = 0, ntop = 15;
+    int once = 0, json = 0, ascii = 0, ntop = -1, watch = 0, cooling = 0;
+    const char *serve = NULL;
     int sys_log = 0, npid = 0;
     pid_t pids[MAX_PLOG];
     double log_every = -1;
-    const char *log_dir = NULL;
+    const char *log_dir = NULL, *view = NULL;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -186,6 +244,18 @@ int main(int argc, char **argv)
             interval = atof(a + 8);
         } else if (!strcmp(a, "-1") || !strcmp(a, "--once")) {
             once = 1;
+        } else if (!strcmp(a, "-j") || !strcmp(a, "--json")) {
+            json = 1;
+        } else if (!strcmp(a, "--watch")) {
+            watch = 1;
+        } else if (!strcmp(a, "--cooling-check")) {
+            cooling = 1;
+        } else if (!strcmp(a, "--serve") && i + 1 < argc) {
+            serve = argv[++i];
+        } else if (!strncmp(a, "--serve=", 8)) {
+            serve = a + 8;
+        } else if (!strcmp(a, "--view") && i + 1 < argc) {
+            view = argv[++i];
         } else if ((!strcmp(a, "-n") || !strcmp(a, "--top")) && i + 1 < argc) {
             ntop = atoi(argv[++i]);
         } else if (!strcmp(a, "-a") || !strcmp(a, "--ascii")) {
@@ -255,30 +325,67 @@ int main(int argc, char **argv)
     struct sigaction old;
     if (sigaction(SIGHUP, NULL, &old) == 0 && old.sa_handler != SIG_IGN) /* keep nohup working */
         sigaction(SIGHUP, &sa, NULL);
+    /* output into a pipe whose reader went away (hsm --watch | head) must not
+     * kill hsm before it cleans up: writes just fail instead */
+    signal(SIGPIPE, SIG_IGN);
 
     setlocale(LC_ALL, "");
+    /* numbers stay "12.5" in logs, JSON and the config file, also where the
+     * language writes "12,5" (a comma would break the CSV columns) */
+    setlocale(LC_NUMERIC, "C");
     int utf8 = !ascii && !strcmp(nl_langinfo(CODESET), "UTF-8");
 
     sys_init(&S);
 
-    if (once) {
+    if (cooling) { /* a minute of full load, then the verdict */
+        static ui_state_t cu;
+        config_defaults(&cu);
+        config_load(&cu);
+        sensors_apply(&S.sens, cu.srule, cu.nsrule);
+        sleep_sec(0.5);
+        sys_sample(&S);
+        int r = cooling_cli(&S, &g_quit);
+        sys_free(&S);
+        return r;
+    }
+    if (once || json) {
+        static ui_state_t ou; /* only for your sensor names */
+        config_defaults(&ou);
+        config_load(&ou);
+        sensors_apply(&S.sens, ou.srule, ou.nsrule);
         S.svc.want_until = now_sec() + 60; /* services too */
         svcs_sample(&S.svc);
         sleep_sec(interval > 0 ? interval : 1.0);
         sys_sample(&S);
-        report_print(&S, ntop);
+        if (json)
+            json_print(&S, ntop);
+        else
+            report_print(&S, ntop >= 0 ? ntop : 15);
         sys_free(&S);
         return 0;
     }
-    if (sys_log || npid) {
+    if (sys_log || npid || watch || serve) {
         static ui_state_t hu;
         config_defaults(&hu);
         config_load(&hu);
+        sensors_apply(&S.sens, hu.srule, hu.nsrule);
         if (interval > 0)
             hu.interval = interval;
-        int r = headless(&hu, sys_log, pids, npid, log_every, log_dir);
+        int r = headless(&hu, sys_log, pids, npid, log_every, log_dir, watch, serve);
         sys_free(&S);
         return r;
+    }
+    char view_path[PATHBUF] = "";
+    if (view) {
+        char *rp = realpath(view, NULL);
+        if (!rp || strlen(rp) >= sizeof view_path) {
+            fprintf(stderr, "%s: %s: %s\n", APP_NAME, view, rp ? "path too long" : strerror(errno));
+            free(rp);
+            sys_free(&S);
+            return 1;
+        }
+        str_copy(view_path, sizeof view_path, rp);
+        free(rp);
     }
     if (!isatty(STDOUT_FILENO)) {
         fprintf(stderr, "%s: stdout is not a terminal (use --once for a text snapshot)\n", APP_NAME);
@@ -292,9 +399,12 @@ int main(int argc, char **argv)
     static ui_state_t u;
     config_defaults(&u);
     config_load(&u); /* ~/.config/hsm/config, if it exists */
+    sensors_apply(&S.sens, u.srule, u.nsrule);
     if (interval > 0)
         u.interval = interval;
     log_build_channels(&S, u.log_skip);
+    watch_start(&S, &u, "screen", 1); /* how did the last session end? */
+    u.notice_open = g_notice.n > 0;
     if (ui_init(utf8) != 0) {
         const char *t = getenv("TERM");
         fprintf(stderr,
@@ -302,9 +412,13 @@ int main(int argc, char **argv)
                 "Try:  TERM=xterm-256color %s\n"
                 "(or install your distribution's ncurses-term package)\n",
                 APP_NAME, t ? t : "", APP_NAME);
+        watch_end();
         sys_free(&S);
         return 1;
     }
+    ui_mouse(u.lay.mouse);
+    if (view_path[0])
+        lv_open(&u, view_path);
 
     double next = now_sec() + u.interval;
     while (!g_quit) {
@@ -334,12 +448,16 @@ int main(int argc, char **argv)
             if (!u.paused) {
                 sys_sample(&S);
                 log_tick(&S);
+                watch_tick(&S, &u);
+            } else {
+                session_tick(); /* paused, but still alive */
             }
             next = now + u.interval;
         }
     }
 
     ui_end();
+    watch_end();
     if (g_log.f)
         printf("Log saved: %s (%lu rows)\n", pretty(g_log.path), g_log.rows);
     for (int i = 0; i < g_log.nplog; i++)

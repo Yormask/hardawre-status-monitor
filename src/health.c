@@ -18,9 +18,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 /* health.c - signs of trouble: thermal throttling, pressure stalls, out-of-
- * memory kills, PCIe bus errors, NVMe drive health and the kernel's own
- * error messages, plus a list of "events" that collects all of these with
- * a time stamp, for the screen and for the logs. */
+ * memory kills, PCIe bus errors, NVMe drive health, the kernel's own error
+ * messages, freezes and suspends, fans stopping, network links dropping,
+ * file systems turning read-only and sensors passing your limits, plus a
+ * list of "events" that collects all of these with a time stamp, for the
+ * screen and for the logs. */
 #define _GNU_SOURCE
 #include "collect.h"
 
@@ -88,7 +90,7 @@ const event_t *health_event_at(const health_t *h, int i)
 int health_alert(const health_t *h, char *out, size_t n)
 {
     double now = wall_now();
-    const char *what[6];
+    const char *what[16];
     int k = 0, lvl = 0;
     if (h->thr_last > 0 && now - h->thr_last < 10) {
         what[k++] = "throttling";
@@ -98,16 +100,51 @@ int health_alert(const health_t *h, char *out, size_t n)
         what[k++] = "too hot";
         lvl = 2;
     }
+    if (h->fan_last > 0 && now - h->fan_last < 10) {
+        what[k++] = "fan stopped";
+        lvl = 2;
+    }
     if (h->oom_last > 0 && now - h->oom_last < 60) {
         what[k++] = "out of memory";
         lvl = 2;
     }
+    if (h->freeze_t > 0 && now - h->freeze_t < 60) {
+        what[k++] = "system froze";
+        lvl = MAX(lvl, h->freeze_last >= 5 ? 2 : 1);
+    }
+    int drive = 0;
     for (int i = 0; i < h->nnvme; i++)
-        if (h->nvme[i].state == 1 && h->nvme[i].crit) {
-            what[k++] = "drive warning";
-            lvl = 2;
-            break;
-        }
+        drive |= h->nvme[i].state == 1 && h->nvme[i].crit;
+    for (int i = 0; i < h->nsata; i++) /* failing, or sectors it can't read */
+        drive |= h->sata[i].state == 1 && (h->sata[i].failing || h->sata[i].pending > 0 || h->sata[i].uncorrect > 0);
+    if (drive) {
+        what[k++] = "drive warning";
+        lvl = 2;
+    }
+    if (h->ro_last > 0 && now - h->ro_last < 10) {
+        what[k++] = "disk read-only";
+        lvl = 2;
+    }
+    if (h->lowmem_last > 0 && now - h->lowmem_last < 10) {
+        what[k++] = "low memory";
+        lvl = MAX(lvl, 1);
+    }
+    if (h->full_last > 0 && now - h->full_last < 10) {
+        what[k++] = "disk almost full";
+        lvl = MAX(lvl, 1);
+    }
+    if (h->ulim_last > 0 && now - h->ulim_last < 10) {
+        what[k++] = "past your limit";
+        lvl = MAX(lvl, 1);
+    }
+    if (h->slow_last > 0 && now - h->slow_last < 10) {
+        what[k++] = "disk slow";
+        lvl = MAX(lvl, 1);
+    }
+    if (h->link_last > 0 && now - h->link_last < 60) {
+        what[k++] = "link dropped";
+        lvl = MAX(lvl, 1);
+    }
     if (h->pci_last > 0 && now - h->pci_last < 60) {
         what[k++] = "PCIe errors";
         lvl = MAX(lvl, 1);
@@ -178,7 +215,50 @@ static int thr_read(int cpu, const char *what, unsigned long long *out)
     return read_ull(p, out);
 }
 
-static void throttle_sample(health_t *h, const cpu_t *c, double dt, double now)
+/* ------------------------------------------------------------- blame */
+
+void health_blame(const procs_t *ps, int what, char *out, size_t n)
+{
+    out[0] = '\0';
+    const proc_t *best = NULL;
+    double bv = 0;
+    for (int i = 0; i < ps->n; i++) {
+        const proc_t *p = &ps->p[i];
+        double v = what == BLAME_CPU ? p->cpu
+                 : what == BLAME_MEM ? (double)p->rss
+                 : what == BLAME_IO  ? (p->io_ok ? p->rd_bps + p->wr_bps : 0)
+                                     : p->gpu;
+        if (v > bv) {
+            bv = v;
+            best = p;
+        }
+    }
+    if (!best)
+        return;
+    char b[16];
+    switch (what) {
+    case BLAME_CPU:
+        if (bv >= 15)
+            sfmt(out, n, " while %s used %.0f%% CPU", best->comm, bv);
+        break;
+    case BLAME_MEM:
+        fmt_bytes(bv, b, sizeof b);
+        sfmt(out, n, " (biggest: %s, %s)", best->comm, b);
+        break;
+    case BLAME_IO:
+        if (bv >= 1e6) {
+            fmt_bytes(MAX(best->rd_bps, best->wr_bps), b, sizeof b);
+            sfmt(out, n, " while %s %s %s/s", best->comm, best->wr_bps > best->rd_bps ? "wrote" : "read", b);
+        }
+        break;
+    case BLAME_GPU:
+        if (bv >= 15)
+            sfmt(out, n, " while %s used %.0f%% GPU", best->comm, bv);
+        break;
+    }
+}
+
+static void throttle_sample(health_t *h, const cpu_t *c, const procs_t *ps, double dt, double now)
 {
     if (!c->ncpu)
         return;
@@ -265,11 +345,13 @@ static void throttle_sample(health_t *h, const cpu_t *c, double dt, double now)
     if (events) {
         h->thr_last = now;
         if (now - h->thr_ev_t >= 60) {
+            char who[80];
             h->thr_ev_t = now;
+            health_blame(ps, BLAME_CPU, who, sizeof who);
             if (c->temp_c >= 0)
-                health_event(h, EV_WARN, "thermal", "CPU slowed down to protect itself from heat (%.0f °C)", c->temp_c);
+                health_event(h, EV_WARN, "thermal", "CPU throttled (%.0f °C)%s", c->temp_c, who);
             else
-                health_event(h, EV_WARN, "thermal", "CPU slowed down to protect itself from heat");
+                health_event(h, EV_WARN, "thermal", "CPU throttled by heat%s", who);
         }
     }
 }
@@ -642,13 +724,290 @@ static void kmsg_sample(health_t *h)
     }
 }
 
+/* ------------------------------------------------- freezes and suspends */
+
+static int suspend_fails(unsigned long long *out)
+{
+    char p[PATHBUF];
+    sfmt(p, sizeof p, "%s/power/suspend_stats/fail", g_sysfs);
+    return read_ull(p, out);
+}
+
+static void clock_hm(double wall, char *out, size_t n)
+{
+    time_t t = (time_t)wall;
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(out, n, "%H:%M", &tm);
+}
+
+/* what the system was busy with while it stood still, from the pressure
+ * stall figures (the kernel's 10 s average still holds the freeze) */
+static void freeze_cause(const health_t *h, const procs_t *ps, char *out, size_t n)
+{
+    const psi_t *c = &h->psi[0], *m = &h->psi[1], *io = &h->psi[2];
+    char who[80];
+    out[0] = '\0';
+    if (m->ok && (MAX(m->full, m->favg10) >= 10 || MAX(m->some, m->avg10) >= 40)) {
+        health_blame(ps, BLAME_MEM, who, sizeof who);
+        sfmt(out, n, ": memory was full%s", who);
+    } else if (io->ok && MAX(io->full, io->favg10) >= 10) {
+        health_blame(ps, BLAME_IO, who, sizeof who);
+        sfmt(out, n, ": everything was waiting for a disk%s", who);
+    } else if (c->ok && MAX(c->some, c->avg10) >= 60) {
+        health_blame(ps, BLAME_CPU, who, sizeof who);
+        sfmt(out, n, ": the CPU was overloaded%s", who);
+    }
+}
+
+static void freeze_events(health_t *h, const procs_t *ps, double now)
+{
+    fz_t z;
+    while (freeze_take(&z)) {
+        char d[24], a[16], b[16];
+        if (z.kind == FZ_SUSPEND) {
+            h->suspends++;
+            h->asleep_total += z.dur;
+            h->resume_t = now;
+            fmt_duration(z.dur, d, sizeof d);
+            clock_hm(z.wall, a, sizeof a);
+            clock_hm(z.wall + z.dur, b, sizeof b);
+            health_event(h, EV_INFO, "power", "Woke up after %s asleep (suspended at %s, woke at %s)", d, a, b);
+            if (h->susp_ok) /* a suspend that went well: not a failure to explain a freeze with */
+                suspend_fails(&h->susp_fail);
+            continue;
+        }
+        /* a suspend that failed half way stops every program for a moment too */
+        unsigned long long f;
+        if (h->susp_ok && suspend_fails(&f) == 0 && f != h->susp_fail) {
+            char step[32] = "", dev[48] = "", p[PATHBUF];
+            h->susp_fail = f;
+            sfmt(p, sizeof p, "%s/power/suspend_stats/last_failed_step", g_sysfs);
+            read_line(p, step, sizeof step);
+            sfmt(p, sizeof p, "%s/power/suspend_stats/last_failed_dev", g_sysfs);
+            read_line(p, dev, sizeof dev);
+            health_event(h, EV_WARN, "power", "Suspend failed%s%s%s%s", step[0] ? " at the " : "", step,
+                         dev[0] ? " step, because of " : "", dev);
+            continue;
+        }
+        h->freezes++;
+        h->freeze_last = z.dur;
+        h->freeze_t = now;
+        h->frozen_total += z.dur;
+        h->freeze_max = MAX(h->freeze_max, z.dur);
+        char why[160];
+        freeze_cause(h, ps, why, sizeof why);
+        health_event(h, z.dur >= 5 ? EV_ERR : EV_WARN, "freeze", "System froze for %.1f s%s%s", z.dur,
+                     h->resume_t > 0 && now - h->resume_t < 60 ? " just after waking up" : "", why);
+    }
+}
+
+/* --------------------------------------------------------- your limits */
+
+#define LIMIT_FOR 5.0 /* past the limit this long before it counts */
+
+static void limit_events(health_t *h, sensors_t *S, double now, double mono)
+{
+    static const char *const unit[] = { "°C", "RPM", "W", "V" };
+    for (int i = 0; i < S->n; i++) {
+        sensor_t *t = &S->s[i];
+        if ((t->ulo <= 0 && t->uhi <= 0) || !t->ok || t->hidden)
+            continue;
+        int low = t->ulo > 0 && t->value < t->ulo && t->type != SENS_TEMP && t->type != SENS_POWER;
+        int high = t->uhi > 0 && t->value >= t->uhi && t->type != SENS_FAN;
+        if (!low && !high) {
+            /* back inside, with a little room, before it can count again */
+            double m = t->type == SENS_FAN ? t->ulo * 0.05 : t->type == SENS_VOLT ? 0.01 : 2;
+            if ((t->ulo <= 0 || t->value >= t->ulo + m) && (t->uhi <= 0 || t->value <= t->uhi - m))
+                t->lim_flagged = 0;
+            t->lim_t = 0;
+            continue;
+        }
+        if (!t->lim_t)
+            t->lim_t = mono;
+        if (mono - t->lim_t < LIMIT_FOR)
+            continue;
+        h->ulim_last = now;
+        if (t->lim_flagged)
+            continue;
+        t->lim_flagged = 1;
+        char chip[24], v[24], l[24];
+        sensors_chip_name(t->chip, chip, sizeof chip);
+        int dec = t->type == SENS_VOLT ? 3 : 0;
+        sfmt(v, sizeof v, "%.*f %s", dec, t->value, unit[t->type]);
+        sfmt(l, sizeof l, "%.*f %s", t->type == SENS_VOLT ? 2 : 0, low ? t->ulo : t->uhi, unit[t->type]);
+        char nm[80];
+        if (t->name[0])
+            str_copy(nm, sizeof nm, t->name);
+        else
+            sfmt(nm, sizeof nm, "%s %s", chip, t->label);
+        static const char *const cat[] = { "thermal", "fan", "power", "voltage" };
+        if (t->type == SENS_FAN)
+            health_event(h, EV_WARN, cat[t->type], "%s turns at %s, below your minimum of %s: slowing down, dusty?", nm,
+                         v, l);
+        else
+            health_event(h, EV_WARN, cat[t->type], "%s at %s, %s your %s of %s", nm, v, low ? "below" : "above",
+                         low ? "minimum" : "limit", l);
+    }
+}
+
+/* ------------------------------------------------------- fans stopping */
+
+#define FAN_HOT 70.0 /* fans may rest when it's cool; at this temperature they must turn */
+
+static void fan_events(health_t *h, sensors_t *S, double now, double mono)
+{
+    double cpu = sensors_cpu_temp(S);
+    for (int i = 0; i < S->n; i++) {
+        sensor_t *f = &S->s[i];
+        if (f->type != SENS_FAN || !f->ok || f->hidden)
+            continue;
+        if (f->value >= 50) { /* turning */
+            f->fan_seen = 1;
+            f->fan_zero_t = 0;
+            f->fan_flagged = 0;
+            continue;
+        }
+        if (!f->fan_seen) /* never seen turning: probably nothing is plugged in there */
+            continue;
+        /* a graphics card's fan cools the card; any other fan the CPU (a
+         * board chip's own temperature inputs are often unconnected junk) */
+        double t = cpu;
+        int gpu = !strncmp(f->chip, "amdgpu", 6) || !strncmp(f->chip, "radeon", 6) || !strncmp(f->chip, "nouveau", 7);
+        if (gpu) {
+            t = -1;
+            for (int j = 0; j < S->n; j++)
+                if (S->s[j].chip_idx == f->chip_idx && S->s[j].type == SENS_TEMP && S->s[j].ok)
+                    t = MAX(t, S->s[j].value);
+        }
+        if (t < FAN_HOT) {
+            f->fan_zero_t = 0;
+            continue;
+        }
+        if (!f->fan_zero_t)
+            f->fan_zero_t = mono;
+        if (mono - f->fan_zero_t < 10) /* a moment at 0 can be a glitch of the reading */
+            continue;
+        h->fan_last = now;
+        if (f->fan_flagged)
+            continue;
+        f->fan_flagged = 1;
+        h->fan_stops++;
+        char chip[24];
+        sensors_chip_name(f->chip, chip, sizeof chip);
+        health_event(h, EV_ERR, "fan", "%s %s stopped although the %s is at %.0f °C: is it blocked or broken?", chip,
+                     f->name[0] ? f->name : f->label, gpu ? "GPU" : "CPU", t);
+    }
+}
+
+/* ------------------------------------------------------ network links */
+
+static void link_events(health_t *h, net_t *nt, double now)
+{
+    /* every link goes down while the machine sleeps */
+    int resumed = h->resume_t > 0 && now - h->resume_t < 60;
+    for (int i = 0; i < nt->n; i++) {
+        netif_t *f = &nt->i[i];
+        if (f->is_virtual || f->link_downs < 0)
+            continue;
+        if (f->downs_seen < 0 || resumed || f->link_downs < f->downs_seen) {
+            f->downs_seen = f->link_downs;
+            f->down_t = f->up ? 0 : -1; /* -1: down, but not news */
+            continue;
+        }
+        const char *nm = f->name;
+        char what[48];
+        sfmt(what, sizeof what, f->wireless ? "Wi-Fi %s" : "%s", nm);
+        long long k = f->link_downs - f->downs_seen;
+        f->downs_seen = f->link_downs;
+        if (k > 0) {
+            char p[PATHBUF];
+            unsigned fl = 1;
+            sfmt(p, sizeof p, "%s/class/net/%s/flags", g_sysfs, nm);
+            if (read_hex(p, &fl) == 0 && !(fl & 1)) { /* switched off, not lost */
+                f->down_t = -1;
+                continue;
+            }
+            h->link_drops += (int)k;
+            h->link_last = now;
+            if (!f->up) {
+                f->down_t = now;
+                if (k > 1)
+                    health_event(h, EV_WARN, "net", "%s lost its link (%lld times)", what, k);
+                else if (f->wireless)
+                    health_event(h, EV_WARN, "net", "%s disconnected", what);
+                else
+                    health_event(h, EV_WARN, "net", "%s lost its link: cable, switch or router?", what);
+            } else {
+                f->down_t = 0;
+                health_event(h, EV_WARN, "net", "%s dropped its link %lld time%s for a moment", what, k,
+                             k == 1 ? "" : "s");
+            }
+        } else if (f->up && f->down_t != 0) {
+            if (f->down_t > 0) {
+                char d[24];
+                fmt_duration(now - f->down_t, d, sizeof d);
+                health_event(h, EV_INFO, "net", "%s link back after %s", what, d);
+            }
+            f->down_t = 0;
+        }
+    }
+}
+
+/* ------------------------------------------------- read-only file systems */
+
+/* ext4 and others switch to read-only after errors (errors=remount-ro):
+ * from then on every write fails, often silently for the user */
+static void fs_events(health_t *h, const disks_t *ds, double now)
+{
+    static struct {
+        char mount[128];
+        int ro, flagged, seen;
+    } m[MAX_FS * 2];
+    static int nm;
+    for (int j = 0; j < nm; j++)
+        m[j].seen = 0;
+    for (int i = 0; i < ds->nfs; i++) {
+        const fs_t *f = &ds->fs[i];
+        int j = 0;
+        while (j < nm && strcmp(m[j].mount, f->mount))
+            j++;
+        if (j == nm) { /* new: whatever it is now is how it was mounted */
+            if (nm == MAX_FS * 2)
+                continue;
+            nm++;
+            str_copy(m[j].mount, sizeof m[j].mount, f->mount);
+            m[j].ro = f->readonly;
+            m[j].flagged = 0;
+        }
+        m[j].seen = 1;
+        if (f->readonly && !m[j].ro) {
+            m[j].flagged = 1;
+            int err = h->kmsg_last > 0 && now - h->kmsg_last < 300;
+            health_event(h, err ? EV_ERR : EV_WARN, "disk", "%s (%s) became read-only%s", f->mount, f->dev,
+                         err ? " after kernel errors: the disk or the file system may be failing"
+                             : ": remounted by hand, or after errors");
+        }
+        if (!f->readonly)
+            m[j].flagged = 0;
+        else if (m[j].flagged)
+            h->ro_last = now;
+        m[j].ro = f->readonly;
+    }
+    for (int j = 0; j < nm; j++) /* unmounted */
+        if (!m[j].seen)
+            m[j--] = m[--nm];
+}
+
 /* ----------------------------------------------------------------- main */
 
 void health_init(health_t *h)
 {
     h->kmsg_fd = -1;
+    h->susp_ok = suspend_fails(&h->susp_fail) == 0;
     kmsg_open(h);
     nvme_find(h);
+    ata_find(h);
 }
 
 void health_close(health_t *h)
@@ -658,11 +1017,11 @@ void health_close(health_t *h)
     h->kmsg_fd = -1;
 }
 
-static void temp_events(health_t *h, sensors_t *S, double now)
+static void temp_events(health_t *h, sensors_t *S, const procs_t *ps, double now)
 {
     for (int i = 0; i < S->n; i++) {
         sensor_t *t = &S->s[i];
-        if (t->type != SENS_TEMP || !t->ok)
+        if (t->type != SENS_TEMP || !t->ok || t->hidden)
             continue;
         double lim = t->crit > 0 ? t->crit : (i == S->cpu_idx ? 100.0 : -1);
         if (lim <= 0 || t->value < lim - 2)
@@ -671,9 +1030,20 @@ static void temp_events(health_t *h, sensors_t *S, double now)
         if (now - t->hot_t < 300)
             continue;
         t->hot_t = now;
-        char chip[24];
+        char chip[24], who[80];
         sensors_chip_name(t->chip, chip, sizeof chip);
-        health_event(h, EV_ERR, "thermal", "%s %s reached %.0f °C (limit %.0f °C)", chip, t->label, t->value, lim);
+        /* who is heating it up: drives get hot from disk work, GPUs from GPU work */
+        int what = strstr(t->chip, "nvme") || strstr(t->chip, "drivetemp") ? BLAME_IO
+                 : strstr(t->chip, "amdgpu") || strstr(t->chip, "nouveau") || strstr(t->chip, "i915") ||
+                   strstr(t->chip, "xe")
+                     ? BLAME_GPU
+                     : BLAME_CPU;
+        health_blame(ps, what, who, sizeof who);
+        if (t->name[0])
+            health_event(h, EV_ERR, "thermal", "%s reached %.0f °C (limit %.0f °C)%s", t->name, t->value, lim, who);
+        else
+            health_event(h, EV_ERR, "thermal", "%s %s reached %.0f °C (limit %.0f °C)%s", chip, t->label, t->value,
+                         lim, who);
     }
 }
 
@@ -686,21 +1056,30 @@ void health_sample(sys_t *s)
     for (int i = 0; i < 3; i++)
         psi_sample(&h->psi[i], psi_name[i], dt);
 
-    throttle_sample(h, &s->cpu, dt, now);
+    throttle_sample(h, &s->cpu, &s->procs, dt, now);
 
     if (s->mem.oom_ok) {
         if (!h->primed)
             h->oom_start = h->oom_prev = s->mem.oom_kill;
         if (s->mem.oom_kill > h->oom_prev) {
             unsigned long long k = s->mem.oom_kill - h->oom_prev;
+            char who[80];
             h->oom_last = now;
-            health_event(h, EV_ERR, "memory", "Memory ran out: the kernel killed %llu process%s", k, k == 1 ? "" : "es");
+            health_blame(&s->procs, BLAME_MEM, who, sizeof who);
+            health_event(h, EV_ERR, "memory", "Memory ran out: the kernel killed %llu process%s%s", k,
+                         k == 1 ? "" : "es", who);
         }
         h->oom_prev = s->mem.oom_kill;
     }
 
     kmsg_sample(h);
-    temp_events(h, &s->sens, now);
+    temp_events(h, &s->sens, &s->procs, now);
+    freeze_events(h, &s->procs, now);
+    fan_events(h, &s->sens, now, mono);
+    limit_events(h, &s->sens, now, mono);
+    link_events(h, &s->net, now);
+    fs_events(h, &s->disks, now);
+    leak_sample(s);
 
     if (mono >= h->next_slow) { /* every 5 s */
         h->next_slow = mono + 5.0;
@@ -720,5 +1099,10 @@ void health_sample(sys_t *s)
         h->next_nvme = mono + NVME_EVERY;
         nvme_sample(h);
     }
+    if (h->nsata && mono >= h->next_sata) {
+        h->next_sata = mono + NVME_EVERY;
+        ata_sample(h);
+    }
+    drives_tick(h); /* self-tests hsm started */
     h->primed = 1;
 }

@@ -85,6 +85,14 @@ static void report_health(sys_t *s)
             printf("%s\n", v->state == -1 ? "health needs root (sudo)" : "health not available");
         }
     }
+    for (int i = 0; i < h->nsata; i++) {
+        sata_t *d = &h->sata[i];
+        char sum[200];
+        int lvl;
+        sata_summary(d, sum, sizeof sum, &lvl, ", ", "C");
+        printf("  %-11s %s (SATA %s): %s\n", d->name, d->model[0] ? d->model : "drive",
+               d->rotational ? "hard disk" : "SSD", sum);
+    }
     if (h->kmsg == 1)
         printf("  kernel log  %u errors, %u warnings since boot\n", h->kmsg_err, h->kmsg_warn);
     else
@@ -256,10 +264,11 @@ void report_print(sys_t *s, int nproc)
         printf("\nSensors\n");
         for (int i = 0; i < s->sens.n; i++) {
             sensor_t *t = &s->sens.s[i];
-            if (!t->ok)
+            if (!t->ok || t->hidden)
                 continue;
             static const char *const unit[] = { "C", "RPM", "W", "V" };
-            printf("  %-14s %-22s %8.*f %s\n", t->chip, t->label, t->type == SENS_VOLT ? 3 : 1, t->value, unit[t->type]);
+            printf("  %-14s %-22s %8.*f %s%s\n", t->chip, sensor_label(t), t->type == SENS_VOLT ? 3 : 1, t->value,
+                   unit[t->type], sensor_bad(t) ? "  (past your limit)" : "");
         }
     }
 

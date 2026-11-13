@@ -30,6 +30,7 @@
 #include "ui.h" /* config_as_user, config_mkdir_p */
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -50,7 +51,9 @@ enum {
     CH_POWER_TOTAL, CH_RAPL, CH_BAT_POWER, CH_BAT_CHARGE, CH_SENSOR,
     CH_DISK_R, CH_DISK_W, CH_DISK_BUSY, CH_NET_RX, CH_NET_TX,
     CH_THROTTLE, CH_PSI, CH_OOM, CH_PCIE, CH_NVME_USED, CH_NVME_MEDIA, CH_NVME_UNSAFE, CH_NVME_WARN,
-    CH_DISK_RLAT, CH_DISK_WLAT, CH_NET_ERR, CH_NET_SIGNAL, CH_WAKEUPS, CH_CSTATE, CH_EVENTS
+    CH_SATA_WEAR, CH_SATA_REALLOC, CH_SATA_PENDING, CH_SATA_CRC,
+    CH_DISK_RLAT, CH_DISK_WLAT, CH_NET_ERR, CH_NET_SIGNAL, CH_WAKEUPS, CH_CSTATE, CH_FREEZE,
+    CH_EVENTS /* stays last */
 };
 
 #define MB (1024.0 * 1024.0)
@@ -151,8 +154,11 @@ void log_build_channels(sys_t *s, const char *skip)
         add("Health", CH_OOM, 0, "", "count", "OOM kills since boot", "health.oom");
     if (H->aer_ok)
         add("Health", CH_PCIE, 0, "", "count", "PCIe errors since boot", "health.pcie");
+    add("Health", CH_FREEZE, 0, "", "s", "System frozen (total)", "health.frozen");
     for (int i = 0; i < H->nnvme; i++) {
         const char *n = H->nvme[i].name;
+        if (H->nvme[i].state < 0) /* can't be read (needs root): no empty columns */
+            continue;
         sfmt(lab, sizeof lab, "%s wear used", n);
         add("Health", CH_NVME_USED, i, "", "%", lab, "nvme.%s.used", n);
         sfmt(lab, sizeof lab, "%s media errors", n);
@@ -161,6 +167,21 @@ void log_build_channels(sys_t *s, const char *skip)
         add("Health", CH_NVME_UNSAFE, i, "", "count", lab, "nvme.%s.unsafe", n);
         sfmt(lab, sizeof lab, "%s critical warning", n);
         add("Health", CH_NVME_WARN, i, "", "count", lab, "nvme.%s.warning", n);
+    }
+    for (int i = 0; i < H->nsata; i++) {
+        const sata_t *d = &H->sata[i];
+        if (d->state == -1 || d->state == -2)
+            continue;
+        if (!d->rotational) {
+            sfmt(lab, sizeof lab, "%s wear used", d->name);
+            add("Health", CH_SATA_WEAR, i, "", "%", lab, "sata.%s.wear", d->name);
+        }
+        sfmt(lab, sizeof lab, "%s reallocated sectors", d->name);
+        add("Health", CH_SATA_REALLOC, i, "", "count", lab, "sata.%s.reallocated", d->name);
+        sfmt(lab, sizeof lab, "%s pending sectors", d->name);
+        add("Health", CH_SATA_PENDING, i, "", "count", lab, "sata.%s.pending", d->name);
+        sfmt(lab, sizeof lab, "%s cable errors", d->name);
+        add("Health", CH_SATA_CRC, i, "", "count", lab, "sata.%s.cable_errors", d->name);
     }
     if (s->cpu.nidle) {
         add("CPU idle", CH_WAKEUPS, 0, "", "/s", "Wake-ups", "cpu.wakeups");
@@ -220,9 +241,14 @@ void log_build_channels(sys_t *s, const char *skip)
     static const char *const grp[] = { "Temperatures", "Fans", "Power", "Voltages" };
     for (int i = 0; i < s->sens.n; i++) {
         sensor_t *t = &s->sens.s[i];
+        if (t->hidden)
+            continue;
         char chip[24];
         sensors_chip_name(t->chip, chip, sizeof chip);
-        sfmt(lab, sizeof lab, "%s %s", chip, t->label); /* "CPU Core 0", "NVMe Composite" */
+        if (t->name[0])
+            str_copy(lab, sizeof lab, t->name);
+        else
+            sfmt(lab, sizeof lab, "%s %s", chip, t->label); /* "CPU Core 0", "NVMe Composite" */
         add(grp[t->type], CH_SENSOR, i, "", unit[t->type], lab, "sensor.%s.%s", t->chip, t->label);
     }
 
@@ -371,8 +397,22 @@ double log_chan_value(const sys_t *s, const chan_t *c)
         return c->kind == CH_NVME_USED ? v->used : c->kind == CH_NVME_MEDIA ? (double)v->media_err
              : c->kind == CH_NVME_UNSAFE ? (double)v->unsafe : (double)v->crit;
     }
+    case CH_SATA_WEAR:
+    case CH_SATA_REALLOC:
+    case CH_SATA_PENDING:
+    case CH_SATA_CRC: {
+        if (c->a >= s->health.nsata)
+            return NAN;
+        const sata_t *d = &s->health.sata[c->a];
+        if (d->hours < 0 && d->realloc < 0) /* never read */
+            return NAN;
+        long long v = c->kind == CH_SATA_WEAR ? d->wear : c->kind == CH_SATA_REALLOC ? d->realloc
+                    : c->kind == CH_SATA_PENDING ? d->pending : d->crc;
+        return v >= 0 ? (double)v : NAN;
+    }
     case CH_WAKEUPS: return s->cpu.nidle ? s->cpu.wakeups : NAN;
     case CH_CSTATE: return c->a < s->cpu.nidle ? s->cpu.idle[c->a].pct : NAN;
+    case CH_FREEZE: return s->health.frozen_total;
     case CH_EVENTS: return (double)s->health.nev;
     }
     return NAN;
@@ -411,17 +451,38 @@ void log_fmt_value(const chan_t *c, double v, char *out, size_t n)
 
 /* --------------------------------------------------------------- files */
 
-static void stamp(char *out, size_t n, const char *fmt)
+static double wall_time(void)
 {
-    time_t t = time(NULL);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void stamp_at(double wall, char *out, size_t n, const char *fmt)
+{
+    time_t t = (time_t)wall;
     struct tm tm;
     localtime_r(&t, &tm);
     strftime(out, n, fmt, &tm);
 }
 
-/* Create a new file (never overwrite one) as the real user, also when
- * hsm runs under sudo, so the logs belong to whoever ran it. */
-static FILE *open_new(const char *base, char *path, size_t pn, char *err, size_t en)
+static void stamp(char *out, size_t n, const char *fmt)
+{
+    stamp_at(wall_time(), out, n, fmt);
+}
+
+int log_day_key(double wall)
+{
+    time_t t = (time_t)wall;
+    struct tm tm;
+    localtime_r(&t, &tm);
+    return (tm.tm_year + 1900) * 10000 + (tm.tm_mon + 1) * 100 + tm.tm_mday;
+}
+
+/* Create a new file (never overwrite one) in the folder of its day,
+ * <log folder>/2026-11-12/, as the real user, also when hsm runs under
+ * sudo, so the logs belong to whoever ran it. */
+FILE *log_create(double wall, const char *base, char *path, size_t pn, char *err, size_t en)
 {
     int who = config_as_user();
     if (who < 0) {
@@ -429,14 +490,17 @@ static FILE *open_new(const char *base, char *path, size_t pn, char *err, size_t
         return NULL;
     }
     FILE *f = NULL;
-    if (config_mkdir_p(g_log.dir) != 0) {
-        sfmt(err, en, "Could not create %s: %s", g_log.dir, strerror(errno));
+    char day[16], dir[PATHBUF];
+    stamp_at(wall, day, sizeof day, "%Y-%m-%d");
+    sfmt(dir, sizeof dir, "%s/%s", g_log.dir, day);
+    if (config_mkdir_p(dir) != 0) {
+        sfmt(err, en, "Could not create %s: %s", dir, strerror(errno));
     } else {
         for (int k = 1; k < 100 && !f; k++) {
             if (k == 1)
-                sfmt(path, pn, "%s/%s.csv", g_log.dir, base);
+                sfmt(path, pn, "%s/%s.csv", dir, base);
             else
-                sfmt(path, pn, "%s/%s-%d.csv", g_log.dir, base, k);
+                sfmt(path, pn, "%s/%s-%d.csv", dir, base, k);
             int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
             if (fd < 0) {
                 if (errno == EEXIST)
@@ -453,6 +517,11 @@ static FILE *open_new(const char *base, char *path, size_t pn, char *err, size_t
     return f;
 }
 
+static FILE *open_new(const char *base, char *path, size_t pn, char *err, size_t en)
+{
+    return log_create(wall_time(), base, path, pn, err, en);
+}
+
 long log_file_size(const char *path)
 {
     struct stat st;
@@ -461,34 +530,88 @@ long log_file_size(const char *path)
 
 static void put_num(FILE *f, double v, int dec)
 {
-    if (isnan(v))
+    if (isnan(v) || isinf(v))
         fputc(',', f);
     else
         fprintf(f, ",%.*f", dec, v);
 }
 
-/* ------------------------------------------------------------ system log */
-
-static void note(int err, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-static void note(int err, const char *fmt, ...)
+void log_put_value(FILE *f, const chan_t *c, double v)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(g_log.note, sizeof g_log.note, fmt, ap);
-    va_end(ap);
-    g_log.note_err = err;
-    g_log.note_new = 1;
+    put_num(f, v, decimals(c->unit));
 }
 
-/* the events since the previous row, as one quoted CSV field:
+/* local time and its offset from UTC: the offset tells the two 02:30 rows
+ * apart on the night the clocks go back, and makes the times unambiguous */
+void log_put_time(FILE *f, double wall)
+{
+    time_t t = (time_t)wall;
+    struct tm tm;
+    localtime_r(&t, &tm);
+    char ts[32];
+    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tm);
+    long off = tm.tm_gmtoff / 60;
+    fprintf(f, "%s,%c%02ld:%02ld", ts, off < 0 ? '-' : '+', labs(off) / 60, labs(off) % 60);
+}
+
+void log_put_header(FILE *f, const char *first, int all)
+{
+    fputs(first, f);
+    for (int i = 0; i < g_log.nchan; i++) {
+        chan_t *c = &g_log.ch[i];
+        if (!c->on && !all)
+            continue;
+        if (*c->unit && strcmp(c->unit, "count"))
+            fprintf(f, ",\"%s (%s)\"", c->label, c->unit);
+        else
+            fprintf(f, ",\"%s\"", c->label);
+    }
+    fputc('\n', f);
+}
+
+/* ------------------------------------------------------------ system log */
+
+void log_note(int err, const char *fmt, ...)
+{
+    if (g_log.nnote == 4) { /* full: the oldest goes */
+        memmove(g_log.note[0], g_log.note[1], sizeof g_log.note[0] * 3);
+        memmove(g_log.note_err, g_log.note_err + 1, sizeof g_log.note_err[0] * 3);
+        g_log.nnote--;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_log.note[g_log.nnote], sizeof g_log.note[0], fmt, ap);
+    va_end(ap);
+    g_log.note_err[g_log.nnote++] = err;
+}
+
+int log_note_pop(char *out, size_t n, int *err)
+{
+    if (!g_log.nnote)
+        return 0;
+    str_copy(out, n, g_log.note[0]);
+    *err = g_log.note_err[0];
+    memmove(g_log.note[0], g_log.note[1], sizeof g_log.note[0] * 3);
+    memmove(g_log.note_err, g_log.note_err + 1, sizeof g_log.note_err[0] * 3);
+    g_log.nnote--;
+    return 1;
+}
+#define note log_note
+
+int log_chan_is_events(const chan_t *c)
+{
+    return c->kind == CH_EVENTS;
+}
+
+/* the events numbered after..upto, as one quoted CSV field:
  * "12:03:44 disk: nvme0n1: I/O error ... | 12:03:50 thermal: ..." */
-static void put_events(FILE *f, health_t *h)
+void log_put_events(FILE *f, const health_t *h, unsigned long after, unsigned long upto)
 {
     fputs(",\"", f);
     int n = 0;
     for (int i = h->nev - 1; i >= 0; i--) { /* oldest first */
         const event_t *e = health_event_at(h, i);
-        if (e->seq <= g_log.ev_seq)
+        if (e->seq <= after || e->seq > upto)
             continue;
         char ts[16];
         time_t t = (time_t)e->t;
@@ -504,20 +627,20 @@ static void put_events(FILE *f, health_t *h)
         }
     }
     fputc('"', f);
-    g_log.ev_seq = h->ev_seq;
 }
 
 static void sys_row(sys_t *s, double now)
 {
-    char ts[32];
-    stamp(ts, sizeof ts, "%Y-%m-%d %H:%M:%S");
-    fprintf(g_log.f, "%s,%.1f", ts, now - g_log.t0);
+    log_put_time(g_log.f, wall_time());
+    fprintf(g_log.f, ",%.1f", now - g_log.t0);
     for (int i = 0; i < g_log.nchan; i++)
         if (g_log.ch[i].on) {
-            if (g_log.ch[i].kind == CH_EVENTS)
-                put_events(g_log.f, &s->health);
-            else
+            if (g_log.ch[i].kind == CH_EVENTS) {
+                log_put_events(g_log.f, &s->health, g_log.ev_seq, s->health.ev_seq);
+                g_log.ev_seq = s->health.ev_seq;
+            } else {
                 put_num(g_log.f, log_chan_value(s, &g_log.ch[i]), decimals(g_log.ch[i].unit));
+            }
         }
     fputc('\n', g_log.f);
     fflush(g_log.f);
@@ -529,6 +652,21 @@ static void sys_row(sys_t *s, double now)
     }
 }
 
+static const char SYS_FIRST[] = "time,utc_offset,elapsed_s";
+
+static int sys_open(char *err, size_t n)
+{
+    char ts[32], base[64];
+    stamp(ts, sizeof ts, "%Y-%m-%d_%H-%M-%S");
+    sfmt(base, sizeof base, "hsm-system-%s", ts);
+    g_log.f = open_new(base, g_log.path, sizeof g_log.path, err, n);
+    if (!g_log.f)
+        return -1;
+    g_log.day = log_day_key(wall_time());
+    log_put_header(g_log.f, SYS_FIRST, 0);
+    return 0;
+}
+
 int log_start(sys_t *s, char *err, size_t n)
 {
     if (g_log.f)
@@ -537,23 +675,8 @@ int log_start(sys_t *s, char *err, size_t n)
         sfmt(err, n, "Nothing selected to log: pick values in the Logging view (5)");
         return -1;
     }
-    char ts[32], base[64];
-    stamp(ts, sizeof ts, "%Y-%m-%d_%H-%M-%S");
-    sfmt(base, sizeof base, "hsm-system-%s", ts);
-    g_log.f = open_new(base, g_log.path, sizeof g_log.path, err, n);
-    if (!g_log.f)
+    if (sys_open(err, n) != 0)
         return -1;
-    fprintf(g_log.f, "time,elapsed_s");
-    for (int i = 0; i < g_log.nchan; i++) {
-        chan_t *c = &g_log.ch[i];
-        if (!c->on)
-            continue;
-        if (*c->unit && strcmp(c->unit, "count"))
-            fprintf(g_log.f, ",\"%s (%s)\"", c->label, c->unit);
-        else
-            fprintf(g_log.f, ",\"%s\"", c->label);
-    }
-    fputc('\n', g_log.f);
     g_log.rows = 0;
     g_log.t0 = g_log.last_sync = now_sec();
     g_log.ev_seq = s->health.ev_seq; /* only what happens from now on */
@@ -599,9 +722,8 @@ int log_proc_find(pid_t pid, unsigned long long start)
 
 static void proc_row(sys_t *s, plog_t *pl, proc_t *p, double now)
 {
-    char ts[32];
-    stamp(ts, sizeof ts, "%Y-%m-%d %H:%M:%S");
-    fprintf(pl->f, "%s,%.1f,%d,%c", ts, now - pl->t0, (int)p->pid, p->state);
+    log_put_time(pl->f, wall_time());
+    fprintf(pl->f, ",%.1f,%d,%c", now - pl->t0, (int)p->pid, p->state);
     put_num(pl->f, p->cpu, 1);
     put_num(pl->f, p->mem, 2);
     put_num(pl->f, (double)p->rss / MB, 1);
@@ -617,6 +739,25 @@ static void proc_row(sys_t *s, plog_t *pl, proc_t *p, double now)
     fflush(pl->f);
     pl->rows++;
     pl->last_row = now;
+}
+
+static int plog_open(plog_t *pl, char *err, size_t n)
+{
+    char name[24], ts[32], base[96];
+    str_copy(name, sizeof name, pl->comm);
+    for (char *q = name; *q; q++)
+        if (!isalnum((unsigned char)*q) && *q != '-' && *q != '.')
+            *q = '_';
+    stamp(ts, sizeof ts, "%Y-%m-%d_%H-%M-%S");
+    sfmt(base, sizeof base, "hsm-process-%d-%s-%s", (int)pl->pid, name, ts);
+    pl->f = open_new(base, pl->path, sizeof pl->path, err, n);
+    if (!pl->f)
+        return -1;
+    pl->day = log_day_key(wall_time());
+    fprintf(pl->f, "time,utc_offset,elapsed_s,pid,state,\"CPU (%% of one core)\",\"Memory (%%)\",\"RSS (MB)\","
+                   "threads,\"Disk read (MB/s)\",\"Disk write (MB/s)\",\"GPU (%%)\",\"GPU memory (MB)\","
+                   "\"Open files\",\"System CPU (%%)\",\"CPU temperature (C)\"\n");
+    return 0;
 }
 
 int log_proc_start(sys_t *s, pid_t pid, unsigned long long start, char *err, size_t n)
@@ -637,19 +778,8 @@ int log_proc_start(sys_t *s, pid_t pid, unsigned long long start, char *err, siz
     pl->pid = pid;
     pl->start = start;
     str_copy(pl->comm, sizeof pl->comm, p->comm);
-    char name[24], ts[32], base[96];
-    str_copy(name, sizeof name, p->comm);
-    for (char *q = name; *q; q++)
-        if (!isalnum((unsigned char)*q) && *q != '-' && *q != '.')
-            *q = '_';
-    stamp(ts, sizeof ts, "%Y-%m-%d_%H-%M-%S");
-    sfmt(base, sizeof base, "hsm-process-%d-%s-%s", (int)pid, name, ts);
-    pl->f = open_new(base, pl->path, sizeof pl->path, err, n);
-    if (!pl->f)
+    if (plog_open(pl, err, n) != 0)
         return -1;
-    fprintf(pl->f, "time,elapsed_s,pid,state,\"CPU (%% of one core)\",\"Memory (%%)\",\"RSS (MB)\",threads,"
-                   "\"Disk read (MB/s)\",\"Disk write (MB/s)\",\"GPU (%%)\",\"GPU memory (MB)\",\"Open files\","
-                   "\"System CPU (%%)\",\"CPU temperature (C)\"\n");
     pl->t0 = now_sec();
     g_log.nplog++;
     proc_row(s, pl, p, pl->t0);
@@ -676,9 +806,49 @@ void log_proc_stop(int i)
 
 /* ------------------------------------------------------------------ tick */
 
+/* a new day: carry on in a new file in the new day's folder */
+static void new_day(sys_t *s, int today)
+{
+    char err[PATHBUF + 64], old[PATHBUF];
+    (void)s;
+    if (g_log.f && g_log.day != today) {
+        str_copy(old, sizeof old, g_log.path);
+        fflush(g_log.f);
+        fsync(fileno(g_log.f));
+        fclose(g_log.f);
+        g_log.f = NULL;
+        if (sys_open(err, sizeof err) != 0)
+            note(1, "Logging stopped at midnight: %s", err);
+        else
+            g_log.rows = 0;
+    }
+    for (int i = 0; i < g_log.nplog; i++) {
+        plog_t *pl = &g_log.pl[i];
+        if (pl->day == today)
+            continue;
+        fflush(pl->f);
+        fsync(fileno(pl->f));
+        fclose(pl->f);
+        pl->f = NULL;
+        if (plog_open(pl, err, sizeof err) != 0) {
+            note(1, "Stopped logging PID %d at midnight: %s", (int)pl->pid, err);
+            plog_close(i--);
+        } else {
+            pl->rows = 0;
+        }
+    }
+}
+
 void log_tick(sys_t *s)
 {
     double now = now_sec(), ev = g_log.every;
+    if (g_log.f || g_log.nplog) {
+        int today = log_day_key(wall_time()), stale = g_log.f && g_log.day != today;
+        for (int i = 0; i < g_log.nplog && !stale; i++)
+            stale = g_log.pl[i].day != today;
+        if (stale)
+            new_day(s, today);
+    }
     if (g_log.f && (ev <= 0 || now - g_log.last_row >= ev - 0.05))
         sys_row(s, now);
     for (int i = 0; i < g_log.nplog;) {
@@ -712,4 +882,113 @@ void log_close_all(void)
     log_stop();
     while (g_log.nplog)
         plog_close(g_log.nplog - 1);
+}
+
+/* ---------------------------------------------------------- housekeeping */
+
+static int our_file(const char *n) /* hsm-....csv */
+{
+    size_t l = strlen(n);
+    return l > 8 && !strncmp(n, "hsm-", 4) && !strcmp(n + l - 4, ".csv");
+}
+
+static int day_folder(const char *n) /* 2026-11-12 -> 20261112, else 0 */
+{
+    if (strlen(n) != 10 || n[4] != '-' || n[7] != '-')
+        return 0;
+    for (int i = 0; i < 10; i++)
+        if (i != 4 && i != 7 && !isdigit((unsigned char)n[i]))
+            return 0;
+    int y = atoi(n), m = atoi(n + 5), d = atoi(n + 8);
+    return m >= 1 && m <= 12 && d >= 1 && d <= 31 ? y * 10000 + m * 100 + d : 0;
+}
+
+static int is_open(const char *dir, const char *sub, const char *name)
+{
+    char p[PATHBUF];
+    if (sub)
+        sfmt(p, sizeof p, "%s/%s/%s", dir, sub, name);
+    else
+        sfmt(p, sizeof p, "%s/%s", dir, name);
+    if (g_log.f && !strcmp(p, g_log.path))
+        return 1;
+    for (int i = 0; i < g_log.nplog; i++)
+        if (!strcmp(p, g_log.pl[i].path))
+            return 1;
+    return 0;
+}
+
+/* delete hsm's CSV files in an open folder; all of them, or (cut > 0) those
+ * last changed before cut */
+static int purge(int dfd, const char *dir, const char *sub, time_t cut)
+{
+    int fd = dup(dfd), n = 0;
+    DIR *d = fd >= 0 ? fdopendir(fd) : NULL;
+    if (!d) {
+        if (fd >= 0)
+            close(fd);
+        return 0;
+    }
+    rewinddir(d); /* a dup shares the read position with dfd, which may be at the end */
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        struct stat st;
+        if (!our_file(e->d_name) || fstatat(dfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode))
+            continue;
+        if ((cut && st.st_mtime >= cut) || is_open(dir, sub, e->d_name))
+            continue;
+        if (unlinkat(dfd, e->d_name, 0) == 0)
+            n++;
+    }
+    closedir(d);
+    return n;
+}
+
+int log_housekeeping(const char *dir, int keep_days)
+{
+    if (keep_days <= 0 || !dir || !*dir)
+        return 0;
+    int who = config_as_user(); /* the logs are the user's, also under sudo */
+    if (who < 0)
+        return 0;
+    int n = 0, dfd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dfd >= 0) {
+        /* keep today and the keep_days - 1 days before it */
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        tm.tm_mday -= keep_days - 1;
+        tm.tm_hour = 12;
+        tm.tm_isdst = -1;
+        mktime(&tm);
+        int first = (tm.tm_year + 1900) * 10000 + (tm.tm_mon + 1) * 100 + tm.tm_mday;
+        int fd = dup(dfd);
+        DIR *d = fd >= 0 ? fdopendir(fd) : NULL;
+        if (!d && fd >= 0)
+            close(fd);
+        if (d)
+            rewinddir(d);
+        struct dirent *e;
+        while (d && (e = readdir(d)) != NULL) {
+            struct stat st;
+            if (fstatat(dfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+                continue;
+            int day = S_ISDIR(st.st_mode) ? day_folder(e->d_name) : 0;
+            if (day && day < first) {
+                int sub = openat(dfd, e->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                if (sub >= 0) {
+                    n += purge(sub, dir, e->d_name, 0);
+                    close(sub);
+                    unlinkat(dfd, e->d_name, AT_REMOVEDIR); /* only works when nothing else is left */
+                }
+            }
+        }
+        if (d)
+            closedir(d);
+        /* logs written before 1.6 sit directly in the folder: go by their age */
+        n += purge(dfd, dir, NULL, now - (time_t)keep_days * 86400);
+        close(dfd);
+    }
+    config_as_root(who);
+    return n;
 }

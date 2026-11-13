@@ -23,6 +23,7 @@
  * Every change is applied and saved at once. */
 #define _GNU_SOURCE
 #include "ui_int.h"
+#include "watch.h"
 
 #include <errno.h>
 #include <math.h>
@@ -31,20 +32,49 @@
 
 enum {
     OPT_PROCS, OPT_BARS, OPT_GRAPHS, OPT_LEFTW, OPT_COLORS, OPT_SINGLE, OPT_HIGHLIGHT, OPT_SELTEXT,
-    OPT_TITLES, OPT_BACKGROUND, OPT_CPU_USAGE, OPT_CPU_CLOCK, OPT_CPU_TEMP, OPT_INTERVAL, OPT_KTHREADS, OPT_COUNT
+    OPT_TITLES, OPT_BACKGROUND, OPT_CORE_BAR, OPT_CORE_VALUES,
+    OPT_NOTIFY, OPT_A_TEMP, OPT_A_THROTTLE, OPT_A_DISK, OPT_A_MEM, OPT_A_FULL, OPT_A_PROBLEMS,
+    OPT_KEEP, OPT_REC, OPT_REC_MIN,
+    OPT_INTERVAL, OPT_KTHREADS, OPT_MOUSE, OPT_COUNT
 };
 static const char *const OPT_LABEL[OPT_COUNT] = {
     "Process list", "Bar style",   "Graphs",      "Left column width", "Bars & values",  "  Colour",
     "Highlight",    "Selected text", "Titles",    "Background",
-    "Usage",        "Clock speed", "Temperature", "Refresh interval",  "Kernel threads",
+    "Bars show",    "Other values",
+    "Alert by",     "CPU hotter than", "CPU throttling", "Disk slower than", "Memory left below", "Disk fuller than", "Problems",
+    "Delete logs after", "Flight recorder", "  Keeps the last",
+    "Refresh interval",  "Kernel threads", "Mouse",
 };
-enum { ACT_RESET_ALL };
-static const char *const ACT_LABEL[] = { "Reset ALL settings to defaults" };
+enum { ACT_RESET_ALL, ACT_TEST_ALERT, ACT_SENSORS };
+static const char *const ACT_LABEL[] = { "Reset ALL settings to defaults", "Send a test alert",
+                                         "Sensor names and limits" };
 
 static const int LEFTW[] = { 0, 35, 40, 45, 50, 55, 60, 65, 70 };
 static const double STEPS[] = { 0.25, 0.5, 1, 2, 3, 5, 10 };
+static const int A_TEMPS[] = { 0, 70, 75, 80, 85, 90, 95, 100 };
+static const int A_DISKS[] = { 0, 100, 200, 500, 1000, 2000, 5000 };
+static const int A_MEMS[] = { 0, 2, 5, 10, 15, 20 };
+static const int A_FULLS[] = { 0, 80, 85, 90, 95, 98 };
+static const int REC_MINS[] = { 2, 5, 10, 30 };
 #define NLEFTW ((int)(sizeof LEFTW / sizeof LEFTW[0]))
 #define NSTEPS ((int)(sizeof STEPS / sizeof STEPS[0]))
+#define COUNT(a) ((int)(sizeof(a) / sizeof(a)[0]))
+
+const char *const NOTIFY_NAME[ALERT_COUNT] = { "Off", "Desktop", "Terminal bell", "Desktop + bell" };
+const int KEEP_DAYS[] = { 0, 7, 14, 30, 60, 90, 180, 365 };
+const int NKEEP = COUNT(KEEP_DAYS);
+
+/* the next entry of a list of choices, starting from where v is */
+static int step_list(const int *list, int n, int v, int dir)
+{
+    int i = 0;
+    while (i < n && list[i] != v)
+        i++;
+    if (i == n) /* a value set by hand in the config file: start from the nearest */
+        for (i = 0; i < n - 1 && list[i] < v; i++)
+            ;
+    return list[((i + dir) % n + n) % n];
+}
 
 /* rows of the right-hand settings list (headings + selectable rows) */
 enum { K_PANEL, K_OPT, K_ACT, K_HEAD, K_BLANK };
@@ -81,14 +111,33 @@ static int build_rows(const ui_state_t *u, row_t *r)
     ROW(K_OPT, OPT_TITLES);
     ROW(K_OPT, OPT_BACKGROUND);
     BLANK();
-    HEAD("CPU core bars: any combination");
-    ROW(K_OPT, OPT_CPU_USAGE);
-    ROW(K_OPT, OPT_CPU_CLOCK);
-    ROW(K_OPT, OPT_CPU_TEMP);
+    HEAD("CPU cores");
+    ROW(K_OPT, OPT_CORE_BAR);
+    ROW(K_OPT, OPT_CORE_VALUES);
+    BLANK();
+    HEAD("Alerts");
+    ROW(K_OPT, OPT_NOTIFY); /* the limits also decide what counts as a problem, so they stay */
+    ROW(K_OPT, OPT_A_TEMP);
+    ROW(K_OPT, OPT_A_THROTTLE);
+    ROW(K_OPT, OPT_A_DISK);
+    ROW(K_OPT, OPT_A_MEM);
+    ROW(K_OPT, OPT_A_FULL);
+    ROW(K_OPT, OPT_A_PROBLEMS);
+    ROW(K_ACT, ACT_TEST_ALERT);
+    BLANK();
+    HEAD("Sensors");
+    ROW(K_ACT, ACT_SENSORS);
+    BLANK();
+    HEAD("Logs");
+    ROW(K_OPT, OPT_KEEP);
+    ROW(K_OPT, OPT_REC);
+    if (u->rec_on)
+        ROW(K_OPT, OPT_REC_MIN);
     BLANK();
     HEAD("Behaviour");
     ROW(K_OPT, OPT_INTERVAL);
     ROW(K_OPT, OPT_KTHREADS);
+    ROW(K_OPT, OPT_MOUSE);
     BLANK();
     ROW(K_ACT, ACT_RESET_ALL);
 #undef HEAD
@@ -130,9 +179,32 @@ static void save(ui_state_t *u)
 
 /* ---------------------------------------------------------- options */
 
-static int cpu_bit(int o)
+static void core_sample(const layout_t *l, int y, int x, int w);
+
+static void off_or(char *out, size_t n, int v, const char *fmt)
 {
-    return o == OPT_CPU_USAGE ? CPUBAR_USAGE : o == OPT_CPU_CLOCK ? CPUBAR_CLOCK : CPUBAR_TEMP;
+    if (v > 0)
+        sfmt(out, n, fmt, v);
+    else
+        str_copy(out, n, "Off");
+}
+
+void keep_text(int days, char *out, size_t n)
+{
+    if (days > 0)
+        sfmt(out, n, "%d days", days);
+    else
+        str_copy(out, n, "Never");
+}
+
+void keep_changed(ui_state_t *u)
+{
+    if (u->log_keep_days > 0)
+        ui_message(u, 0, "Logs older than %d days will be deleted (the first clean-up runs in 2 minutes)",
+                   u->log_keep_days);
+    else
+        ui_message(u, 0, "Logs are kept: nothing is deleted");
+    watch_keep_changed();
 }
 
 static void opt_value(const ui_state_t *u, int o, char *out, size_t n)
@@ -148,9 +220,19 @@ static void opt_value(const ui_state_t *u, int o, char *out, size_t n)
     case OPT_BACKGROUND: str_copy(out, n, BG_NAME[l->background]); break;
     case OPT_SELTEXT: str_copy(out, n, TXT_NAME[l->sel_text]); break;
     case OPT_TITLES: str_copy(out, n, l->title_color ? TXT_NAME[l->title_color] : "Automatic (cyan)"); break;
-    case OPT_CPU_USAGE:
-    case OPT_CPU_CLOCK:
-    case OPT_CPU_TEMP: str_copy(out, n, (l->cpu_bars & cpu_bit(o)) ? "On" : "Off"); break;
+    case OPT_CORE_BAR: str_copy(out, n, CORE_NAME[l->core_bar]); break;
+    case OPT_CORE_VALUES: str_copy(out, n, l->core_values ? "Shown" : "Hidden"); break;
+    case OPT_NOTIFY: str_copy(out, n, NOTIFY_NAME[u->alert_notify]); break;
+    case OPT_A_TEMP: off_or(out, n, u->alert_cpu_temp, U ? "%d °C" : "%d C"); break;
+    case OPT_A_THROTTLE: str_copy(out, n, u->alert_throttle ? "Alert" : "Off"); break;
+    case OPT_A_DISK: off_or(out, n, u->alert_disk_ms, "%d ms"); break;
+    case OPT_A_MEM: off_or(out, n, u->alert_mem_pct, "%d%%"); break;
+    case OPT_A_FULL: off_or(out, n, u->alert_disk_full, "%d%%"); break;
+    case OPT_A_PROBLEMS: str_copy(out, n, u->alert_problems ? "Alert" : "Off"); break;
+    case OPT_KEEP: keep_text(u->log_keep_days, out, n); break;
+    case OPT_REC: str_copy(out, n, u->rec_on ? "On" : "Off"); break;
+    case OPT_REC_MIN: sfmt(out, n, "%d minutes", u->rec_minutes); break;
+    case OPT_MOUSE: str_copy(out, n, l->mouse ? "On" : "Off"); break;
     case OPT_LEFTW:
         if (l->left_pct)
             sfmt(out, n, "%d%%", l->left_pct);
@@ -194,14 +276,24 @@ static void opt_change(ui_state_t *u, int o, int dir)
         while (COLORS < 16 && TXT_COLOR[*v] >= 8);
         break;
     }
-    case OPT_CPU_USAGE:
-    case OPT_CPU_CLOCK:
-    case OPT_CPU_TEMP:
-        if (l->cpu_bars == cpu_bit(o)) {
-            ui_message(u, 1, "At least one kind of CPU bar has to stay on");
-            return;
-        }
-        l->cpu_bars ^= cpu_bit(o);
+    case OPT_CORE_BAR: l->core_bar = cyc(l->core_bar, dir, CORE_COUNT); break;
+    case OPT_CORE_VALUES: l->core_values ^= 1; break;
+    case OPT_NOTIFY: u->alert_notify = cyc(u->alert_notify, dir, ALERT_COUNT); break;
+    case OPT_A_TEMP: u->alert_cpu_temp = step_list(A_TEMPS, COUNT(A_TEMPS), u->alert_cpu_temp, dir); break;
+    case OPT_A_THROTTLE: u->alert_throttle ^= 1; break;
+    case OPT_A_DISK: u->alert_disk_ms = step_list(A_DISKS, COUNT(A_DISKS), u->alert_disk_ms, dir); break;
+    case OPT_A_MEM: u->alert_mem_pct = step_list(A_MEMS, COUNT(A_MEMS), u->alert_mem_pct, dir); break;
+    case OPT_A_FULL: u->alert_disk_full = step_list(A_FULLS, COUNT(A_FULLS), u->alert_disk_full, dir); break;
+    case OPT_A_PROBLEMS: u->alert_problems ^= 1; break;
+    case OPT_KEEP:
+        u->log_keep_days = step_list(KEEP_DAYS, NKEEP, u->log_keep_days, dir);
+        keep_changed(u);
+        break;
+    case OPT_REC: u->rec_on ^= 1; break;
+    case OPT_REC_MIN: u->rec_minutes = step_list(REC_MINS, COUNT(REC_MINS), u->rec_minutes, dir); break;
+    case OPT_MOUSE:
+        l->mouse ^= 1;
+        ui_mouse(l->mouse);
         break;
     case OPT_LEFTW:
         for (i = 0; i < NLEFTW && LEFTW[i] != l->left_pct; i++)
@@ -224,7 +316,7 @@ static void reset_all(ui_state_t *u)
     if (u->confirm != ACT_RESET_ALL || now_sec() > u->confirm_until) {
         u->confirm = ACT_RESET_ALL;
         u->confirm_until = now_sec() + 5.0;
-        ui_message(u, 1, "Press Enter (or R) again to reset ALL settings to defaults; any other key cancels");
+        ui_message(u, 1, "Press Enter (or R) again to reset ALL settings to defaults (sensor names stay); any other key cancels");
         return;
     }
     u->confirm = -1;
@@ -278,6 +370,8 @@ static void panel_to(layout_t *l, int c, int i, int nc)
 
 int setup_key(ui_state_t *u, int ch)
 {
+    if (u->sens_open)
+        return sensors_page_key(u, ch);
     if (u->confirm == ACT_RESET_ALL && now_sec() <= u->confirm_until) { /* "Reset ALL" is waiting */
         if (ch == '\n' || ch == '\r' || ch == KEY_ENTER || ch == 'R') {
             reset_all(u);
@@ -314,6 +408,11 @@ int setup_key(ui_state_t *u, int ch)
             save(u);
         } else if (cur.kind == K_OPT) {
             opt_change(u, cur.id, 1);
+        } else if (cur.kind == K_ACT && cur.id == ACT_TEST_ALERT) {
+            alert_test(u, 1);
+        } else if (cur.kind == K_ACT && cur.id == ACT_SENSORS) {
+            u->sens_open = 1;
+            u->sens_edit = 0;
         } else if (cur.kind == K_ACT && ch != ' ') { /* only Enter confirms a reset */
             reset_all(u);
         }
@@ -342,6 +441,17 @@ int setup_key(ui_state_t *u, int ch)
     return 0;
 }
 
+/* a click selects; on an arrow it changes the value, on a box (or twice) it
+ * does what Enter does */
+void setup_click(ui_state_t *u, int item, int arrow, int dbl)
+{
+    u->setup_sel = item;
+    if (arrow == -1 || arrow == 1)
+        setup_key(u, arrow < 0 ? KEY_LEFT : KEY_RIGHT);
+    else if (arrow == 2 || dbl)
+        setup_key(u, '\n');
+}
+
 /* ----------------------------------------------------------- drawing */
 
 static void sample_hist(hist_t *h)
@@ -352,7 +462,7 @@ static void sample_hist(hist_t *h)
         hist_push(h, 50 + 45 * sin(i / 3.0) * cos(i / 11.0));
 }
 
-static void option_row(ui_state_t *u, int o, int y, int x, int w, int sel)
+static void option_row(ui_state_t *u, int o, int y, int x, int w, int sel, int item)
 {
     attr_t base = sel ? CP(C_SEL) : A_NORMAL;
     int lw = MIN(21, w / 2);
@@ -360,18 +470,12 @@ static void option_row(ui_state_t *u, int o, int y, int x, int w, int sel)
         fill(y, x, MIN(w, lw + 22), base);
     char v[40];
     opt_value(u, o, v, sizeof v);
-    int cpu = o == OPT_CPU_USAGE || o == OPT_CPU_CLOCK || o == OPT_CPU_TEMP;
-    if (cpu) { /* checkbox-style toggles */
-        int on = (u->lay.cpu_bars & cpu_bit(o)) != 0;
-        int xx = x + 1 + put(y, x + 1, w, sel ? base : (on ? CP(C_OK) | A_BOLD : A_GRAY), "%s ",
-                             U ? (on ? "■" : "□") : (on ? "[x]" : "[ ]"));
-        put(y, xx, lw - 2, sel ? base | A_BOLD : (on ? A_BOLD : A_GRAY), "%s", OPT_LABEL[o]);
-        put(y, x + 1 + lw, w - lw - 1, sel ? base : A_GRAY, "%s", on ? "shown" : "off");
-        return;
-    }
     put(y, x + 1, lw, sel ? base : CP(C_INFO), "%s", OPT_LABEL[o]);
     int xx = x + 1 + lw;
-    put(y, xx, x + w - xx, base | A_BOLD, U ? "◀ %s ▶" : "< %s >", v);
+    int vw = put(y, xx, x + w - xx, base | A_BOLD, U ? "◀ %s ▶" : "< %s >", v);
+    hit_add(y, x, 1, w, HIT_SETUP, item, 0);
+    hit_add(y, xx, 1, 2, HIT_SETUP, item, -1); /* the arrows change the value */
+    hit_add(y, xx + vw - 2, 1, 2, HIT_SETUP, item, 1);
     xx += 22; /* samples line up in one column */
     int room = x + w - xx - 2;
     if (room < 8)
@@ -389,14 +493,74 @@ static void option_row(ui_state_t *u, int o, int y, int x, int w, int sel)
         static hist_t demo;
         sample_hist(&demo);
         graph(y, xx, 1, sw, &demo, 100, 0, 0);
+    } else if (o == OPT_CORE_BAR) {
+        core_sample(&u->lay, y, xx, room);
+    } else {
+        const char *hint = NULL;
+        switch (o) {
+        case OPT_NOTIFY:
+            hint = u->alert_notify == ALERT_OFF ? "no alerts"
+                 : u->alert_notify == ALERT_BELL ? "beeps while hsm is open"
+                                                 : "a pop-up on your desktop";
+            break;
+        case OPT_A_TEMP: hint = "for 5 seconds"; break;
+        case OPT_A_THROTTLE: hint = "slowed down by heat"; break;
+        case OPT_A_DISK: hint = "per request, for 10 s"; break;
+        case OPT_A_MEM: hint = "of memory available"; break;
+        case OPT_A_FULL: hint = "space or inodes used"; break;
+        case OPT_A_PROBLEMS: hint = "freezes, kernel errors, OOM, bad drives"; break;
+        case OPT_CORE_VALUES: hint = u->lay.core_values ? "the other two, as numbers" : "only the bar's own value"; break;
+        case OPT_KEEP: hint = u->log_keep_days ? "only hsm's own CSV files" : "logs are kept"; break;
+        case OPT_REC: hint = "saves the lead-up to problems"; break;
+        case OPT_REC_MIN: hint = "in memory"; break;
+        case OPT_MOUSE: hint = u->lay.mouse ? "Shift + drag selects text" : NULL; break;
+        case OPT_INTERVAL: hint = "+ and - change it anywhere"; break;
+        }
+        if (hint)
+            put(y, xx, room, A_GRAY, "%s", hint);
     }
 }
 
-static void action_row(ui_state_t *u, int a, int y, int x, int w, int sel)
+/* an example core row, as the CPU panel would draw it */
+static void core_sample(const layout_t *l, int y, int x, int w)
+{
+    static const char *const val[CORE_COUNT] = { "48%", "54°", "3.6G" };
+    static const double pct[CORE_COUNT] = { 48, 54, 88 };
+    int m = l->core_bar, bw = MIN(10, w - 20);
+    if (bw < 3)
+        return;
+    int xx = x + put(y, x, w, A_GRAY, "0 ");
+    attr_t ba = m == CORE_TEMP ? bar_temp_attr(54) : m == CORE_CLOCK ? (gradient_on() ? 0 : CP(C_IN)) : 0;
+    bar(y, xx, bw, pct[m], ba);
+    xx += bw + 1;
+    const char *t = U || m != CORE_TEMP ? val[m] : "54C";
+    attr_t ta = m == CORE_USAGE ? pct_attr(48) : m == CORE_TEMP ? temp_attr(54) : A_NORMAL;
+    xx += put(y, xx + 4 - utf8_cols(t), 4, ta | A_BOLD, "%s", t) + (4 - utf8_cols(t));
+    static const int order[CORE_COUNT] = { CORE_USAGE, CORE_CLOCK, CORE_TEMP };
+    for (int k = 0; k < CORE_COUNT && l->core_values; k++) {
+        int o = order[k];
+        if (o == m)
+            continue;
+        t = U || o != CORE_TEMP ? val[o] : "54C";
+        ta = o == CORE_USAGE ? pct_attr(48) : o == CORE_TEMP ? temp_attr(54) : A_NORMAL;
+        xx += put(y, xx + 6 - utf8_cols(t), MAX(0, x + w - xx), ta, "%s", t) + (6 - utf8_cols(t));
+    }
+}
+
+static void action_row(ui_state_t *u, int a, int y, int x, int w, int sel, int item)
 {
     attr_t base = sel ? CP(C_SEL) : A_NORMAL;
     if (sel)
         fill(y, x, MIN(w, 41), base);
+    hit_add(y, x, 1, MIN(w, 41), HIT_SETUP, item, 0);
+    if (a == ACT_TEST_ALERT || a == ACT_SENSORS) {
+        put(y, x + 1, w - 2, sel ? base | A_BOLD : CP(C_INFO), "%s %s", U ? "▸" : ">", ACT_LABEL[a]);
+        int hx = x + 1 + MIN(21, w / 2) + 22; /* where the other rows show their samples */
+        if (x + w - hx > 12)
+            put(y, hx, x + w - hx, A_GRAY, "%s",
+                a == ACT_TEST_ALERT ? "Enter: check that alerts reach you" : "Enter: your names, limits, hiding");
+        return;
+    }
     put(y, x + 1, w - 2, sel ? base | A_BOLD : CP(C_WARN), "%s %s", U ? "↺" : "*", ACT_LABEL[a]);
     if (u->confirm == a && now_sec() < u->confirm_until)
         put(y, x + 43, w - 44, CP(C_CRIT) | A_BOLD, "press Enter again to confirm");
@@ -419,7 +583,10 @@ static void panel_row(const layout_t *l, int p, int y, int x, int w, int sel)
 
 void setup_view(sys_t *s, ui_state_t *u)
 {
-    (void)s;
+    if (u->sens_open) {
+        sensors_page(s, u);
+        return;
+    }
     layout_t *l = &u->lay;
     item_t it[MAXROWS];
     row_t rows[MAXROWS];
@@ -440,8 +607,11 @@ void setup_view(sys_t *s, ui_state_t *u)
     int y = top + 2, k = 0;
     for (int c = 0; c < 2; c++) {
         put(y++, 2, pw - 4, A_GRAY | A_BOLD, c ? "Right column" : "Left column");
-        for (int i = 0; i < l->ncol[c]; i++, k++)
+        for (int i = 0; i < l->ncol[c]; i++, k++) {
+            hit_add(y, 1, 1, pw - 2, HIT_SETUP, k, 0);
+            hit_add(y, 2, 1, U ? 2 : 4, HIT_SETUP, k, 2); /* the box: show / hide */
             panel_row(l, l->col[c][i], y++, 1, pw - 2, k == u->setup_sel);
+        }
         y++;
     }
     static const char *const help[] = { "Space / Enter  show or hide",
@@ -467,14 +637,18 @@ void setup_view(sys_t *s, ui_state_t *u)
             u->setup_scroll = cur.row - inner + 1;
     }
     u->setup_scroll = CLAMP(u->setup_scroll, 0, MAX(0, nr - inner));
+    hit_add(oy + 2, ox + 1, inner, ow - 2, HIT_SCROLL, 0, 0);
     for (int i = 0; i < inner && u->setup_scroll + i < nr; i++) {
-        int ri = u->setup_scroll + i, yy = oy + 2 + i;
+        int ri = u->setup_scroll + i, yy = oy + 2 + i, item = 0;
         row_t *r = &rows[ri];
         int sel = cur.row == ri;
+        for (int k2 = 0; k2 < n; k2++)
+            if (it[k2].row == ri)
+                item = k2;
         switch (r->kind) {
         case K_HEAD: put(yy, ox + 2, ow - 4, A_GRAY | A_BOLD, "%s", r->text); break;
-        case K_OPT: option_row(u, r->id, yy, ox + 1, ow - 2, sel); break;
-        case K_ACT: action_row(u, r->id, yy, ox + 1, ow - 2, sel); break;
+        case K_OPT: option_row(u, r->id, yy, ox + 1, ow - 2, sel, item); break;
+        case K_ACT: action_row(u, r->id, yy, ox + 1, ow - 2, sel, item); break;
         default: break;
         }
     }

@@ -118,6 +118,8 @@ typedef struct {
 typedef struct {
     char mount[128], dev[96], type[16];
     unsigned long long total, used, avail;
+    unsigned long long files, ffree; /* inodes (file slots); files 0 = the file system has no fixed number */
+    int readonly;
 } fs_t;
 
 typedef struct {
@@ -143,6 +145,9 @@ typedef struct {
     double err_rate, drop_rate;       /* per second */
     double signal_dbm;                /* Wi-Fi signal, 0 = n/a */
     int quality;                      /* Wi-Fi link quality %, -1 = n/a */
+    long long link_downs;             /* times the link (cable, Wi-Fi) went down since boot, -1 = n/a */
+    long long downs_seen;             /* health: the count already reported */
+    double down_t;                    /* health: when the link went down (wall), 0 = it's up */
     int primed, seen;
 } netif_t;
 
@@ -194,6 +199,7 @@ void procs_sample(procs_t *ps, double dt, unsigned long long memtotal);
 void procs_free(procs_t *ps);
 const char *proc_cmdline(proc_t *p);
 int proc_send_signal(pid_t pid, unsigned long long start, int sig); /* 0 or errno */
+int proc_renice(pid_t pid, unsigned long long start, int nice);    /* every thread; 0 or errno */
 const char *uid_name(uid_t uid);
 
 /* ------------------------------------------------------ Sensors (hwmon) */
@@ -207,6 +213,16 @@ typedef struct {
     double peak, fmax;  /* highest value seen; fans: fanN_max if exposed */
     double lo, hi;      /* voltages: the chip's min / max limits, 0 = none */
     double hot_t;       /* health: when a "too hot" event was last raised */
+    int fan_seen;       /* health: this fan has been seen spinning */
+    int fan_flagged;    /* health: "stopped while hot" was reported */
+    double fan_zero_t;  /* health: since when it reads 0 while hot */
+    /* your own name and limits ("sensor = ..." lines in the config file) */
+    char id[96];        /* "chip/label": stays the same across boots */
+    char name[48];      /* "" = the label */
+    double ulo, uhi;    /* your limits in the sensor's unit, 0 = none (fans: ulo = minimum RPM) */
+    int hidden;         /* left out of the screen and the logs */
+    double lim_t;       /* health: since when it is past your limit, 0 = it isn't */
+    int lim_flagged;    /* health: reported */
 } sensor_t;
 
 typedef struct {
@@ -214,6 +230,19 @@ typedef struct {
     sensor_t s[MAX_SENSORS];
     int cpu_idx; /* sensor used as "CPU temperature", -1 = none */
 } sensors_t;
+
+/* your settings for one sensor, kept even while it isn't there (a USB
+ * device, a graphics card that's out) */
+#define MAX_SRULES 128
+typedef struct {
+    char id[96];   /* sensor_t.id */
+    char name[48]; /* "" = keep the label */
+    double lo, hi; /* 0 = none */
+    int hide;
+} srule_t;
+void sensors_apply(sensors_t *S, const srule_t *r, int n);
+const char *sensor_label(const sensor_t *t); /* your name, or the chip's label */
+int sensor_bad(const sensor_t *t);           /* past your limits (voltages: or the chip's) */
 
 void sensors_init(sensors_t *s);
 void sensors_sample(sensors_t *s);
@@ -343,6 +372,20 @@ typedef struct {
     double read_b, written_b;
 } nvme_t;
 
+#define MAX_SATA 8
+
+/* a SATA SSD or hard disk, from its SMART attributes */
+typedef struct {
+    char name[16], model[48];
+    int state;        /* 1 read, 0 not yet, -1 needs root, -2 no SMART data, -3 asleep, not woken */
+    int rotational;   /* a hard disk */
+    int asleep;       /* spun down at the last check (the figures are from before) */
+    int failing;      /* an attribute is at or below the maker's limit */
+    char fail_attr[28];
+    int temp_c, wear; /* wear: % of the rated life used (SSDs), -1 = unknown */
+    long long hours, cycles, realloc, pending, uncorrect, crc, unsafe; /* -1 = unknown */
+} sata_t;
+
 typedef struct {
     psi_t psi[3]; /* cpu, memory, io */
 
@@ -364,6 +407,8 @@ typedef struct {
 
     int nnvme;
     nvme_t nvme[MAX_NVME];
+    int nsata;
+    sata_t sata[MAX_SATA];
 
     unsigned long long files, files_max; /* open file handles, whole system */
 
@@ -376,14 +421,29 @@ typedef struct {
     event_t ev[MAX_EVENTS];
 
     double hot_last; /* a temperature reached its critical level */
+    double slow_last, lowmem_last; /* a disk was very slow / memory ran low (alert limits) */
+    double full_last;              /* a file system passed the "almost full" alert limit */
+
+    /* freezes: the whole system stood still (watchdog thread); suspends */
+    int freezes;
+    double freeze_max, freeze_last, freeze_t; /* longest, latest (s), when it was noticed (wall) */
+    double frozen_total;                      /* seconds frozen since start */
+    double asleep_total, resume_t;            /* time suspended since start, when it last woke (wall) */
+    int suspends;
+    int link_drops;                           /* network links lost since start */
+    int fan_stops;                            /* fans that stopped while hot */
+    double fan_last, link_last, ro_last;      /* a fan is stopped / a link dropped / a disk went read-only */
+    double ulim_last;                         /* a sensor is past the limit you gave it */
 
     /* private */
     int kmsg_fd, kmsg_file, primed, thr_tried;
     long kmsg_off;
     unsigned long long oom_prev;
     unsigned long long core_ms[MAX_CPUS], core_cnt[MAX_CPUS];
-    double next_slow, next_nvme, thr_ev_t;
+    double next_slow, next_nvme, next_sata, thr_ev_t;
     char governor[24];
+    int susp_ok;                   /* the kernel counts failed suspends */
+    unsigned long long susp_fail;
 } health_t;
 
 void health_init(health_t *h);
@@ -391,6 +451,68 @@ void health_event(health_t *h, int level, const char *cat, const char *fmt, ...)
 const event_t *health_event_at(const health_t *h, int i); /* 0 = newest, NULL past the end */
 /* active problems for the header: throttling now, OOM kill just now... "" = none */
 int health_alert(const health_t *h, char *out, size_t n);
+/* the busiest process right now, for event texts: " while firefox used 180% CPU" ("" = none) */
+enum { BLAME_CPU, BLAME_MEM, BLAME_IO, BLAME_GPU };
+void health_blame(const procs_t *ps, int what, char *out, size_t n);
+
+/* freeze.c: a watchdog thread that notices when the whole system stops */
+enum { FZ_STALL, FZ_SUSPEND };
+typedef struct {
+    double wall, dur; /* when it started, how long */
+    int kind;
+} fz_t;
+void freeze_start(void);
+int freeze_take(fz_t *out); /* 1 = got one */
+
+/* leak.c: processes whose memory keeps growing (leak_sample is with sys_t below) */
+#define LEAK_MIN 120 /* minutes of memory history kept per process */
+/* the memory history of one process, oldest first (MB a minute); returns
+ * how many; *growing = it was flagged, *rate = MB per hour lately */
+int leak_history(pid_t pid, unsigned long long start, float *out, int max, int *growing, double *rate);
+int leak_growing(pid_t pid, unsigned long long start);
+
+/* ata.c: SATA drives */
+void ata_find(health_t *h);
+void ata_sample(health_t *h);
+
+/* selftest.c: a drive's own tests and error log */
+#define MAX_STEST 21
+typedef struct {
+    int type;          /* 1 short, 2 extended, 3 other */
+    int failed, stopped;
+    char what[48];     /* "completed without error", "FAILED: read element"... */
+    long long hours;   /* the drive's power-on hours when it ran */
+    long long lba;     /* first bad sector, -1 = none */
+} stest_t;
+
+typedef struct {
+    char name[16], model[48];
+    int nvme;
+    int state;               /* 1 read, 0 not yet, -1 needs root, -2 not supported */
+    int can_test;
+    int running, progress;   /* a test going on now: 1 short, 2 extended; % done (-1 unknown) */
+    int short_min, ext_min;  /* how long the tests take, minutes, -1 = unknown */
+    int ntest;
+    stest_t test[MAX_STEST]; /* newest first */
+    long long hours;         /* power-on hours now */
+    long long errors;        /* errors the drive logged in its life, -1 unknown */
+    char err_text[96];       /* the latest one */
+    int err_bad;             /* ... was a real problem (media error), not a refused command */
+    long long err_hours;     /* when (power-on hours), -1 unknown */
+    double read_t;
+    int follow;              /* hsm started a test: report when it ends */
+    double follow_t;
+    int sim_type;            /* test hook: a pretend test */
+    double sim_until;
+} drive_t;
+
+int drives_sync(const health_t *h); /* the drives health found; returns how many */
+drive_t *drive_at(int i);
+int drive_read(drive_t *d);          /* self-test log, status, error log; 0 = read */
+int drive_start(drive_t *d, int type); /* 1 short, 2 extended, 0 stop it; 0 or errno */
+void drives_tick(health_t *h);       /* events for the tests hsm started */
+int ata_smart(int fd, unsigned char feature, unsigned char lba_low, unsigned char *buf); /* 0 or errno */
+void sata_summary(const sata_t *s, char *out, size_t n, int *level, const char *sep, const char *deg);
 
 /* ------------------------------------------------- Services (cgroup v2) */
 enum { SVC_SERVICE, SVC_SCOPE, SVC_CONTAINER, SVC_SESSION, SVC_APP, SVC_OTHER };
@@ -449,6 +571,7 @@ void sys_init(sys_t *s);
 void sys_sample(sys_t *s);
 void sys_free(sys_t *s);
 void health_sample(sys_t *s); /* after the other collectors: needs CPU, memory and sensors */
+void leak_sample(sys_t *s);   /* once a minute, from health_sample */
 void health_close(health_t *h);
 
 #endif

@@ -22,6 +22,7 @@
 #define _GNU_SOURCE
 #include "log.h"
 #include "ui_int.h"
+#include "watch.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -119,6 +120,34 @@ static int nearest_in_col(int col, int row)
 
 int log_view_key(sys_t *s, ui_state_t *u, int ch)
 {
+    if (u->log_mode == 1)
+        return lv_list_key(s, u, ch);
+    if (u->log_mode == 2)
+        return lv_key(s, u, ch);
+    switch (ch) { /* recorder, clean-up and saved logs work with or without channels */
+    case 'v':
+        u->log_mode = 1;
+        return 1;
+    case 'r':
+        u->rec_on ^= 1;
+        config_save(u);
+        if (u->rec_on)
+            ui_message(u, 0, "Flight recorder on: the last %d minutes are kept and saved when something goes wrong",
+                       u->rec_minutes);
+        else
+            ui_message(u, 0, "Flight recorder off");
+        return 1;
+    case 'd': { /* delete logs after: from the longest to the shortest time, then never */
+        int i = 0;
+        while (i < NKEEP && KEEP_DAYS[i] != u->log_keep_days)
+            i++;
+        i = i >= NKEEP || i == 0 ? NKEEP - 1 : i - 1; /* KEEP_DAYS[0] is "never" */
+        u->log_keep_days = KEEP_DAYS[i];
+        config_save(u);
+        keep_changed(u);
+        return 1;
+    }
+    }
     int n = g_log.nchan + g_log.nplog, sel = u->log_sel;
     if (n <= 0)
         return 0;
@@ -184,6 +213,14 @@ int log_view_key(sys_t *s, ui_state_t *u, int ch)
     return 1;
 }
 
+/* a click selects a row; on the box (or a double click) it toggles, as Space does */
+void log_click(sys_t *s, ui_state_t *u, int row, int box, int dbl)
+{
+    u->log_sel = row;
+    if (box || dbl)
+        log_view_key(s, u, ' ');
+}
+
 /* -------------------------------------------------------------- drawing */
 
 static void chan_row(sys_t *s, int i, int y, int x, int w, int sel)
@@ -192,6 +229,8 @@ static void chan_row(sys_t *s, int i, int y, int x, int w, int sel)
     attr_t base = sel ? CP(C_SEL) : A_NORMAL;
     if (sel)
         fill(y, x, w, base);
+    hit_add(y, x, 1, w, HIT_LOGCH, i, 0);
+    hit_add(y, x, 1, U ? 3 : 4, HIT_LOGCH, i, 1); /* the box itself: toggles at once */
     int xx = x + 1;
     if (U)
         xx += put(y, xx, w, sel ? base : (c->on ? CP(C_OK) | A_BOLD : A_GRAY), "%s ", c->on ? "■" : "□");
@@ -214,13 +253,21 @@ static void chan_row(sys_t *s, int i, int y, int x, int w, int sel)
 
 void log_view(sys_t *s, ui_state_t *u)
 {
+    if (u->log_mode == 1) {
+        lv_list_draw(s, u);
+        return;
+    }
+    if (u->log_mode == 2) {
+        lv_draw(s, u);
+        return;
+    }
     int top = 1, H = LINES - 2, W = COLS;
     int n = g_log.nchan + g_log.nplog;
     u->log_sel = n ? CLAMP(u->log_sel, 0, n - 1) : 0;
     char t[64], p[PATHBUF], sz[16];
 
     /* ---- status */
-    int sh = 5;
+    int sh = 6;
     box_(top, 0, sh, W, "System log", NULL);
     int x = 2, y = top + 1;
     every_text(g_log.f ? g_log.every : u->log_every, t, sizeof t);
@@ -243,8 +290,34 @@ void log_view(sys_t *s, ui_state_t *u)
             put(y + 1, 2, W - 4, A_GRAY, "Logs are saved as CSV files in %s", p);
         }
     }
-    put(y + 2, 2, W - 4, A_GRAY, "%s",
-        "l start / stop    Space select    a all    n none    i interval    L log the selected process (view 2)");
+    /* flight recorder and clean-up */
+    rec_status_t rs;
+    rec_status(&rs);
+    char keep[24];
+    keep_text(u->log_keep_days, keep, sizeof keep);
+    x = 2;
+    if (!u->rec_on) {
+        x += put(y + 2, x, W - 4, A_GRAY, "Flight recorder: off");
+    } else if (rs.busy) {
+        x += put(y + 2, x, W - 4, CP(C_CRIT) | A_BOLD, "%s Flight recorder: saving an incident log", U ? "●" : "*");
+        x += put(y + 2, x, W - 2 - x, A_NORMAL, " (%s)", rs.reason);
+    } else {
+        x += put(y + 2, x, W - 4, CP(C_OK) | A_BOLD, "Flight recorder: on");
+        x += put(y + 2, x, W - 2 - x, A_NORMAL, ", keeps the last %d min", u->rec_minutes);
+        if (rs.saved)
+            x += put(y + 2, x, W - 2 - x, A_NORMAL, "%s%d incident log%s saved", SEP, rs.saved,
+                     rs.saved == 1 ? "" : "s");
+    }
+    put(y + 2, x, W - 2 - x, A_GRAY, "%sdelete logs after: %s", SEP, keep);
+    static const struct {
+        const char *k, *l;
+        int code;
+    } KH[] = { { "l", "start/stop", 'l' },     { "Space", "select", ' ' }, { "a", "all", 'a' },
+               { "n", "none", 'n' },           { "i", "interval", 'i' },   { "r", "recorder", 'r' },
+               { "d", "delete after", 'd' },   { "v", "saved logs", 'v' } };
+    x = 2;
+    for (size_t i = 0; i < sizeof KH / sizeof KH[0]; i++)
+        x += key_hint(y + 3, x, W - 2, KH[i].k, KH[i].l, KH[i].code);
 
     /* ---- what to log: groups laid out in columns, whole groups per column */
     int iw = W - 4, ncols = MAX(1, iw / 44), cw = iw / ncols;
@@ -289,6 +362,7 @@ void log_view(sys_t *s, ui_state_t *u)
         attr_t base = sel ? CP(C_SEL) : A_NORMAL;
         if (sel)
             fill(yy, 1, W - 2, base);
+        hit_add(yy, 1, 1, W - 2, HIT_LOGCH, g_log.nchan + i, 0);
         fmt_bytes((double)log_file_size(pl->path), sz, sizeof sz);
         config_pretty_path(pl->path, p, sizeof p);
         int xx = 3;

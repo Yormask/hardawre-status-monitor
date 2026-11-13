@@ -20,6 +20,7 @@
 /* ui_hw.c - Hardware view: every sensor, GPU detail, drive, filesystem and interface */
 #define _GNU_SOURCE
 #include "ui_int.h"
+#include "watch.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -94,9 +95,13 @@ static void hw_sensors(sys_t *s, lc_t *c)
         lc_text(c, A_GRAY, "No hwmon sensors found in /sys/class/hwmon");
         return;
     }
-    int last = -1;
+    int last = -1, hidden = 0;
     for (int i = 0; i < S->n; i++) {
         sensor_t *t = &S->s[i];
+        if (t->hidden) {
+            hidden++;
+            continue;
+        }
         if (t->chip_idx != last) {
             lc_text(c, CP(C_INFO) | A_BOLD, "%s", t->chip);
             last = t->chip_idx;
@@ -104,33 +109,47 @@ static void hw_sensors(sys_t *s, lc_t *c)
         int y = lc_row(c);
         if (y < 0)
             continue;
-        int lw = MIN(22, c->w / 2), xx = c->x + 2 + lw;
-        put(y, c->x + 2, lw, A_NORMAL, "%s", t->label);
+        int lw = MIN(22, c->w / 2), xx = c->x + 2 + lw, bad = sensor_bad(t);
+        put(y, c->x + 2, lw, bad ? CP(C_CRIT) | A_BOLD : A_NORMAL, "%s", sensor_label(t));
         if (!t->ok) {
             put(y, xx, c->w - lw - 2, A_GRAY, "n/a");
             continue;
         }
+        char lim[48] = "";
         if (t->type == SENS_TEMP) {
-            xx += put(y, xx, 9, temp_attr(t->value) | A_BOLD, "%5.1f%s", t->value, DEG);
-            double ref = t->crit > 0 ? t->crit : 100.0;
+            xx += put(y, xx, 9, temp_attr_lim(t->value, t->uhi) | A_BOLD, "%5.1f%s", t->value, DEG);
+            double ref = t->uhi > 0 ? t->uhi : t->crit > 0 ? t->crit : 100.0;
             int bw = MIN(20, c->x + c->w - xx - 14);
             if (bw > 3) {
-                bar(y, xx + 1, bw, 100.0 * t->value / ref, gradient_on() ? 0 : bar_temp_attr(t->value));
+                bar(y, xx + 1, bw, 100.0 * t->value / ref, gradient_on() ? 0 : bar_temp_attr_lim(t->value, t->uhi));
                 xx += bw + 1;
             }
-            if (t->crit > 0)
-                put(y, xx + 1, c->x + c->w - xx - 1, A_GRAY, "crit %.0f%s", t->crit, DEG);
+            if (t->uhi > 0)
+                sfmt(lim, sizeof lim, "your limit %.0f%s", t->uhi, DEG);
+            else if (t->crit > 0)
+                sfmt(lim, sizeof lim, "crit %.0f%s", t->crit, DEG);
         } else if (t->type == SENS_FAN) {
-            put(y, xx, c->w - lw - 2, A_BOLD, "%5.0f RPM", t->value);
+            xx += put(y, xx, 9, bad ? CP(C_CRIT) | A_BOLD : A_BOLD, "%5.0f RPM", t->value);
+            if (t->ulo > 0)
+                sfmt(lim, sizeof lim, "your minimum %.0f RPM", t->ulo);
         } else if (t->type == SENS_VOLT) {
-            int bad = (t->hi > 0 && t->value > t->hi) || (t->lo > 0 && t->value < t->lo);
             xx += put(y, xx, 10, bad ? CP(C_CRIT) | A_BOLD : A_BOLD, "%7.3f V", t->value);
-            if (t->lo > 0 || t->hi > 0)
-                put(y, xx + 2, c->x + c->w - xx - 2, A_GRAY, "range %.2f - %.2f V", t->lo, t->hi);
+            if (t->ulo > 0 && t->uhi > 0)
+                sfmt(lim, sizeof lim, "your range %.2f - %.2f V", t->ulo, t->uhi);
+            else if (t->ulo > 0 || t->uhi > 0)
+                sfmt(lim, sizeof lim, "your %s %.2f V", t->ulo > 0 ? "minimum" : "maximum", t->ulo > 0 ? t->ulo : t->uhi);
+            else if (t->lo > 0 || t->hi > 0)
+                sfmt(lim, sizeof lim, "range %.2f - %.2f V", t->lo, t->hi);
         } else {
-            put(y, xx, c->w - lw - 2, CP(C_WARN) | A_BOLD, "%6.2f W", t->value);
+            xx += put(y, xx, 9, bad ? CP(C_CRIT) | A_BOLD : CP(C_WARN) | A_BOLD, "%6.2f W", t->value);
+            if (t->uhi > 0)
+                sfmt(lim, sizeof lim, "your limit %.0f W", t->uhi);
         }
+        if (lim[0] && c->x + c->w - xx > 6)
+            put(y, xx + 2, c->x + c->w - xx - 2, A_GRAY, "%s", lim);
     }
+    if (hidden)
+        lc_text(c, A_GRAY, "  %d hidden (Setup > Sensor names and limits)", hidden);
 }
 
 static void hw_health(sys_t *s, lc_t *c)
@@ -185,6 +204,30 @@ static void hw_health(sys_t *s, lc_t *c)
         lc_kv(c, "OOM kills", since ? CP(C_CRIT) | A_BOLD : s->mem.oom_kill ? CP(C_WARN) : A_BOLD,
               "%llu since boot, %llu since hsm started", s->mem.oom_kill, since);
     }
+
+    /* the whole system standing still; sleeping */
+    if (H->freezes) {
+        double now = (double)time(NULL);
+        lc_kv(c, "Freezes", H->freeze_t > 0 && now - H->freeze_t < 60 ? CP(C_CRIT) | A_BOLD : CP(C_WARN) | A_BOLD,
+              "%d since hsm started, longest %.1f s, %.1f s in total", H->freezes, H->freeze_max, H->frozen_total);
+    } else {
+        lc_kv(c, "Freezes", A_BOLD, "%s", "none since hsm started");
+    }
+    lc_text(c, A_GRAY, "  the whole system stood still for 2 s or more; the events say why");
+    if (H->suspends) {
+        fmt_duration(H->asleep_total, a, sizeof a);
+        time_t t = (time_t)H->resume_t;
+        struct tm tm;
+        localtime_r(&t, &tm);
+        strftime(b, sizeof b, "%H:%M", &tm);
+        lc_kv(c, "Suspended", A_NORMAL, "%d time%s, %s asleep in total, last woke at %s", H->suspends,
+              H->suspends == 1 ? "" : "s", a, b);
+    }
+    if (H->fan_stops)
+        lc_kv(c, "Fans", CP(C_CRIT) | A_BOLD, "%d stopped while hot since hsm started", H->fan_stops);
+    if (H->link_drops)
+        lc_kv(c, "Network links", CP(C_WARN) | A_BOLD, "lost %d time%s since hsm started", H->link_drops,
+              H->link_drops == 1 ? "" : "s");
     if (H->aer_ok) {
         attr_t pa = H->pci_nonfatal + H->pci_fatal ? CP(C_CRIT) | A_BOLD : H->pci_cor ? CP(C_WARN) : A_BOLD;
         lc_kv(c, "PCIe errors", pa, "%llu corrected, %llu non-fatal, %llu fatal since boot", H->pci_cor,
@@ -226,6 +269,54 @@ static void hw_health(sys_t *s, lc_t *c)
         if (v->warn_min || v->crit_min)
             lc_kv(c, "", CP(C_WARN), "%llu min above its warning temperature, %llu min above critical", v->warn_min,
                   v->crit_min);
+    }
+
+    /* SATA SSDs and hard disks */
+    for (int i = 0; i < H->nsata; i++) {
+        sata_t *d = &H->sata[i];
+        char k[32], sum[200];
+        int lvl;
+        sfmt(k, sizeof k, "Drive %s", d->name);
+        sata_summary(d, sum, sizeof sum, &lvl, ", ", DEG);
+        const char *what = d->rotational ? "hard disk" : "SSD";
+        if (d->state != 1 && !(d->state == -3 && d->hours >= 0)) {
+            lc_kv(c, k, A_GRAY, "%s (SATA %s): %s", d->model[0] ? d->model : "drive", what, sum);
+            continue;
+        }
+        lc_kv(c, k, lvl > 1 ? CP(C_CRIT) | A_BOLD : lvl ? CP(C_WARN) | A_BOLD : CP(C_OK) | A_BOLD, "%s (SATA %s): %s",
+              d->model, what, d->failing ? "FAILING" : lvl > 1 ? "bad sectors" : lvl ? "cable errors" : "OK");
+        if (d->state == -3)
+            lc_kv(c, "", A_GRAY, "%s", "asleep now; these are the figures from when it last spun");
+        lc_kv(c, "", lvl > 1 ? CP(C_CRIT) : A_NORMAL, "%lld reallocated, %lld pending, %lld uncorrectable sectors",
+              MAX(d->realloc, 0), MAX(d->pending, 0), MAX(d->uncorrect, 0));
+        if (d->crc >= 0)
+            lc_kv(c, "", d->crc > 0 ? CP(C_WARN) : A_GRAY, "%lld cable errors (UDMA CRC)%s", d->crc,
+                  d->crc > 0 ? ": reseat or replace the SATA cable" : "");
+        char line[160] = "";
+        if (d->wear >= 0)
+            app(line, sizeof line, "%d%% of rated wear used, ", d->wear);
+        if (d->hours >= 0)
+            app(line, sizeof line, "%lld h powered on, ", d->hours);
+        if (d->cycles >= 0)
+            app(line, sizeof line, "%lld power cycles, ", d->cycles);
+        if (d->unsafe >= 0)
+            app(line, sizeof line, "%lld power losses, ", d->unsafe);
+        if (d->temp_c > 0)
+            app(line, sizeof line, "now %d%s, ", d->temp_c, DEG);
+        size_t ll = strlen(line);
+        if (ll >= 2)
+            line[ll - 2] = '\0';
+        if (line[0])
+            lc_kv(c, "", A_NORMAL, "%s", line);
+    }
+
+    /* how the last sessions ended, when not normally */
+    char hist[5][160];
+    int nh = session_history(hist, 5);
+    if (nh) {
+        lc_kv(c, "Ended badly", CP(C_WARN) | A_BOLD, "%s", hist[0]);
+        for (int i = 1; i < nh; i++)
+            lc_kv(c, "", A_GRAY, "%s", hist[i]);
     }
 
     /* kernel messages and other events */

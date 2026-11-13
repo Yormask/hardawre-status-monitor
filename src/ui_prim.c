@@ -22,6 +22,7 @@
 #define _GNU_SOURCE
 #include "ui_int.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +36,8 @@ const layout_t *g_lay = &g_default_lay;
 static int g_colors;
 
 const char *const SORT_NAMES[] = { "CPU%", "MEM%", "DISK I/O", "PID", "NAME", "TIME", "GPU%", "FILES" };
-const char *const VIEW_NAMES[] = { "Dashboard", "Processes", "Hardware", "Setup", "Logging", "Services" };
+const char *const VIEW_NAMES[] = { "Dashboard", "Processes", "Hardware", "Setup",
+                                   "Logging",   "Services",  "Events",   "History" };
 
 static const char *const BLK[9] = { " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
 static const char *const HB[8] = { "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };
@@ -62,6 +64,108 @@ int ui_init(int utf8)
         use_default_colors();
     }
     return 0;
+}
+
+/* One value per column (NAN = no data), scaled lo..hi, drawn with the
+ * eighth blocks whatever the graph style: the log viewer's graphs. */
+void graph_cols(int y, int x, int h, int w, const float *v, double lo, double hi, attr_t a, int hl, attr_t ha)
+{
+    double span = hi - lo > 0 ? hi - lo : 1;
+    for (int c = 0; c < w; c++) {
+        if (isnan(v[c]))
+            continue;
+        attrset(c == hl ? ha : a);
+        double f = CLAMP((v[c] - lo) / span, 0.0, 1.0);
+        int lv = (int)(f * h * 8 + 0.5);
+        if (lv == 0 && v[c] > lo)
+            lv = 1; /* above the floor: show a sliver */
+        for (int r = 0; r < h; r++) {
+            int k = MIN(lv - r * 8, 8);
+            if (k <= 0)
+                break;
+            mvaddstr(y + h - 1 - r, x + c, U ? BLK[k] : k >= 4 ? "|" : ".");
+        }
+    }
+    attrset(A_NORMAL);
+}
+
+/* a paragraph over up to maxl lines, broken between words; returns the lines used */
+int wrap_text(int y, int x, int w, int maxl, attr_t a, const char *t)
+{
+    int n = 0;
+    while (*t && n < maxl && w > 0) {
+        while (*t == ' ')
+            t++;
+        size_t nb = utf8_bytes_for_cols(t, w);
+        if (t[nb] && nb) { /* break at the last space that fits */
+            size_t b = nb;
+            while (b > 0 && t[b] != ' ')
+                b--;
+            if (b > 0)
+                nb = b;
+        }
+        if (!nb)
+            break;
+        put(y + n, x, w, a, "%.*s", (int)nb, t);
+        t += nb;
+        n++;
+    }
+    return n;
+}
+
+/* "key label" for a line of hints; clicking it presses the key. Returns
+ * the columns used (0 when it doesn't fit before maxx). */
+int key_hint(int y, int x, int maxx, const char *key, const char *label, int code)
+{
+    int need = utf8_cols(key) + utf8_cols(label) + 3;
+    if (x + need > maxx)
+        return 0;
+    int w = put(y, x, maxx - x, A_BOLD, "%s", key);
+    w += put(y, x + w, maxx - x - w, A_GRAY, " %s  ", label);
+    if (code)
+        hit_add(y, x, 1, w - 2, HIT_KEY, code, 0);
+    return w;
+}
+
+/* ---------------------------------------------------------------- mouse */
+
+void ui_mouse(int on)
+{
+#ifdef BUTTON5_PRESSED
+    mmask_t m = BUTTON1_PRESSED | BUTTON4_PRESSED | BUTTON5_PRESSED;
+#else
+    mmask_t m = BUTTON1_PRESSED | BUTTON4_PRESSED;
+#endif
+    mousemask(on ? m : 0, NULL);
+    mouseinterval(0); /* report presses straight away; double clicks are timed by hand */
+}
+
+/* Clickable areas, registered while a frame is drawn. A click goes to the
+ * last area added that contains it, so overlays (dialogs) win. */
+#define MAX_HITS 1024
+static hit_t g_hits[MAX_HITS];
+static int g_nhits;
+
+void hit_reset(void)
+{
+    g_nhits = 0;
+}
+
+void hit_add(int y, int x, int h, int w, int kind, int a, int b)
+{
+    if (g_nhits >= MAX_HITS || h <= 0 || w <= 0)
+        return;
+    g_hits[g_nhits++] = (hit_t){ y, x, h, w, kind, a, b };
+}
+
+const hit_t *hit_at(int y, int x)
+{
+    for (int i = g_nhits - 1; i >= 0; i--) {
+        const hit_t *t = &g_hits[i];
+        if (y >= t->y && y < t->y + t->h && x >= t->x && x < t->x + t->w)
+            return t;
+    }
+    return NULL;
 }
 
 void ui_end(void)
@@ -229,6 +333,22 @@ attr_t bar_attr(double p)
 attr_t bar_temp_attr(double t)
 {
     return bar_attr(t >= 85 ? 100 : t >= 70 ? 70 : 0);
+}
+
+/* with your own limit: red from the limit, yellow from 10 below it */
+static double lim_scale(double t, double lim)
+{
+    return lim <= 0 ? t : t >= lim ? 85 : t >= lim - 10 ? 70 : 0;
+}
+
+attr_t temp_attr_lim(double t, double lim)
+{
+    return temp_attr(lim_scale(t, lim));
+}
+
+attr_t bar_temp_attr_lim(double t, double lim)
+{
+    return bar_temp_attr(lim_scale(t, lim));
 }
 
 attr_t graph_attr(double p)
