@@ -664,9 +664,16 @@ static void summary_build(void)
         int throttled = thro.n && thro.hi > 0;
         if (thro.n)
             app(line, sizeof line, throttled ? "; throttled by heat, at worst %.0f%% of a sample" : "; never throttled", thro.hi);
+        /* its power limit, rather than heat (logs from 1.9 on, run as root) */
+        st_t plim = stats(col_named("CPU held back by power limit"), ct, thr);
+        double held = plim.n ? avg(plim) : 0;
+        if (held >= 1)
+            app(line, sizeof line, "; held back by its power limit %.0f%% of its busy time", held);
         sum_add(throttled, "%s", line);
         if (temp.n)
             app(dg, sizeof dg, "CPU up to %.0f%s%s", temp.hi, deg, thro.n ? (throttled ? ", throttled" : ", no throttling") : "");
+        if (temp.n && held >= 5)
+            app(dg, sizeof dg, ", power-limited %.0f%% of its busy time", held);
     }
 
     /* the GPUs: "GPU1 load" ... or "GPU load" on machines with one */

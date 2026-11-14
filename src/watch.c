@@ -61,6 +61,8 @@ void watch_start(sys_t *s, ui_state_t *u, const char *mode, int tui)
 {
     W.tui = tui;
     freeze_start();
+    netq_set(u->net_check, u->net_check_host);
+    netq_read(&s->net.q); /* on now: the logs' columns include it */
     str_copy(g_log.dir, sizeof g_log.dir, config_log_dir(u));
     if (!g_log.nchan)
         log_build_channels(s, u->log_skip);
@@ -105,5 +107,6 @@ void watch_end(void)
     rec_end(1);
     history_end();
     session_end();
+    netq_set(0, NULL);
     W.started = 0;
 }

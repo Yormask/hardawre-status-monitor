@@ -183,6 +183,20 @@ static void cpu(sys_t *s)
         boolean("turbo", c->turbo);
     else
         null_("turbo");
+    const cpulim_t *L = &s->power.lim;
+    if (L->ok) { /* what applies: the lower of the CPU's and the firmware's */
+        open_("power_limit", '{');
+        pos("sustained_w", L->eff_long_w, 1);
+        pos("sustained_window_s", L->long_s, 3);
+        pos("boost_w", L->eff_short_w, 1);
+        if (s->health.pl_known)
+            boolean("holding_back", s->health.pl_now != 0);
+        else
+            null_("holding_back");
+        close_('}');
+    } else {
+        null_("power_limit");
+    }
     open_("per_core", '[');
     for (int i = 0; i < c->ncpu; i++) {
         int id = c->id[i];
@@ -235,6 +249,12 @@ static void gpus(sys_t *s)
         if (g->nv_state != NV_NONE) {
             s_("state", g->nv_state == NV_ASLEEP ? "asleep" : g->nv_state == NV_IDLE ? "idle" : "awake");
             pos("temp_limit_c", g->temp_lim, 0);
+            pos("video_encode_pct", g->enc_pct, 0);
+            pos("video_decode_pct", g->dec_pct, 0);
+            pos("pcie_gen", g->pcie_gen > 0 ? g->pcie_gen : -1, 0);
+            pos("pcie_width", g->pcie_width > 0 ? g->pcie_width : -1, 0);
+            pos("pcie_gen_max", g->pcie_gen_max > 0 ? g->pcie_gen_max : -1, 0);
+            pos("pcie_width_max", g->pcie_width_max > 0 ? g->pcie_width_max : -1, 0);
         }
         if (g->reasons_ok) {
             boolean("slowed_by_heat", (g->slow_now & GS_HEAT) != 0);
@@ -348,6 +368,30 @@ static void network(sys_t *s)
         close_('}');
     }
     close_(']');
+}
+
+/* the network check: pings to the router and the internet, null while it's off */
+static void network_check(sys_t *s)
+{
+    const netq_t *q = &s->net.q;
+    if (!q->on) {
+        null_("network_check");
+        return;
+    }
+    static const char *const nm[NQ_COUNT] = { "router", "internet" };
+    open_("network_check", '{');
+    for (int k = 0; k < NQ_COUNT; k++) {
+        const nqt_t *t = &q->t[k];
+        open_(nm[k], '{');
+        sn("address", t->addr);
+        pos("ping_ms", t->rtt_ms, 1);
+        pos("average_ms", t->avg_ms, 1);
+        pos("jitter_ms", t->jitter_ms, 1);
+        pos("lost_pct", t->loss_pct, 0);
+        boolean("trouble", t->trouble != NQ_FINE);
+        close_('}');
+    }
+    close_('}');
 }
 
 static void sensors(sys_t *s)
@@ -570,6 +614,9 @@ static void processes(sys_t *s, int nproc)
             else
                 null_("open_files");
             num("cpu_time_s", ps->hz > 0 ? (double)p->ticks / (double)ps->hz : NAN, 2);
+            int flagged, busy = runaway_minutes(p->pid, p->start, &flagged);
+            integer("busy_minutes", busy); /* a whole core or more, without a break */
+            boolean("runaway", flagged);
             sn("command", p->kthread ? "" : proc_cmdline(p));
             close_('}');
         }
@@ -598,12 +645,30 @@ void json_write(FILE *f, sys_t *s, int nproc)
     s_("arch", s->arch);
     num("uptime_s", s->cpu.uptime, 0);
     boolean("root", geteuid() == 0);
+    if (s->mach.ok) {
+        const machine_t *mc = &s->mach;
+        char d[16] = "";
+        if (mc->bios_date)
+            sfmt(d, sizeof d, "%04d-%02d-%02d", mc->bios_date / 10000, mc->bios_date / 100 % 100, mc->bios_date % 100);
+        open_("machine", '{');
+        sn("vendor", mc->vendor);
+        sn("model", mc->model);
+        sn("type", mc->type);
+        sn("board", mc->board);
+        sn("bios_vendor", mc->bios_vendor);
+        sn("bios_version", mc->bios_version);
+        sn("bios_date", d);
+        close_('}');
+    } else {
+        null_("machine");
+    }
     cpu(s);
     memory(s);
     gpus(s);
     power(s);
     storage(s);
     network(s);
+    network_check(s);
     sensors(s);
     health(s);
     services(s);

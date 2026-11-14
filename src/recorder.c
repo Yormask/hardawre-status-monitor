@@ -221,9 +221,9 @@ static int is_trigger(const event_t *e)
         return 1;
     /* warnings too (throttling, low memory, slow disk, freezes...), but not
      * the corrected PCIe errors some machines report all day long, a Wi-Fi
-     * that comes and goes, or a slowly growing process */
+     * that comes and goes, or a slowly growing or long-busy process */
     return e->level == EV_WARN && strcmp(e->cat, "pcie") && strcmp(e->cat, "shutdown") && strcmp(e->cat, "net") &&
-           strcmp(e->cat, "leak");
+           strcmp(e->cat, "leak") && strcmp(e->cat, "runaway");
 }
 
 static void incident_start(const health_t *h, const event_t *e, double mono)

@@ -488,6 +488,60 @@ typedef struct {
     double (*get)(const hday_t *);
 } metric_t;
 
+/* "40 s", "25 min", "2.2 h" */
+static void fmt_busy(double s, char *out, size_t n)
+{
+    if (s < 90)
+        sfmt(out, n, "%.0f s", s);
+    else if (s < 90 * 60)
+        sfmt(out, n, "%.0f min", s / 60);
+    else
+        sfmt(out, n, "%.1f h", s / 3600);
+}
+
+/* what ran on the selected day: the programs that used the most */
+static void day_programs(const hday_t *d, int y, int x, int h, int w)
+{
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = d->day / 10000 - 1900;
+    tm.tm_mon = d->day / 100 % 100 - 1;
+    tm.tm_mday = d->day % 100;
+    tm.tm_hour = 12;
+    mktime(&tm);
+    char dl[24];
+    strftime(dl, sizeof dl, "%a %d %b", &tm);
+    prog_day_t pd;
+    if (h < 1)
+        return;
+    if (prog_get_day(d->day, &pd) != 0) {
+        put(y, x, w, A_GRAY, "No programs counted on %s (hsm 1.9 and later count them while it keeps the history)", dl);
+        return;
+    }
+    put(y, x, w, A_GRAY | A_BOLD, "What ran on %s, by", dl);
+    static const char *const kind[PROG_KINDS] = { "CPU time", "GPU time", "Written" };
+    int lw = 12;
+    for (int k = 0, r = 1; k < PROG_KINDS && r < h + 1; k++) {
+        if (!pd.n[k])
+            continue;
+        int yy = y + r++, xx = x + lw, xm = x + w;
+        put(yy, x + 2, lw - 2, CP(C_INFO), "%s", kind[k]);
+        for (int i = 0; i < pd.n[k]; i++) {
+            char v[24], item[64];
+            if (k == 2)
+                fmt_bytes(pd.top[k][i].v, v, sizeof v);
+            else
+                fmt_busy(pd.top[k][i].v, v, sizeof v);
+            sfmt(item, sizeof item, "%s%s ", i ? SEP : "", pd.top[k][i].name);
+            int need = utf8_cols(item) + utf8_cols(v);
+            if (xx + need > xm)
+                break;
+            xx += put(yy, xx, xm - xx, A_BOLD, "%s", item);
+            xx += put(yy, xx, xm - xx, A_NORMAL, "%s", v);
+        }
+    }
+}
+
 static double g_temp_max(const hday_t *d) { return d->temp_max; }
 static double g_temp_avg(const hday_t *d) { return d->temp_avg; }
 static double g_cpu_avg(const hday_t *d) { return d->cpu_avg; }
@@ -648,11 +702,21 @@ void history_view(sys_t *s, ui_state_t *u)
     if (xx < ix + iw)
         fill(y0, xx, ix + iw - xx, CP(C_THEAD));
     int rows = iy + ih - y0 - 1;
+    int prog_h = rows >= 8 ? 5 : 0; /* the selected day's programs, below the list */
+    rows -= prog_h;
+    u->hist_sel = CLAMP(u->hist_sel, 0, n - 1);
+    if (u->hist_sel < u->hist_scroll)
+        u->hist_scroll = u->hist_sel;
+    if (u->hist_sel >= u->hist_scroll + rows)
+        u->hist_scroll = u->hist_sel - rows + 1;
     u->hist_scroll = CLAMP(u->hist_scroll, 0, MAX(0, n - rows));
     hit_add(y0 + 1, ix, rows, iw, HIT_SCROLL, 0, 0);
     for (int r = 0; r < rows && u->hist_scroll + r < n; r++) {
         const hday_t *d = &D[n - 1 - u->hist_scroll - r];
-        int y = y0 + 1 + r, cx = ix;
+        int y = y0 + 1 + r, cx = ix, sel = u->hist_scroll + r == u->hist_sel;
+        hit_add(y, ix, 1, iw, HIT_HIST, u->hist_scroll + r, 0);
+        if (sel)
+            fill(y, ix, iw, CP(C_SEL));
         struct tm tm;
         memset(&tm, 0, sizeof tm);
         tm.tm_year = d->day / 10000 - 1900;
@@ -669,7 +733,7 @@ void history_view(sys_t *s, ui_state_t *u)
         for (int c = 0; c < nc && cx + C[c].w <= ix + iw; c++) {
             int w = C[c].w;
             if (!c) {
-                put(y, cx, w, d->hours > 0 ? A_BOLD : A_GRAY, "%-*s", w, dl);
+                put(y, cx, w, sel ? CP(C_SEL) | A_BOLD : d->hours > 0 ? A_BOLD : A_GRAY, "%-*s", w, dl);
                 cx += w + 1;
                 continue;
             }
@@ -700,11 +764,15 @@ void history_view(sys_t *s, ui_state_t *u)
                 str_copy(t, sizeof t, "-");
                 a = A_GRAY;
             }
+            if (sel)
+                a = CP(C_SEL);
             int tc = utf8_cols(t);
             put(y, cx + MAX(0, w - tc), MIN(w, tc), a, "%s", t);
             cx += w + 1;
         }
     }
+    if (prog_h)
+        day_programs(&D[n - 1 - u->hist_sel], y0 + 1 + rows + 1, ix, prog_h - 1, iw);
     if (n > rows) {
         char m[32];
         sfmt(m, sizeof m, " %s more ", U ? "↑↓" : "up/down");
@@ -715,15 +783,21 @@ void history_view(sys_t *s, ui_state_t *u)
 
 int history_key(ui_state_t *u, int ch)
 {
-    switch (ch) {
-    case KEY_UP: u->hist_scroll--; break;
-    case KEY_DOWN: u->hist_scroll++; break;
-    case KEY_PPAGE: u->hist_scroll -= 10; break;
-    case KEY_NPAGE: u->hist_scroll += 10; break;
-    case KEY_HOME: u->hist_scroll = 0; break;
+    switch (ch) { /* the view keeps the selection within the days and in sight */
+    case KEY_UP: u->hist_sel--; break;
+    case KEY_DOWN: u->hist_sel++; break;
+    case KEY_PPAGE: u->hist_sel -= 10; break;
+    case KEY_NPAGE: u->hist_sel += 10; break;
+    case KEY_HOME: u->hist_sel = 0; break;
+    case KEY_END: u->hist_sel = 1 << 20; break;
     default: return 0;
     }
-    if (u->hist_scroll < 0)
-        u->hist_scroll = 0;
+    if (u->hist_sel < 0)
+        u->hist_sel = 0;
     return 1;
+}
+
+void history_click(ui_state_t *u, int k)
+{
+    u->hist_sel = k;
 }

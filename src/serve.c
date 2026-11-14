@@ -117,6 +117,20 @@ void metrics_write(FILE *f, sys_t *s)
     char b[32];
     help("up", "gauge", "1 while hsm runs");
     plain("up", 1);
+    if (s->mach.ok) { /* an info metric: the labels say it */
+        const machine_t *mc = &s->mach;
+        char d[16] = "";
+        if (mc->bios_date)
+            sfmt(d, sizeof d, "%04d-%02d-%02d", mc->bios_date / 10000, mc->bios_date / 100 % 100, mc->bios_date % 100);
+        help("machine_info", "gauge", "the machine as its firmware describes it");
+        fputs("hsm_machine_info{", M);
+        lab("vendor", mc->vendor, 1);
+        lab("model", mc->model, 1);
+        lab("bios_version", mc->bios_version, 1);
+        lab("bios_date", d, 0);
+        fputc('}', M);
+        val(1);
+    }
     char al[64];
     int lvl = health_alert(&s->health, al, sizeof al);
     help("health_status", "gauge", "0 fine, 1 warning, 2 problem (as the screen's badge)");
@@ -193,6 +207,21 @@ void metrics_write(FILE *f, sys_t *s)
                 if (s->gpus.g[i].nv_state != NV_NONE) {
                     sfmt(b, sizeof b, "%d", i);
                     one("gpu_asleep", "gpu", b, s->gpus.g[i].nv_state == NV_ASLEEP ? 1 : 0);
+                }
+            help("gpu_video_percent", "gauge", "video encoder / decoder busy");
+            for (int i = 0; i < s->gpus.n; i++)
+                if (s->gpus.g[i].nv_state != NV_NONE) {
+                    sfmt(b, sizeof b, "%d", i);
+                    two("gpu_video_percent", "gpu", b, "engine", "encode", nn(s->gpus.g[i].enc_pct));
+                    two("gpu_video_percent", "gpu", b, "engine", "decode", nn(s->gpus.g[i].dec_pct));
+                }
+            help("gpu_pcie_link", "gauge", "the GPU's PCIe link now: generation and width (lanes)");
+            for (int i = 0; i < s->gpus.n; i++)
+                if (s->gpus.g[i].nv_state != NV_NONE) {
+                    const gpu_t *g = &s->gpus.g[i];
+                    sfmt(b, sizeof b, "%d", i);
+                    two("gpu_pcie_link", "gpu", b, "what", "generation", g->pcie_gen > 0 ? g->pcie_gen : NAN);
+                    two("gpu_pcie_link", "gpu", b, "what", "width", g->pcie_width > 0 ? g->pcie_width : NAN);
                 }
         }
     }
@@ -288,6 +317,17 @@ void metrics_write(FILE *f, sys_t *s)
             if (s->net.i[i].link_downs >= 0)
                 one("network_link_drops_total", "interface", s->net.i[i].name, (double)s->net.i[i].link_downs);
     }
+    if (s->net.q.on && !s->net.q.err) { /* the network check */
+        static const char *const nm[NQ_COUNT] = { "router", "internet" };
+        help("ping_seconds", "gauge", "the latest ping's delay (NaN: lost)");
+        for (int k = 0; k < NQ_COUNT; k++)
+            if (s->net.q.t[k].addr[0])
+                one("ping_seconds", "target", nm[k], s->net.q.t[k].rtt_ms >= 0 ? s->net.q.t[k].rtt_ms / 1000.0 : NAN);
+        help("ping_loss_ratio", "gauge", "pings lost over the last minute");
+        for (int k = 0; k < NQ_COUNT; k++)
+            if (s->net.q.t[k].addr[0])
+                one("ping_loss_ratio", "target", nm[k], s->net.q.t[k].loss_pct >= 0 ? s->net.q.t[k].loss_pct / 100.0 : NAN);
+    }
 
     /* health */
     const health_t *h = &s->health;
@@ -304,6 +344,18 @@ void metrics_write(FILE *f, sys_t *s)
         help("throttle_events_total", "counter", "thermal throttling events since boot");
         plain("throttle_events_total", (double)(h->thr_count + h->core_count));
     }
+    const cpulim_t *L = &s->power.lim;
+    if (L->ok) {
+        help("cpu_power_limit_watts", "gauge", "how much the CPU package may draw (the lower of the CPU's and the firmware's)");
+        if (L->eff_long_w > 0)
+            one("cpu_power_limit_watts", "limit", "sustained", L->eff_long_w);
+        if (L->eff_short_w > 0)
+            one("cpu_power_limit_watts", "limit", "boost", L->eff_short_w);
+        if (h->pl_known) {
+            help("cpu_power_limited", "gauge", "1 while the power limit, not heat, holds the CPU's clock back");
+            plain("cpu_power_limited", h->pl_now ? 1 : 0);
+        }
+    }
     if (h->aer_ok) {
         help("pcie_errors_total", "counter", "PCIe errors since boot");
         one("pcie_errors_total", "severity", "corrected", (double)h->pci_cor);
@@ -312,6 +364,8 @@ void metrics_write(FILE *f, sys_t *s)
     }
     help("freezes_total", "counter", "times the whole system stood still for 2 s or more, since hsm started");
     plain("freezes_total", h->freezes);
+    help("runaway_processes", "gauge", "processes that have kept a whole core busy for 15 minutes or more without a break");
+    plain("runaway_processes", runaway_count());
     help("frozen_seconds_total", "counter", "seconds the system stood still, since hsm started");
     plain("frozen_seconds_total", h->frozen_total);
     if (h->kmsg == 1) {

@@ -29,6 +29,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -912,19 +913,105 @@ static void freeze_cause(const health_t *h, const procs_t *ps, char *out, size_t
     }
 }
 
-static void freeze_events(health_t *h, const procs_t *ps, double now)
+/* ---------------------------------------------- sleep and the battery */
+
+#define WAKE_SETTLE 5.0 /* s after waking before the battery's charge is read again */
+
+static void bat_snap(const power_t *p, batsnap_t *o)
+{
+    double pct = 0, wh = 0, full = 0;
+    int n = 0, nwh = 0, nfull = 0, busy = 0;
+    memset(o, 0, sizeof *o);
+    o->wh = -1;
+    for (int i = 0; i < p->nbat; i++) {
+        const battery_t *b = &p->bat[i];
+        if (b->capacity < 0)
+            continue;
+        n++;
+        pct += b->capacity;
+        if (!strcmp(b->status, "Charging") || !strcmp(b->status, "Full") || !strcmp(b->status, "Not charging"))
+            busy = 1;
+        if (b->energy_wh >= 0) {
+            wh += b->energy_wh;
+            nwh++;
+        }
+        if (b->energy_full_wh > 0) {
+            full += b->energy_full_wh;
+            nfull++;
+        }
+    }
+    if (!n)
+        return;
+    o->ok = 1;
+    o->charger = p->ac_online == 1 || (p->ac_online < 0 && busy);
+    o->pct = pct / n;
+    if (nwh == n) {
+        o->wh = wh;
+        if (n > 1 && nfull == n) /* two batteries: the share of what both can hold */
+            o->pct = CLAMP(100.0 * wh / full, 0, 100);
+    }
+}
+
+/* what the batteries lost while the computer slept, for the "woke up" event */
+static void sleep_battery(const batsnap_t *a, const batsnap_t *b, double dur, char *out, size_t n)
+{
+    out[0] = '\0';
+    if (!a->ok || !b->ok)
+        return;
+    long pa = lround(a->pct), pb = lround(b->pct);
+    if (a->charger || b->charger) {
+        if (pb > pa)
+            sfmt(out, n, "; the battery charged from %ld%% to %ld%%", pa, pb);
+        return;
+    }
+    if (pb == pa) {
+        if (dur >= 1800) /* a long sleep that cost nothing worth a percent */
+            sfmt(out, n, "; the battery stayed at %ld%%", pb);
+        return;
+    }
+    if (pb > pa) { /* the gauge settled after a rest; no rate to give */
+        sfmt(out, n, "; the battery went from %ld%% to %ld%%", pa, pb);
+        return;
+    }
+    char rate[64] = "";
+    double hours = dur / 3600.0;
+    if (dur >= 1200) { /* long enough for a rate to mean something */
+        double w = a->wh >= 0 && b->wh >= 0 && a->wh >= b->wh ? (a->wh - b->wh) / hours : -1;
+        if (w >= 0)
+            sfmt(rate, sizeof rate, ", %.1f%% an hour (%.*f W)", (a->pct - b->pct) / hours, w < 1 ? 2 : 1, w);
+        else
+            sfmt(rate, sizeof rate, ", %.1f%% an hour", (a->pct - b->pct) / hours);
+    }
+    sfmt(out, n, "; the battery went from %ld%% to %ld%%%s", pa, pb, rate);
+}
+
+static void wake_tell(health_t *h, const batsnap_t *post)
+{
+    char d[24], a[16], b[16], bat[128];
+    fmt_duration(h->wake.dur, d, sizeof d);
+    clock_hm(h->wake.wall, a, sizeof a);
+    clock_hm(h->wake.wall + h->wake.dur, b, sizeof b);
+    sleep_battery(&h->wake.pre, post, h->wake.dur, bat, sizeof bat);
+    health_event(h, EV_INFO, "power", "Woke up after %s asleep (suspended at %s, woke at %s)%s", d, a, b, bat);
+    h->wake.on = 0;
+}
+
+static void freeze_events(health_t *h, const procs_t *ps, double now, double mono)
 {
     fz_t z;
     while (freeze_take(&z)) {
-        char d[24], a[16], b[16];
         if (z.kind == FZ_SUSPEND) {
             h->suspends++;
             h->asleep_total += z.dur;
             h->resume_t = now;
-            fmt_duration(z.dur, d, sizeof d);
-            clock_hm(z.wall, a, sizeof a);
-            clock_hm(z.wall + z.dur, b, sizeof b);
-            health_event(h, EV_INFO, "power", "Woke up after %s asleep (suspended at %s, woke at %s)", d, a, b);
+            if (h->wake.on) /* slept again before the last wake-up was told */
+                wake_tell(h, &h->bat_prev);
+            /* told a few seconds later, once the battery has reported its charge again */
+            h->wake.on = 1;
+            h->wake.dur = z.dur;
+            h->wake.wall = z.wall;
+            h->wake.due = mono + WAKE_SETTLE;
+            h->wake.pre = h->bat_prev;
             if (h->susp_ok) /* a suspend that went well: not a failure to explain a freeze with */
                 suspend_fails(&h->susp_fail);
             continue;
@@ -1229,6 +1316,118 @@ static void gpu_events(health_t *h, gpus_t *gs, const procs_t *ps, double now, d
     }
 }
 
+/* ---------------------------------------------- the network check */
+
+/* troubles found by the pings: the router (the local link, Wi-Fi or cable)
+ * or only the internet (beyond your network); told when they start and end */
+static void netq_events(health_t *h, const net_t *nt, double now)
+{
+    const netq_t *q = &nt->q;
+    if (!q->on)
+        return;
+    int wifi = 0;
+    for (int i = 0; i < nt->n; i++)
+        if (!strcmp(nt->i[i].name, q->iface))
+            wifi = nt->i[i].wireless;
+    char link[48];
+    if (wifi)
+        str_copy(link, sizeof link, "Wi-Fi");
+    else if (q->iface[0])
+        sfmt(link, sizeof link, "Network (%s)", q->iface);
+    else
+        str_copy(link, sizeof link, "Network");
+    for (int k = 0; k < NQ_COUNT; k++) {
+        const nqt_t *t = &q->t[k];
+        if (t->trouble && t->episode != h->nq_seen[k]) { /* a new one */
+            h->nq_seen[k] = t->episode;
+            /* the router too: that's the local link's trouble, told by its own event */
+            if (k == NQ_NET && q->t[NQ_ROUTER].trouble)
+                continue;
+            h->nq_open[k] = 1;
+            char what[96];
+            if (t->trouble == NQ_LOSS)
+                sfmt(what, sizeof what, "%.0f%% of the pings to %s are lost", t->worst_loss,
+                     k == NQ_ROUTER ? "the router" : t->addr);
+            else if (t->normal_ms > 0)
+                sfmt(what, sizeof what, "%s answers in %.0f ms, normally %.0f ms", k == NQ_ROUTER ? "the router" : t->addr,
+                     t->worst_ms, t->normal_ms);
+            else
+                sfmt(what, sizeof what, "%s answers in %.0f ms", k == NQ_ROUTER ? "the router" : t->addr, t->worst_ms);
+            if (k == NQ_ROUTER)
+                health_event(h, EV_WARN, "net", "%s trouble: %s (%s)", link, what, t->addr);
+            else
+                health_event(h, EV_WARN, "net", "Internet trouble: %s, while the router answers normally: it's beyond your network",
+                             what);
+        } else if (h->nq_open[k] && !t->trouble) { /* over */
+            h->nq_open[k] = 0;
+            char d[24] = "";
+            if (t->until > t->since && t->since > 0)
+                fmt_duration(t->until - t->since, d, sizeof d);
+            health_event(h, EV_INFO, "net", "%s back to normal%s%s", k == NQ_ROUTER ? link : "Internet",
+                         d[0] ? " after " : "", d);
+        }
+    }
+    (void)now;
+}
+
+/* ------------------------------------------------- CPU power limits */
+
+/* The CPU held back by its power limit rather than by heat: the package
+ * draws what the limit allows while its clocks stay below what they can do.
+ * A sustained limit is an average, so the package sits close to it; above
+ * it, up to the boost limit, the CPU is still boosting freely. */
+static void power_limit_sample(health_t *h, const sys_t *s, double dt, double now, double mono)
+{
+    const power_t *p = &s->power;
+    const cpulim_t *L = &p->lim;
+    const cpu_t *c = &s->cpu;
+    double lw = L->eff_long_w, sw = L->eff_short_w;
+    h->pl_known = L->ok && p->pkg_w >= 0;
+    if (!h->pl_known) {
+        h->pl_now = 0;
+        h->pl_since = 0;
+        return;
+    }
+    int busy = c->total >= 10;
+    int hot = h->thr_last > 0 && now - h->thr_last < 10;   /* that's heat, said elsewhere */
+    int slow = c->hw_max <= 0 || c->mhz_max <= 0 || c->mhz_max < 0.95 * c->hw_max;
+    int at = 0;
+    if (busy && !hot && slow) {
+        if (sw > 0 && p->pkg_w >= 0.93 * sw)
+            at = PL_SHORT;
+        else if (lw > 0 && p->pkg_w >= 0.93 * lw && p->pkg_w <= 1.07 * lw)
+            at = PL_LONG;
+    }
+    if (at) {
+        h->pl_last = mono;
+        h->pl_kind = at;
+        if (!h->pl_since)
+            h->pl_since = mono;
+    } else if (h->pl_since && mono - h->pl_last >= 3) { /* a stretch ends after 3 s off the limit */
+        h->pl_since = 0;
+        h->pl_told = 0;
+    }
+    h->pl_now = h->pl_since && mono - h->pl_since >= 3 ? h->pl_kind : 0;
+    if (busy)
+        h->pl_busy_s += dt;
+    if (h->pl_now)
+        h->pl_held_s += dt;
+    /* an event once a stretch has lasted 10 s, at most every half hour: on a
+     * laptop under load this is normal, but it explains a slow CPU */
+    if (h->pl_now && !h->pl_told && mono - h->pl_since >= 10 && now - h->pl_ev_t >= 1800) {
+        char who[80];
+        h->pl_told = 1;
+        h->pl_ev_t = now;
+        health_blame(&s->procs, BLAME_CPU, who, sizeof who);
+        if (h->pl_now == PL_SHORT)
+            health_event(h, EV_INFO, "cpu", "The CPU is held back by its power limit for boosts (%.0f W), not by heat%s",
+                         sw, who);
+        else
+            health_event(h, EV_INFO, "cpu", "The CPU is held back by its sustained power limit (%.0f W), not by heat%s",
+                         lw, who);
+    }
+}
+
 /* the slowest check of this sample, for "reading X took 3 s" */
 static void slow_part(health_t *h, double t0, const char *what)
 {
@@ -1270,13 +1469,21 @@ void health_sample(sys_t *s)
     kmsg_sample(h);
     slow_part(h, t0, "the kernel log");
     temp_events(h, &s->sens, &s->procs, now);
-    freeze_events(h, &s->procs, now);
+    freeze_events(h, &s->procs, now, mono);
+    batsnap_t bat;
+    bat_snap(&s->power, &bat);
+    if (h->wake.on && mono >= h->wake.due)
+        wake_tell(h, &bat);
+    h->bat_prev = bat;
     fan_events(h, &s->sens, now, mono);
     limit_events(h, &s->sens, now, mono);
     link_events(h, &s->net, now);
+    netq_events(h, &s->net, now);
     fs_events(h, &s->disks, now);
     gpu_events(h, &s->gpus, &s->procs, now, mono);
+    power_limit_sample(h, s, dt, now, mono);
     leak_sample(s);
+    runaway_sample(s);
 
     if (mono >= h->next_slow) { /* every 5 s */
         h->next_slow = mono + 5.0;

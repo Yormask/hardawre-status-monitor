@@ -53,7 +53,8 @@ enum {
     CH_THROTTLE, CH_PSI, CH_OOM, CH_PCIE, CH_NVME_USED, CH_NVME_MEDIA, CH_NVME_UNSAFE, CH_NVME_WARN,
     CH_SATA_WEAR, CH_SATA_REALLOC, CH_SATA_PENDING, CH_SATA_CRC,
     CH_DISK_RLAT, CH_DISK_WLAT, CH_NET_ERR, CH_NET_SIGNAL, CH_WAKEUPS, CH_CSTATE, CH_FREEZE,
-    CH_GPU_SLOW_HEAT, CH_GPU_SLOW_POWER,
+    CH_GPU_SLOW_HEAT, CH_GPU_SLOW_POWER, CH_CPU_PL, CH_GPU_ENC, CH_GPU_DEC, CH_GPU_PCIE_GEN, CH_GPU_PCIE_W,
+    CH_PING, CH_PING_LOSS,
     CH_EVENTS /* stays last */
 };
 
@@ -141,6 +142,9 @@ void log_build_channels(sys_t *s, const char *skip)
     health_t *H = &s->health;
     if (H->thr_ok)
         add("Health", CH_THROTTLE, 0, "", "%", "CPU throttled (time)", "health.throttled");
+    /* known only with the package's power (root): 100 = held back this sample */
+    if (s->power.lim.ok && s->power.nrapl && !s->power.rapl_denied)
+        add("Health", CH_CPU_PL, 0, "", "%", "CPU held back by power limit", "health.power_limited");
     static const char *const pn[3] = { "CPU", "Memory", "Disk I/O" }, *const pk[3] = { "cpu", "memory", "io" };
     for (int i = 0; i < 3; i++)
         if (H->psi[i].ok) {
@@ -230,6 +234,14 @@ void log_build_channels(sys_t *s, const char *skip)
             add("GPU", CH_GPU_SLOW_HEAT, i, "", "%", lab, "gpu%d.slow_heat", i);
             sfmt(lab, sizeof lab, "%s slowed by power limit", gn);
             add("GPU", CH_GPU_SLOW_POWER, i, "", "%", lab, "gpu%d.slow_power", i);
+            sfmt(lab, sizeof lab, "%s video encode", gn);
+            add("GPU", CH_GPU_ENC, i, "", "%", lab, "gpu%d.encode", i);
+            sfmt(lab, sizeof lab, "%s video decode", gn);
+            add("GPU", CH_GPU_DEC, i, "", "%", lab, "gpu%d.decode", i);
+            sfmt(lab, sizeof lab, "%s PCIe link generation", gn);
+            add("GPU", CH_GPU_PCIE_GEN, i, "", "", lab, "gpu%d.pcie_gen", i);
+            sfmt(lab, sizeof lab, "%s PCIe link width", gn);
+            add("GPU", CH_GPU_PCIE_W, i, "", "lanes", lab, "gpu%d.pcie_width", i);
         }
     }
 
@@ -292,6 +304,12 @@ void log_build_channels(sys_t *s, const char *skip)
             sfmt(lab, sizeof lab, "%s Wi-Fi signal", f->name);
             add("Network", CH_NET_SIGNAL, 0, f->name, "dBm", lab, "net.%s.signal", f->name);
         }
+    }
+    if (s->net.q.on) { /* the network check, when it runs as the log starts */
+        add("Network", CH_PING, NQ_ROUTER, "", "ms", "Router ping", "net.ping.router");
+        add("Network", CH_PING_LOSS, NQ_ROUTER, "", "%", "Router pings lost", "net.ping.router_loss");
+        add("Network", CH_PING, NQ_NET, "", "ms", "Internet ping", "net.ping.internet");
+        add("Network", CH_PING_LOSS, NQ_NET, "", "%", "Internet pings lost", "net.ping.internet_loss");
     }
 
     /* kernel errors, throttling, OOM kills... as text, in the last column */
@@ -434,6 +452,13 @@ double log_chan_value(const sys_t *s, const chan_t *c)
             return NAN;
         return g->slow_now & (c->kind == CH_GPU_SLOW_HEAT ? GS_HEAT : GS_POWER) ? 100 : 0;
     }
+    case CH_CPU_PL: return s->health.pl_known ? (s->health.pl_now ? 100 : 0) : NAN;
+    case CH_PING: return s->net.q.on && c->a < NQ_COUNT ? nn(s->net.q.t[c->a].rtt_ms) : NAN;
+    case CH_PING_LOSS: return s->net.q.on && c->a < NQ_COUNT ? nn(s->net.q.t[c->a].loss_pct) : NAN;
+    case CH_GPU_ENC: return c->a < s->gpus.n ? nn(s->gpus.g[c->a].enc_pct) : NAN;
+    case CH_GPU_DEC: return c->a < s->gpus.n ? nn(s->gpus.g[c->a].dec_pct) : NAN;
+    case CH_GPU_PCIE_GEN: return c->a < s->gpus.n && s->gpus.g[c->a].pcie_gen > 0 ? s->gpus.g[c->a].pcie_gen : NAN;
+    case CH_GPU_PCIE_W: return c->a < s->gpus.n && s->gpus.g[c->a].pcie_width > 0 ? s->gpus.g[c->a].pcie_width : NAN;
     case CH_EVENTS: return (double)s->health.nev;
     }
     return NAN;

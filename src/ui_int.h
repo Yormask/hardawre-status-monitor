@@ -90,6 +90,7 @@ enum {
     HIT_PD,        /* process details: a = PID to open */
     HIT_EVENT,     /* Events view: a = event in the list */
     HIT_DRIVE,     /* drive tests page: a = drive */
+    HIT_HIST,      /* History view: a = day in the list (0 = newest) */
 };
 typedef struct {
     int y, x, h, w, kind, a, b;
@@ -102,6 +103,7 @@ const hit_t *hit_at(int y, int x);
 /* -------------------------------------------------------------- views */
 void dashboard(sys_t *s, ui_state_t *u);
 void dashboard_preview(const layout_t *l, int y, int x, int h, int w, int hl);
+int dashboard_preview_rows(const layout_t *l);
 void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full);
 void hardware(sys_t *s, ui_state_t *u);
 void setup_view(sys_t *s, ui_state_t *u);
@@ -130,6 +132,7 @@ void drives_view(sys_t *s, ui_state_t *u);
 int drives_key(ui_state_t *u, int ch);
 void drives_click(ui_state_t *u, int i);
 void history_view(sys_t *s, ui_state_t *u); /* view 8 */
+void history_click(ui_state_t *u, int k);
 int history_key(ui_state_t *u, int ch);
 void log_click(sys_t *s, ui_state_t *u, int row, int box, int dbl);
 int svc_panel_need(sys_t *s, ui_state_t *u, int w);

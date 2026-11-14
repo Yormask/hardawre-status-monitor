@@ -380,6 +380,10 @@ void pdetail_view(sys_t *s, ui_state_t *u)
         sfmt(a, sizeof a, "%.1f s", cpu_s);
     pl_kv(&c, "CPU", pct_attr(MIN(p->cpu, 100)) | A_BOLD, "%.1f%% now %s %s used in all %s %.1f%% on average", p->cpu,
           SEP, a, SEP, life > 0 ? 100.0 * cpu_s / life : 0);
+    int flagged, busy_min = runaway_minutes(p->pid, p->start, &flagged);
+    if (busy_min >= 5) /* a while at a whole core without a break */
+        pl_kv(&c, "", flagged ? CP(C_WARN) | A_BOLD : A_NORMAL, "a whole core or more for %d minutes without a break%s",
+              busy_min, flagged ? " (see the events)" : "");
     int gy = pl_row(&c), gy2 = pl_row(&c);
     if (gy >= 0 && gy2 == gy + 1) {
         double mx = MAX(100.0, hist_max(&D.cpu, graph_span(iw - 11)));

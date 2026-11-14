@@ -47,16 +47,20 @@
 #define TEMP_FOR 5.0   /* the CPU has to stay above the limit this long */
 #define DISK_FOR 10.0  /* ... a disk this slow this long */
 #define MEM_FOR 5.0
+#define GSLOW_FOR 180.0 /* s of the GPU slowing itself from heat (short breaks don't reset it) */
 
 extern char **environ;
 
-enum { AK_TEMP, AK_THROTTLE, AK_DISK, AK_MEM, AK_FULL, AK_PROBLEM, AK_COUNT };
+enum { AK_TEMP, AK_THROTTLE, AK_DISK, AK_MEM, AK_FULL, AK_PROBLEM, AK_GTEMP, AK_GSLOW, AK_COUNT };
 
 static struct {
     unsigned long seen; /* events already looked at */
     double temp_since, mem_since, disk_since[MAX_DISKS];
     int temp_armed, mem_armed, disk_armed[MAX_DISKS];
     double thr_seen;
+    /* GPUs: above the temperature limit since, slowed by heat (seconds, leaking away when not) */
+    double gtemp_since[MAX_GPUS], gslow_s[MAX_GPUS], gslow_start[MAX_GPUS], gtick;
+    int gtemp_armed[MAX_GPUS], gslow_armed[MAX_GPUS];
     double sent[AK_COUNT];
     char sent_cat[8][12];
     double sent_cat_t[8];
@@ -82,6 +86,8 @@ void alert_init(sys_t *s)
     A.temp_armed = A.mem_armed = 1;
     for (int i = 0; i < MAX_DISKS; i++)
         A.disk_armed[i] = 1;
+    for (int i = 0; i < MAX_GPUS; i++)
+        A.gtemp_armed[i] = A.gslow_armed[i] = 1;
     A.thr_seen = s->health.thr_last;
 }
 
@@ -398,6 +404,62 @@ void alert_tick(sys_t *s, ui_state_t *u, int tui)
         A.temp_since = 0;
         if (lim <= 0 || t < lim - 5) /* cooled down properly: may alert again */
             A.temp_armed = 1;
+    }
+
+    /* GPUs: too hot, or slowing themselves down from heat for minutes */
+    double gdt = A.gtick > 0 ? CLAMP(mono - A.gtick, 0, 10) : 0;
+    A.gtick = mono;
+    int glim = u->alert_gpu_temp;
+    for (int i = 0; i < s->gpus.n && i < MAX_GPUS; i++) {
+        const gpu_t *g = &s->gpus.g[i];
+        double gt = g->temp_c;
+        char gn[16];
+        sfmt(gn, sizeof gn, s->gpus.n > 1 ? "GPU%d" : "GPU", i);
+        if (glim > 0 && gt >= glim) {
+            if (!A.gtemp_since[i])
+                A.gtemp_since[i] = mono;
+            if (A.gtemp_armed[i] && mono - A.gtemp_since[i] >= TEMP_FOR) {
+                A.gtemp_armed[i] = 0;
+                health_blame(&s->procs, BLAME_GPU, who, sizeof who);
+                health_event(h, EV_WARN, "thermal", "%s at %.0f °C, above the alert limit of %d °C%s", gn, gt, glim, who);
+                A.seen = h->ev_seq;
+                if (on && ready(AK_GTEMP, now)) {
+                    char ti[48];
+                    sfmt(ti, sizeof ti, "%s at %.0f °C", gn, gt);
+                    sfmt(body, sizeof body, "Above your limit of %d °C%s.", glim, who);
+                    deliver(u, EV_WARN, ti, body, tui);
+                }
+            }
+        } else {
+            A.gtemp_since[i] = 0;
+            if (glim <= 0 || gt < glim - 5) /* cooled down properly (or asleep): may alert again */
+                A.gtemp_armed[i] = 1;
+        }
+        if (!g->reasons_ok)
+            continue;
+        int heat = (g->slow_now & GS_HEAT) != 0;
+        if (heat && A.gslow_s[i] <= 0)
+            A.gslow_start[i] = mono;
+        A.gslow_s[i] = CLAMP(A.gslow_s[i] + (heat ? gdt : -gdt / 2), 0, 2 * GSLOW_FOR);
+        if (A.gslow_s[i] <= 0)
+            A.gslow_armed[i] = 1; /* a proper break: may alert again */
+        if (u->alert_gpu_slow && A.gslow_armed[i] && A.gslow_s[i] >= GSLOW_FOR) {
+            A.gslow_armed[i] = 0;
+            int min = (int)((mono - A.gslow_start[i]) / 60 + 0.5);
+            char tc[24] = "";
+            if (gt >= 0)
+                sfmt(tc, sizeof tc, " (%.0f °C)", gt);
+            health_blame(&s->procs, BLAME_GPU, who, sizeof who);
+            health_event(h, EV_WARN, "gpu", "%s slowed itself down from heat most of the last %d minutes%s%s", gn, min,
+                         tc, who);
+            A.seen = h->ev_seq;
+            if (on && ready(AK_GSLOW, now)) {
+                char ti[64];
+                sfmt(ti, sizeof ti, "%s slowing down from heat", gn);
+                sfmt(body, sizeof body, "Most of the last %d minutes%s%s. It gives up speed to stay cool.", min, tc, who);
+                deliver(u, EV_WARN, ti, body, tui);
+            }
+        }
     }
 
     /* slow disks: time per request, while it is doing something */

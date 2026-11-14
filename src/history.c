@@ -561,6 +561,7 @@ static void become_writer(sys_t *s)
     load_known(boot);
     H.seen = 0; /* everything in memory, the kernel log's backlog too; the known ones are skipped */
     load_today(log_day_key(wall()));
+    prog_day_start(log_day_key(wall()));
     H.next_flush = now_sec() + FLUSH_EVERY;
 }
 
@@ -598,14 +599,19 @@ void history_tick(sys_t *s)
     int today = log_day_key(wall());
     if (today != H.d.day) { /* midnight: the old day is done */
         flush_day();
+        prog_flush();
         empty_day(&H.d, today);
+        prog_day_start(today);
     }
     write_events(s);
-    if (dt > 0 && dt < 30) /* longer: suspended or paused, not watched */
+    if (dt > 0 && dt < 30) { /* longer: suspended or paused, not watched */
         sample_day(s, dt);
+        prog_sample(s, dt);
+    }
     if (mono >= H.next_flush) {
         H.next_flush = mono + FLUSH_EVERY;
         flush_day();
+        prog_flush();
     }
 }
 
@@ -614,6 +620,7 @@ void history_end(void)
     if (H.fd < 0)
         return;
     flush_day();
+    prog_flush();
     close(H.fd); /* the lock goes with it */
     H.fd = -1;
     free(H.known);

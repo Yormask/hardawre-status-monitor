@@ -81,6 +81,12 @@ static nvret_t (*nv_putil)(nvdev_t, nvpsample_t *, unsigned int *, unsigned long
 static nvret_t (*nv_pci)(nvdev_t, nvpci_t *);
 static nvret_t (*nv_reasons)(nvdev_t, unsigned long long *);
 static nvret_t (*nv_thresh)(nvdev_t, int, unsigned int *);
+static nvret_t (*nv_enc)(nvdev_t, unsigned int *, unsigned int *);
+static nvret_t (*nv_dec)(nvdev_t, unsigned int *, unsigned int *);
+static nvret_t (*nv_lgen)(nvdev_t, unsigned int *);
+static nvret_t (*nv_lwidth)(nvdev_t, unsigned int *);
+static nvret_t (*nv_lgen_max)(nvdev_t, unsigned int *);
+static nvret_t (*nv_lwidth_max)(nvdev_t, unsigned int *);
 
 #define NV_SYM(var, name) (*(void **)(&(var)) = dlsym(nv_lib, name))
 
@@ -117,6 +123,12 @@ static int nvml_lib(void)
     if (!nv_reasons)
         NV_SYM(nv_reasons, "nvmlDeviceGetCurrentClocksThrottleReasons"); /* its old name */
     NV_SYM(nv_thresh, "nvmlDeviceGetTemperatureThreshold");
+    NV_SYM(nv_enc, "nvmlDeviceGetEncoderUtilization");
+    NV_SYM(nv_dec, "nvmlDeviceGetDecoderUtilization");
+    NV_SYM(nv_lgen, "nvmlDeviceGetCurrPcieLinkGeneration");
+    NV_SYM(nv_lwidth, "nvmlDeviceGetCurrPcieLinkWidth");
+    NV_SYM(nv_lgen_max, "nvmlDeviceGetMaxPcieLinkGeneration");
+    NV_SYM(nv_lwidth_max, "nvmlDeviceGetMaxPcieLinkWidth");
     if (!nv_init || !nv_count || !nv_handle) {
         dlclose(nv_lib);
         nv_lib = NULL;
@@ -151,6 +163,20 @@ static void nvml_sample(gpu_t *g)
         g->clk_max_mhz = u;
     if (nv_fan && !nv_fan(d, &u))
         g->fan_pct = u;
+    unsigned int per; /* the encoder's and decoder's sampling period: not needed */
+    if (nv_enc && !nv_enc(d, &u, &per) && u <= 100)
+        g->enc_pct = u;
+    if (nv_dec && !nv_dec(d, &u, &per) && u <= 100)
+        g->dec_pct = u;
+    /* the link: idle cards drop to a slower one to save power, then speed up again */
+    if (nv_lgen && !nv_lgen(d, &u) && u > 0 && u < 10)
+        g->pcie_gen = (int)u;
+    if (nv_lwidth && !nv_lwidth(d, &u) && u > 0 && u <= 32)
+        g->pcie_width = (int)u;
+    if (!g->pcie_gen_max && nv_lgen_max && !nv_lgen_max(d, &u) && u > 0 && u < 10)
+        g->pcie_gen_max = (int)u;
+    if (!g->pcie_width_max && nv_lwidth_max && !nv_lwidth_max(d, &u) && u > 0 && u <= 32)
+        g->pcie_width_max = (int)u;
     unsigned long long r;
     g->reasons = 0;
     if (nv_reasons && !nv_reasons(d, &r)) {
@@ -800,11 +826,14 @@ void gpus_sample(gpus_t *gs, double dt)
         double mt = g->mem_total, cm = g->clk_max_mhz;
         g->util = g->mem_used = g->mem_total = -1;
         g->temp_c = g->power_w = g->power_cap_w = g->clk_mhz = g->mem_clk_mhz = g->fan_pct = g->fan_rpm = -1;
+        g->enc_pct = g->dec_pct = -1;
+        g->pcie_gen = g->pcie_width = 0;
         if (g->nvml) {
             nvml_sample(g);
         } else if (g->nv_state != NV_NONE) {
             /* let go of / asleep: nothing to ask it without waking it */
             g->util = 0;
+            g->enc_pct = g->dec_pct = 0;
             g->power_w = g->nv_state == NV_ASLEEP ? 0 : g->last_power;
             g->mem_total = mt; /* what it has stays known: the panel keeps its shape */
             g->clk_max_mhz = cm;

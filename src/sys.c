@@ -48,6 +48,59 @@ static void read_os_name(char *out, size_t n)
     }
 }
 
+/* a DMI field, or "" for the placeholders firmware leaves in ("To Be Filled By O.E.M.") */
+static void dmi(const char *name, char *out, size_t n)
+{
+    static const char *const junk[] = { "to be filled by o.e.m.", "default string", "system product name",
+                                        "system version", "system manufacturer", "not applicable", "not specified",
+                                        "none", "n/a", "type1productconfigid", "0123456789", "123456789", "x.x",
+                                        "invalid", "oem", "o.e.m.", "unknown", "sku", "base board product name" };
+    char p[PATHBUF];
+    sfmt(p, sizeof p, "%s/class/dmi/id/%s", g_sysfs, name);
+    out[0] = '\0';
+    if (read_line(p, out, n))
+        return;
+    char *a = out;
+    while (*a == ' ')
+        a++;
+    memmove(out, a, strlen(a) + 1);
+    size_t l = strlen(out);
+    while (l && out[l - 1] == ' ')
+        out[--l] = '\0';
+    for (size_t i = 0; i < sizeof junk / sizeof junk[0]; i++)
+        if (!strcasecmp(out, junk[i]))
+            out[0] = '\0';
+}
+
+static void read_machine(machine_t *m)
+{
+    char name[96], ver[64], fam[96], bn[64], bv[64], date[24];
+    memset(m, 0, sizeof *m);
+    dmi("sys_vendor", m->vendor, sizeof m->vendor);
+    dmi("product_name", name, sizeof name);
+    dmi("product_version", ver, sizeof ver);
+    dmi("product_family", fam, sizeof fam);
+    /* Lenovo puts a type code in the name ("10RRS0R700") and the model in the version */
+    if (!strcasecmp(m->vendor, "LENOVO") && (ver[0] || fam[0])) {
+        str_copy(m->model, sizeof m->model, ver[0] ? ver : fam);
+        str_copy(m->type, sizeof m->type, name);
+    } else {
+        str_copy(m->model, sizeof m->model, name[0] ? name : fam);
+    }
+    dmi("board_vendor", bv, sizeof bv);
+    dmi("board_name", bn, sizeof bn);
+    if (bn[0])
+        sfmt(m->board, sizeof m->board, "%s%s%s", bv[0] && strcasecmp(bv, m->vendor) ? bv : "",
+             bv[0] && strcasecmp(bv, m->vendor) ? " " : "", bn);
+    dmi("bios_vendor", m->bios_vendor, sizeof m->bios_vendor);
+    dmi("bios_version", m->bios_version, sizeof m->bios_version);
+    dmi("bios_date", date, sizeof date);
+    int mo, d, y;
+    if (sscanf(date, "%d/%d/%d", &mo, &d, &y) == 3 && y > 1980 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31)
+        m->bios_date = y * 10000 + mo * 100 + d;
+    m->ok = m->model[0] || m->vendor[0] || m->bios_version[0];
+}
+
 void sys_init(sys_t *s)
 {
     struct utsname u;
@@ -58,6 +111,7 @@ void sys_init(sys_t *s)
         str_copy(s->arch, sizeof s->arch, u.machine);
     }
     read_os_name(s->os, sizeof s->os);
+    read_machine(&s->mach);
     s->total_w = -1;
     s->total_w_src = "";
     s->total_why = "";
@@ -188,6 +242,7 @@ void sys_sample(sys_t *s)
     timed(worst, sizeof worst, &wd, t0, "the disk counters");
     t0 = now_sec();
     net_sample(&s->net, dt);
+    netq_read(&s->net.q);
     timed(worst, sizeof worst, &wd, t0, "the network counters");
     t0 = now_sec();
     procs_sample(&s->procs, dt, s->mem.total);

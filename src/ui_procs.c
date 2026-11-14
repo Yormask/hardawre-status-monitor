@@ -319,10 +319,14 @@ static void cell_text(proc_t *p, int k, long hz, char *o, size_t n, attr_t *a)
            : p->state == 'D' || p->state == 'Z' ? CP(C_CRIT) | A_BOLD
            : p->state == 'T' ? CP(C_WARN) : A_GRAY;
         break;
-    case K_CPU:
+    case K_CPU: {
+        int flagged;
         sfmt(o, n, "%.1f", p->cpu);
         *a = p->cpu < 0.05 ? A_GRAY : p->cpu >= 85 ? CP(C_CRIT) | A_BOLD : p->cpu >= 50 ? CP(C_WARN) | A_BOLD : A_BOLD;
+        if (runaway_minutes(p->pid, p->start, &flagged) && flagged) /* busy for a long time: see the events */
+            sfmt(o, n, "%.0f!", p->cpu); /* "100!": the column has room for 5 */
         break;
+    }
     case K_MEM:
         sfmt(o, n, "%.1f", p->mem);
         *a = p->mem < 0.05 ? A_GRAY : p->mem >= 25 ? CP(C_WARN) | A_BOLD : A_NORMAL;

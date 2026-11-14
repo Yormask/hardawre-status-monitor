@@ -131,6 +131,18 @@ void report_print(sys_t *s, int nproc)
 
     fmt_duration(cp->uptime, a, sizeof a);
     printf("%s %s  %s | %s | kernel %s (%s) | up %s\n", APP_NAME, APP_VERSION, s->host, s->os, s->kernel, s->arch, a);
+    const machine_t *mc = &s->mach;
+    if (mc->ok) {
+        printf("machine  %s%s%s%s", mc->model[0] ? mc->model : "?", mc->type[0] ? " (" : "", mc->type, mc->type[0] ? ")" : "");
+        if (mc->vendor[0])
+            printf(" by %s", mc->vendor);
+        if (mc->bios_version[0]) {
+            printf(" | BIOS %s", mc->bios_version);
+            if (mc->bios_date)
+                printf(" (%04d-%02d-%02d)", mc->bios_date / 10000, mc->bios_date / 100 % 100, mc->bios_date % 100);
+        }
+        printf("\n");
+    }
 
     printf("\nCPU         %s, %d cores / %d threads\n", cp->model, cp->cores, cp->threads);
     printf("  usage     %.1f%%  (user %.1f%%, system %.1f%%, iowait %.1f%%, steal %.1f%%)\n", cp->total, cp->user,
@@ -152,6 +164,15 @@ void report_print(sys_t *s, int nproc)
             printf(", %.0f-%.0f MHz", cp->lim_min, cp->lim_max);
         if (cp->profile[0])
             printf(", profile %s", cp->profile);
+        printf("\n");
+    }
+    const cpulim_t *L = &s->power.lim;
+    if (L->ok && (L->eff_long_w > 0 || L->eff_short_w > 0)) {
+        printf("  limits   ");
+        if (L->eff_long_w > 0)
+            printf(" %.0f W sustained", L->eff_long_w);
+        if (L->eff_short_w > 0)
+            printf("%s %.0f W in short boosts", L->eff_long_w > 0 ? "," : "", L->eff_short_w);
         printf("\n");
     }
     if (cp->nidle) {

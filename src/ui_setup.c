@@ -33,17 +33,18 @@
 enum {
     OPT_PROCS, OPT_BARS, OPT_GRAPHS, OPT_LEFTW, OPT_COLORS, OPT_SINGLE, OPT_HIGHLIGHT, OPT_SELTEXT,
     OPT_TITLES, OPT_BACKGROUND, OPT_CORE_BAR, OPT_CORE_VALUES,
-    OPT_NOTIFY, OPT_A_TEMP, OPT_A_THROTTLE, OPT_A_DISK, OPT_A_MEM, OPT_A_FULL, OPT_A_PROBLEMS,
+    OPT_NOTIFY, OPT_A_TEMP, OPT_A_THROTTLE, OPT_A_GTEMP, OPT_A_GSLOW, OPT_A_DISK, OPT_A_MEM, OPT_A_FULL, OPT_A_PROBLEMS,
     OPT_KEEP, OPT_REC, OPT_REC_MIN,
-    OPT_INTERVAL, OPT_KTHREADS, OPT_MOUSE, OPT_COUNT
+    OPT_INTERVAL, OPT_KTHREADS, OPT_MOUSE, OPT_NETCHECK, OPT_COUNT
 };
 static const char *const OPT_LABEL[OPT_COUNT] = {
     "Process list", "Bar style",   "Graphs",      "Left column width", "Bars & values",  "  Colour",
     "Highlight",    "Selected text", "Titles",    "Background",
     "Bars show",    "Other values",
-    "Alert by",     "CPU hotter than", "CPU throttling", "Disk slower than", "Memory left below", "Disk fuller than", "Problems",
+    "Alert by",     "CPU hotter than", "CPU throttling", "GPU hotter than", "GPU slowing", "Disk slower than",
+    "Memory left below", "Disk fuller than", "Problems",
     "Delete logs after", "Flight recorder", "  Keeps the last",
-    "Refresh interval",  "Kernel threads", "Mouse",
+    "Refresh interval",  "Kernel threads", "Mouse", "Network check",
 };
 enum { ACT_RESET_ALL, ACT_TEST_ALERT, ACT_SENSORS };
 static const char *const ACT_LABEL[] = { "Reset ALL settings to defaults", "Send a test alert",
@@ -119,6 +120,8 @@ static int build_rows(const ui_state_t *u, row_t *r)
     ROW(K_OPT, OPT_NOTIFY); /* the limits also decide what counts as a problem, so they stay */
     ROW(K_OPT, OPT_A_TEMP);
     ROW(K_OPT, OPT_A_THROTTLE);
+    ROW(K_OPT, OPT_A_GTEMP);
+    ROW(K_OPT, OPT_A_GSLOW);
     ROW(K_OPT, OPT_A_DISK);
     ROW(K_OPT, OPT_A_MEM);
     ROW(K_OPT, OPT_A_FULL);
@@ -138,6 +141,7 @@ static int build_rows(const ui_state_t *u, row_t *r)
     ROW(K_OPT, OPT_INTERVAL);
     ROW(K_OPT, OPT_KTHREADS);
     ROW(K_OPT, OPT_MOUSE);
+    ROW(K_OPT, OPT_NETCHECK);
     BLANK();
     ROW(K_ACT, ACT_RESET_ALL);
 #undef HEAD
@@ -225,6 +229,8 @@ static void opt_value(const ui_state_t *u, int o, char *out, size_t n)
     case OPT_NOTIFY: str_copy(out, n, NOTIFY_NAME[u->alert_notify]); break;
     case OPT_A_TEMP: off_or(out, n, u->alert_cpu_temp, U ? "%d °C" : "%d C"); break;
     case OPT_A_THROTTLE: str_copy(out, n, u->alert_throttle ? "Alert" : "Off"); break;
+    case OPT_A_GTEMP: off_or(out, n, u->alert_gpu_temp, U ? "%d °C" : "%d C"); break;
+    case OPT_A_GSLOW: str_copy(out, n, u->alert_gpu_slow ? "Alert" : "Off"); break;
     case OPT_A_DISK: off_or(out, n, u->alert_disk_ms, "%d ms"); break;
     case OPT_A_MEM: off_or(out, n, u->alert_mem_pct, "%d%%"); break;
     case OPT_A_FULL: off_or(out, n, u->alert_disk_full, "%d%%"); break;
@@ -241,6 +247,7 @@ static void opt_value(const ui_state_t *u, int o, char *out, size_t n)
         break;
     case OPT_INTERVAL: sfmt(out, n, "%g s", u->interval); break;
     case OPT_KTHREADS: str_copy(out, n, u->show_kthreads ? "Shown" : "Hidden"); break;
+    case OPT_NETCHECK: str_copy(out, n, u->net_check ? "On" : "Off"); break;
     default: out[0] = '\0';
     }
 }
@@ -281,6 +288,8 @@ static void opt_change(ui_state_t *u, int o, int dir)
     case OPT_NOTIFY: u->alert_notify = cyc(u->alert_notify, dir, ALERT_COUNT); break;
     case OPT_A_TEMP: u->alert_cpu_temp = step_list(A_TEMPS, COUNT(A_TEMPS), u->alert_cpu_temp, dir); break;
     case OPT_A_THROTTLE: u->alert_throttle ^= 1; break;
+    case OPT_A_GTEMP: u->alert_gpu_temp = step_list(A_TEMPS, COUNT(A_TEMPS), u->alert_gpu_temp, dir); break;
+    case OPT_A_GSLOW: u->alert_gpu_slow ^= 1; break;
     case OPT_A_DISK: u->alert_disk_ms = step_list(A_DISKS, COUNT(A_DISKS), u->alert_disk_ms, dir); break;
     case OPT_A_MEM: u->alert_mem_pct = step_list(A_MEMS, COUNT(A_MEMS), u->alert_mem_pct, dir); break;
     case OPT_A_FULL: u->alert_disk_full = step_list(A_FULLS, COUNT(A_FULLS), u->alert_disk_full, dir); break;
@@ -306,6 +315,10 @@ static void opt_change(ui_state_t *u, int o, int dir)
         u->interval = STEPS[CLAMP(i + dir, 0, NSTEPS - 1)];
         break;
     case OPT_KTHREADS: u->show_kthreads ^= 1; break;
+    case OPT_NETCHECK:
+        u->net_check ^= 1;
+        netq_set(u->net_check, u->net_check_host);
+        break;
     }
     save(u);
 }
@@ -321,6 +334,7 @@ static void reset_all(ui_state_t *u)
     }
     u->confirm = -1;
     config_reset_all(u);
+    netq_set(u->net_check, u->net_check_host); /* off again */
     u->setup_sel = 0;
     u->setup_scroll = 0;
     ui_message(u, 0, "All settings are back to their defaults");
@@ -505,6 +519,8 @@ static void option_row(ui_state_t *u, int o, int y, int x, int w, int sel, int i
             break;
         case OPT_A_TEMP: hint = "for 5 seconds"; break;
         case OPT_A_THROTTLE: hint = "slowed down by heat"; break;
+        case OPT_A_GTEMP: hint = "for 5 seconds"; break;
+        case OPT_A_GSLOW: hint = "slowed down by heat for minutes"; break;
         case OPT_A_DISK: hint = "per request, for 10 s"; break;
         case OPT_A_MEM: hint = "of memory available"; break;
         case OPT_A_FULL: hint = "space or inodes used"; break;
@@ -514,6 +530,7 @@ static void option_row(ui_state_t *u, int o, int y, int x, int w, int sel, int i
         case OPT_REC: hint = "saves the lead-up to problems"; break;
         case OPT_REC_MIN: hint = "in memory"; break;
         case OPT_MOUSE: hint = u->lay.mouse ? "Shift + drag selects text" : NULL; break;
+        case OPT_NETCHECK: hint = u->net_check ? "pings the router and the internet every 2 s" : "delay and lost packets"; break;
         case OPT_INTERVAL: hint = "+ and - change it anywhere"; break;
         }
         if (hint)
@@ -628,6 +645,18 @@ void setup_view(sys_t *s, ui_state_t *u)
         return;
     int want = nr + 3, prev_room = avail - want;
     int show_prev = two && prev_room >= 9;
+    /* "Saved automatically to" and the file on one line when they fit */
+    char saved[PATHBUF + 32];
+    sfmt(saved, sizeof saved, "Saved automatically to %s", config_path());
+    int one_line = utf8_cols(saved) <= ow - 6;
+    if (show_prev) { /* room in the preview for every panel: the list scrolls a little instead */
+        int need = dashboard_preview_rows(l) + (one_line ? 5 : 6);
+        int take = MIN(need - prev_room, nr - 16);
+        if (take > 0) {
+            want -= take;
+            prev_room += take;
+        }
+    }
     int oh = show_prev ? want : avail, inner = oh - 3;
     box_(oy, ox, oh, ow, "Settings", "Up/Down select  Left/Right change");
     if (cur.row >= 0) { /* keep the selected row visible */
@@ -663,7 +692,11 @@ void setup_view(sys_t *s, ui_state_t *u)
         return;
     int py = oy + oh, phh = top + H - py;
     box_(py, ox, phh, ow, "Preview", NULL);
-    dashboard_preview(l, py + 2, ox + 3, phh - 6, ow - 6, cur.kind == K_PANEL ? cur.id : -1);
-    put(py + phh - 3, ox + 3, ow - 6, A_GRAY, "Saved automatically to");
-    put(py + phh - 2, ox + 3, ow - 6, A_GRAY, "%s", config_path());
+    dashboard_preview(l, py + 2, ox + 3, phh - (one_line ? 5 : 6), ow - 6, cur.kind == K_PANEL ? cur.id : -1);
+    if (one_line) {
+        put(py + phh - 2, ox + 3, ow - 6, A_GRAY, "%s", saved);
+    } else {
+        put(py + phh - 3, ox + 3, ow - 6, A_GRAY, "Saved automatically to");
+        put(py + phh - 2, ox + 3, ow - 6, A_GRAY, "%s", config_path());
+    }
 }

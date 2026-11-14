@@ -106,6 +106,7 @@ void power_init(power_t *p)
                 str_copy(b->name, sizeof b->name, e->d_name);
                 str_copy(b->path, sizeof b->path, dir);
                 b->watts = b->capacity = b->time_left = b->health = b->full_wh = b->design_wh = -1;
+                b->energy_wh = b->energy_full_wh = -1;
                 b->cycles = -1;
                 b->lim_end = b->lim_start = -1;
             } else if (!strcmp(type, "Mains") && !p->ac_path[0]) {
@@ -147,6 +148,8 @@ static void battery_sample(battery_t *b)
         e_now = (double)now * (double)volt / 1e12;
         e_full = (double)full * (double)volt / 1e12;
     }
+    b->energy_wh = e_now;
+    b->energy_full_wh = e_full > 0 ? e_full : -1;
     /* wear: what a full charge holds now compared with when it was new */
     long long des, fl;
     b->health = b->full_wh = b->design_wh = -1;
@@ -193,6 +196,66 @@ static void battery_sample(battery_t *b)
         else if (!strcmp(b->status, "Charging") && e_full > e_now)
             b->time_left = (e_full - e_now) / b->watts * 3600.0;
     }
+}
+
+/* ------------------------------------------------ the CPU's power limits */
+
+/* one interface's limits for package 0: sustained (and its window) and short-term */
+static void lim_read(const char *dir, double *lw, double *ls, double *sw, int *off)
+{
+    char f[PATHBUF], nm[32];
+    long long v;
+    *lw = *ls = *sw = -1;
+    *off = 0;
+    sfmt(f, sizeof f, "%s/name", dir);
+    if (read_line(f, nm, sizeof nm) || strcmp(nm, "package-0"))
+        return;
+    sfmt(f, sizeof f, "%s/enabled", dir); /* the sustained limit's on/off switch */
+    *off = read_ll(f, &v) == 0 && v == 0;
+    for (int k = 0; k < 4; k++) {
+        sfmt(f, sizeof f, "%s/constraint_%d_name", dir, k);
+        if (read_line(f, nm, sizeof nm))
+            continue;
+        sfmt(f, sizeof f, "%s/constraint_%d_power_limit_uw", dir, k);
+        if (read_ll(f, &v) || v <= 0)
+            continue;
+        if (!strcmp(nm, "long_term")) {
+            *lw = (double)v / 1e6;
+            sfmt(f, sizeof f, "%s/constraint_%d_time_window_us", dir, k);
+            if (read_ll(f, &v) == 0 && v > 0)
+                *ls = (double)v / 1e6;
+        } else if (!strcmp(nm, "short_term")) {
+            *sw = (double)v / 1e6;
+        }
+    }
+}
+
+static double lower(double a, double b)
+{
+    return a > 0 && b > 0 ? MIN(a, b) : a > 0 ? a : b;
+}
+
+/* they change with the platform profile or the firmware's mood: every 10 s */
+static void limits_sample(power_t *p)
+{
+    cpulim_t *L = &p->lim;
+    double mono = now_sec(), fs;
+    if (L->t && mono - L->t < 10)
+        return;
+    L->t = mono;
+    char d[PATHBUF];
+    int fw_off;
+    sfmt(d, sizeof d, "%s/class/powercap/intel-rapl:0", g_sysfs);
+    lim_read(d, &L->long_w, &L->long_s, &L->short_w, &L->long_off);
+    sfmt(d, sizeof d, "%s/class/powercap/intel-rapl-mmio:0", g_sysfs);
+    lim_read(d, &L->fw_long_w, &fs, &L->fw_short_w, &fw_off);
+    if (fw_off)
+        L->fw_long_w = -1;
+    if (L->long_s <= 0)
+        L->long_s = fs;
+    L->eff_long_w = lower(L->long_off ? -1 : L->long_w, L->fw_long_w);
+    L->eff_short_w = lower(L->short_w, L->fw_short_w);
+    L->ok = L->long_w > 0 || L->fw_long_w > 0;
 }
 
 /* the slowest part of this sample so far (for "reading X took 3 s" events) */
@@ -271,8 +334,10 @@ void power_sample(power_t *p, double dt)
         if (p->psys_low >= 3)
             p->psys_bad = 1;
     }
-    if (p->nrapl)
+    if (p->nrapl) {
+        limits_sample(p);
         note_slow(p, t0, "the CPU power meters (RAPL)");
+    }
 
     for (int i = 0; i < p->nbat; i++) {
         char what[40];

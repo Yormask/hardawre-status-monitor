@@ -24,6 +24,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
@@ -241,6 +242,12 @@ static void panel_cpu(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         kv(iy + r, &kx, km, c->iowait >= 5 ? CP(C_WARN) : A_BOLD, "iowait", "%.1f%%", c->iowait);
         if (c->mhz_avg > 0)
             kv(iy + r, &kx, km, A_BOLD, "clock", "%.2f GHz", c->mhz_avg / 1000.0);
+        /* what holds the clock down right now, like the GPU's */
+        const health_t *H = &s->health;
+        if (H->thr_last > 0 && time(NULL) - H->thr_last < 10)
+            kv(iy + r, &kx, km, CP(C_WARN) | A_BOLD, "slowing", "%s", "heat");
+        else if (H->pl_now)
+            kv(iy + r, &kx, km, A_BOLD, "slowing", "%s", H->pl_now == PL_SHORT ? "boost limit" : "power limit");
         kv(iy + r, &kx, km, A_BOLD, "load", "%.2f %.2f %.2f", c->load[0], c->load[1], c->load[2]);
         if (c->steal > 0.05)
             kv(iy + r, &kx, km, CP(C_WARN), "steal", "%.1f%%", c->steal);
@@ -321,6 +328,12 @@ static void gpu_details(int y, int x, int w, const gpu_t *g)
         kv(y, &xx, xm, A_BOLD, "fan", "%.0f rpm", g->fan_rpm);
     for (int i = 0; i < g->neng; i++)
         kv(y, &xx, xm, pct_attr(g->eng[i].pct), g->eng[i].name, "%.0f%%", g->eng[i].pct);
+    if (g->enc_pct > 0) /* video: only while it is used */
+        kv(y, &xx, xm, pct_attr(g->enc_pct), "encode", "%.0f%%", g->enc_pct);
+    if (g->dec_pct > 0)
+        kv(y, &xx, xm, pct_attr(g->dec_pct), "decode", "%.0f%%", g->dec_pct);
+    if (g->pcie_gen > 0 && g->pcie_width > 0)
+        kv(y, &xx, xm, A_BOLD, "PCIe", "%d.0 x%d", g->pcie_gen, g->pcie_width);
 }
 
 static void panel_gpu(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
@@ -643,7 +656,41 @@ static int net_pick(sys_t *s, int *idx, int max)
 static int net_need(sys_t *s, ui_state_t *u, int w)
 {
     int idx[8];
-    return 2 + MAX(net_pick(s, idx, 4), 1);
+    return 2 + MAX(net_pick(s, idx, 4), 1) + (s->net.q.on ? 1 : 0);
+}
+
+/* the network check's row: delay to the router and the internet, and losses */
+static void net_ping_row(const netq_t *q, int y, int x, int w)
+{
+    int xx = x, xm = x + w;
+    xx += put(y, xx, xm - xx, CP(C_INFO), "%s", "ping  ");
+    if (q->err) {
+        put(y, xx, xm - xx, CP(C_WARN), "%s", q->err == EACCES || q->err == EPERM
+                                                 ? "not allowed (sysctl net.ipv4.ping_group_range)" : strerror(q->err));
+        return;
+    }
+    static const char *const nm[NQ_COUNT] = { "router", "internet" };
+    for (int k = 0; k < NQ_COUNT; k++) {
+        const nqt_t *t = &q->t[k];
+        if (k)
+            xx += put(y, xx, xm - xx, A_GRAY, "%s", SEP);
+        xx += put(y, xx, xm - xx, A_GRAY, "%s ", nm[k]);
+        if (t->noroute)
+            xx += put(y, xx, xm - xx, CP(C_WARN), "%s", "no network");
+        else if (!t->addr[0])
+            xx += put(y, xx, xm - xx, A_GRAY, "%s", k == NQ_ROUTER ? "none" : "...");
+        else if (t->rtt_ms >= 0 && t->rtt_ms < 0.05)
+            xx += put(y, xx, xm - xx, A_BOLD, "%s", "<0.1 ms");
+        else if (t->rtt_ms >= 0)
+            xx += put(y, xx, xm - xx, t->trouble ? CP(C_WARN) | A_BOLD : A_BOLD, t->rtt_ms < 10 ? "%.1f ms" : "%.0f ms",
+                      t->rtt_ms);
+        else if (t->loss_pct >= 0)
+            xx += put(y, xx, xm - xx, CP(C_CRIT) | A_BOLD, "%s", "lost");
+        else
+            xx += put(y, xx, xm - xx, A_GRAY, "%s", "...");
+        if (t->loss_pct > 0)
+            xx += put(y, xx, xm - xx, t->loss_pct >= 10 ? CP(C_CRIT) | A_BOLD : CP(C_WARN), " (%.0f%% lost)", t->loss_pct);
+    }
 }
 
 static void panel_net(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
@@ -683,6 +730,8 @@ static void panel_net(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         else if (f->speed > 0 && xm - xx >= 10)
             put(iy + r, xx, xm - xx, A_GRAY, "  %dM", f->speed);
     }
+    if (s->net.q.on && r < ih)
+        net_ping_row(&s->net.q, iy + r++, ix, iw);
     if (r < ih)
         dual_graph(iy + r, ix, ih - r, iw, &s->h_rx, &s->h_tx, CP(C_IN), CP(C_OUT), U ? "↓" : "v", U ? "↑" : "^");
 }
@@ -1012,6 +1061,13 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         if (all && !since)
             kv(iy + r, &kx, km, A_GRAY, "", "(%llu since boot)", all);
     }
+    /* the CPU's power limit, once it has held the CPU back (needs root to know) */
+    if (H->pl_now)
+        kv(iy + r, &kx, km, A_BOLD, "Power limit", "holding the CPU back (%.0f W)",
+           H->pl_now == PL_SHORT ? s->power.lim.eff_short_w : s->power.lim.eff_long_w);
+    else if (H->pl_known && H->pl_held_s >= 5 && H->pl_busy_s > 0)
+        kv(iy + r, &kx, km, A_NORMAL, "Power limit", "held the CPU back %.0f%% of its busy time",
+           100.0 * H->pl_held_s / H->pl_busy_s);
     /* the GPU: held back by heat or a power limit (NVIDIA's own reasons) */
     for (int i = 0; i < s->gpus.n; i++) {
         const gpu_t *g = &s->gpus.g[i];
@@ -1323,30 +1379,55 @@ void dashboard(sys_t *s, ui_state_t *u)
         draw_procs(s, u, top + top_h, 0, avail - top_h, W, 0);
 }
 
-/* Miniature of the dashboard for the Setup screen; panel hl is highlighted. */
+/* rows the preview needs to show every panel: one each, then a gap and the process list */
+int dashboard_preview_rows(const layout_t *l)
+{
+    int ids[P_COUNT], rows = MAX(MAX(visible(l, 0, ids), visible(l, 1, ids)), 1);
+    return rows + (l->show_procs ? 3 : 0);
+}
+
+/* Miniature of the dashboard for the Setup screen; panel hl is highlighted.
+ * Every row belongs to one thing: when space is short the gaps go first, then
+ * the process list gets a single row, and a column that still doesn't fit
+ * ends in "+N more" instead of running under the process list. */
 void dashboard_preview(const layout_t *l, int y, int x, int h, int w, int hl)
 {
     int ids[2][P_COUNT], n[2] = { visible(l, 0, ids[0]), visible(l, 1, ids[1]) };
     int both = n[0] && n[1], rows = MAX(MAX(n[0], n[1]), 1);
-    int ph = l->show_procs ? 3 : 0;
-    int per = CLAMP((h - ph) / rows, 1, 4), sh = per > 1 ? per - 1 : 1; /* block height */
+    int bar = l->show_procs ? 2 : 0, gap = l->show_procs ? 1 : 0;
+    if (rows + bar + gap > h)
+        gap = 0;
+    if (bar && rows + bar > h)
+        bar = 1;
+    int room = MAX(h - bar - gap, 1);                               /* rows for the panels */
+    int per = CLAMP(room / rows, 1, 4), sh = per > 1 ? per - 1 : 1; /* block height */
     int lw = both ? left_width(l, w) : w;
     int xs[2] = { x, both ? x + lw : x }, ws[2] = { lw, both ? w - lw : w };
-    if (!n[0] && !n[1]) {
+    if (!n[0] && !n[1])
         put(y, x, w, A_GRAY, "(no panels shown)");
-    }
-    for (int c = 0; c < 2; c++)
-        for (int i = 0; i < n[c] && i * per < h - ph; i++) {
+    for (int c = 0; c < 2; c++) {
+        int fit = n[c] <= room ? n[c] : room - 1; /* the last row then says how many more */
+        for (int i = 0; i < fit; i++) {
             int p = ids[c][i];
             attr_t a = p == hl ? CP(C_THEAD) | A_BOLD : CP(C_GRAY) | A_REVERSE;
             for (int r = 0; r < sh; r++)
                 fill(y + i * per + r, xs[c], ws[c] - 1, a);
             put(y + i * per, xs[c] + 1, ws[c] - 2, a, "%s", PANEL_NAME[p]);
         }
-    if (ph) {
-        int py = y + MIN(rows * per, h - ph);
-        fill(py, x, w, CP(C_SEL));
-        fill(py + 1, x, w, CP(C_SEL));
+        if (fit < n[c]) { /* per is 1 here */
+            int sel = 0;
+            for (int i = fit; i < n[c]; i++)
+                sel |= ids[c][i] == hl;
+            attr_t a = sel ? CP(C_THEAD) | A_BOLD : CP(C_GRAY) | A_REVERSE;
+            fill(y + fit, xs[c], ws[c] - 1, a);
+            put(y + fit, xs[c] + 1, ws[c] - 2, a, "+%d more", n[c] - fit);
+        }
+    }
+    if (bar) {
+        int used = rows > room ? room : per > 1 ? rows * per - 1 : rows;
+        int py = y + used + (used + 1 + bar <= h ? 1 : 0);
+        for (int r = 0; r < bar; r++)
+            fill(py + r, x, w, CP(C_SEL));
         put(py, x + 1, w - 2, CP(C_SEL), "Processes");
     }
 }

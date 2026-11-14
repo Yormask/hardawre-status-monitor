@@ -52,6 +52,22 @@ typedef struct {
     char text[256];
 } hevent_t;
 
+/* what ran each day (programs.c): the programs that used the most */
+#define PROG_KINDS 3 /* CPU time (s), GPU time (s), bytes written */
+#define PROG_TOP 10  /* kept per day and kind */
+typedef struct {
+    char name[24];
+    double v;
+} prog_top_t;
+typedef struct {
+    int n[PROG_KINDS];
+    prog_top_t top[PROG_KINDS][PROG_TOP]; /* biggest first */
+} prog_day_t;
+void prog_sample(const sys_t *s, double dt); /* the writer, every sample */
+void prog_day_start(int day);               /* a new day: go on from what programs.csv has for it */
+void prog_flush(void);                      /* today's top programs into programs.csv */
+int prog_get_day(int day, prog_day_t *out); /* for the History view; 0 = something to show */
+
 void history_start(sys_t *s); /* from watch_start */
 void history_tick(sys_t *s);  /* every sample */
 void history_end(void);

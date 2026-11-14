@@ -89,8 +89,9 @@ typedef struct {
     layout_t lay;
     double interval, log_every;
     int sort, reverse, kthreads, tree, keep, rec_on, rec_min;
-    int a_notify, a_temp, a_disk, a_mem, a_full, a_thr, a_prob;
-    char log_dir[PATHBUF], log_skip[8192], a_cmd[PATHBUF];
+    int a_notify, a_temp, a_disk, a_mem, a_full, a_thr, a_prob, a_gtemp, a_gslow;
+    char log_dir[PATHBUF], log_skip[8192], a_cmd[PATHBUF], nc_host[128];
+    int nc;
     srule_t srule[MAX_SRULES];
     int nsrule;
 } snap_t;
@@ -116,6 +117,10 @@ static void snapshot(const ui_state_t *u, snap_t *s)
     s->a_full = u->alert_disk_full;
     s->a_thr = u->alert_throttle;
     s->a_prob = u->alert_problems;
+    s->a_gtemp = u->alert_gpu_temp;
+    s->a_gslow = u->alert_gpu_slow;
+    s->nc = u->net_check;
+    str_copy(s->nc_host, sizeof s->nc_host, u->net_check_host);
     str_copy(s->log_dir, sizeof s->log_dir, u->log_dir);
     str_copy(s->log_skip, sizeof s->log_skip, u->log_skip);
     str_copy(s->a_cmd, sizeof s->a_cmd, u->alert_command);
@@ -160,6 +165,8 @@ static void other_defaults(ui_state_t *u)
     u->rec_minutes = 10;
     u->alert_notify = ALERT_DESKTOP;
     u->alert_cpu_temp = 90;
+    u->alert_gpu_temp = 90;
+    u->alert_gpu_slow = 1;
     u->alert_disk_ms = 500;
     u->alert_mem_pct = 5;
     u->alert_disk_full = 95;
@@ -167,6 +174,8 @@ static void other_defaults(ui_state_t *u)
     u->alert_problems = 1;
     u->alert_command[0] = '\0';
     u->tree = 0;
+    u->net_check = 0;
+    u->net_check_host[0] = '\0';
 }
 
 /* add, change or (when it holds nothing any more) remove the rule for r->id */
@@ -507,6 +516,10 @@ int config_load(ui_state_t *u)
             u->reverse = parse_bool(v);
         } else if (!strcmp(k, "kernel_threads")) {
             u->show_kthreads = parse_bool(v);
+        } else if (!strcmp(k, "net_check")) {
+            u->net_check = parse_bool(v);
+        } else if (!strcmp(k, "net_check_host")) {
+            str_copy(u->net_check_host, sizeof u->net_check_host, strcmp(v, "default") ? v : "");
         } else if (!strcmp(k, "single_color") && (i = find_key(SINGLE_KEY, SINGLE_COUNT, v)) >= 0) {
             l->single_color = i;
         } else if (!strcmp(k, "highlight") && (i = find_key(SINGLE_KEY, SINGLE_COUNT, v)) >= 0) {
@@ -543,6 +556,12 @@ int config_load(ui_state_t *u)
             i = parse_off(v);
             if (i >= 0 && i <= 150)
                 u->alert_cpu_temp = i;
+        } else if (!strcmp(k, "alert_gpu_temp")) {
+            i = parse_off(v);
+            if (i >= 0 && i <= 150)
+                u->alert_gpu_temp = i;
+        } else if (!strcmp(k, "alert_gpu_slowing")) {
+            u->alert_gpu_slow = parse_bool(v);
         } else if (!strcmp(k, "alert_disk_ms")) {
             i = parse_off(v);
             if (i >= 0 && i <= 60000)
@@ -669,6 +688,10 @@ int config_save(const ui_state_t *u)
             fprintf(f, "\ninterval = %g\nsort = %s\nreverse = %s\nkernel_threads = %s\nprocess_tree = %s\n",
                     u->interval, SORT_KEY[u->sort], u->reverse ? "on" : "off", u->show_kthreads ? "on" : "off",
                     u->tree ? "on" : "off");
+            fprintf(f, "\n# Network check: pings the router and an internet address (default 1.1.1.1)\n"
+                       "# every 2 s, for delay and lost packets\n");
+            fprintf(f, "net_check = %s\nnet_check_host = %s\n", u->net_check ? "on" : "off",
+                    u->net_check_host[0] ? u->net_check_host : "default");
             fprintf(f, "\n# Logging (view 5): folder, seconds between rows (refresh = every update),\n"
                        "# and the channels that are switched off\n");
             fprintf(f, "log_dir = %s\n", u->log_dir[0] ? u->log_dir : "default");
@@ -689,6 +712,8 @@ int config_save(const ui_state_t *u)
                        "# $2 the details and $3 \"warning\" or \"error\", e.g. notify a phone with curl.\n");
             fprintf(f, "alert_notify = %s\n", NOTIFY_KEY[u->alert_notify]);
             put_off(f, "alert_cpu_temp", u->alert_cpu_temp);
+            put_off(f, "alert_gpu_temp", u->alert_gpu_temp);
+            fprintf(f, "alert_gpu_slowing = %s\n", u->alert_gpu_slow ? "on" : "off");
             put_off(f, "alert_disk_ms", u->alert_disk_ms);
             put_off(f, "alert_low_memory", u->alert_mem_pct);
             put_off(f, "alert_disk_full", u->alert_disk_full);

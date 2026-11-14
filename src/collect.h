@@ -151,10 +151,36 @@ typedef struct {
     int primed, seen;
 } netif_t;
 
+/* network quality: the router and one internet address pinged every 2 s
+ * (netcheck.c, off unless switched on) */
+enum { NQ_ROUTER, NQ_NET, NQ_COUNT };
+enum { NQ_FINE, NQ_LOSS, NQ_SLOW };   /* trouble right now */
+typedef struct {
+    char addr[48];                    /* what is pinged, "" = nothing (no router) */
+    int noroute;                      /* the network says it can't be reached */
+    double rtt_ms;                    /* the latest answer, -1 = lost, or none yet */
+    double avg_ms, min_ms, max_ms, jitter_ms; /* the last minute's answers, -1 = none */
+    double loss_pct;                  /* the last minute, -1 = nothing sent yet */
+    double normal_ms;                 /* its usual delay, while all was well, -1 = unknown */
+    int trouble;                      /* NQ_* now (after a few pings in a row) */
+    int episode;                      /* counts troubles: a new number when one starts */
+    double since, until;              /* the latest trouble started / ended (wall); until 0 = still on */
+    double worst_loss, worst_ms;      /* the worst of this trouble */
+} nqt_t;
+typedef struct {
+    int on;                           /* the check runs */
+    int err;                          /* it can't: errno of the ping socket (EACCES: no permission) */
+    char iface[32];                   /* the interface the router is on */
+    nqt_t t[NQ_COUNT];
+} netq_t;
+void netq_set(int on, const char *host); /* start or stop it (the setting); host "" = 1.1.1.1 */
+void netq_read(netq_t *out);             /* a copy of the figures */
+
 typedef struct {
     int n;
     netif_t i[MAX_NETIF];
     double rx_bps, tx_bps;
+    netq_t q; /* the network check's figures, copied every sample */
 } net_t;
 
 void net_sample(net_t *n, double dt);
@@ -293,6 +319,9 @@ typedef struct {
     double slow_since;     /* monotonic: held back without a break since, 0 = not now */
     double busy_s, heat_s, pwr_s, held_s; /* since start: seconds busy, and held back by heat / power / either while busy */
     double slow_ev_t;      /* when the last "slowing down" event was raised */
+    double enc_pct, dec_pct;          /* video encoder / decoder busy, -1 = unknown (NVIDIA, while awake) */
+    int pcie_gen, pcie_width;         /* the PCIe link now, 0 = unknown (NVIDIA, while awake) */
+    int pcie_gen_max, pcie_width_max; /* the best this card and its slot can do, 0 = unknown */
 
     /* private */
     char dev[PATHBUF], hwmon[PATHBUF], drm[PATHBUF];
@@ -342,6 +371,7 @@ typedef struct {
     double watts, capacity, time_left; /* -1 = unknown; time_left in s */
     double health;                     /* full charge now vs. new, %, -1 = unknown */
     double full_wh, design_wh;         /* what a full charge holds now / when new, -1 = unknown */
+    double energy_wh, energy_full_wh;  /* the charge in it now / when full, Wh, -1 = unknown */
     long cycles;                       /* charge cycles, -1 = unknown */
     /* a charge limit (laptops that can stop charging early to slow wear) */
     int lim_ok;              /* the battery has the setting ... */
@@ -349,6 +379,19 @@ typedef struct {
     int lim_end, lim_start;  /* stops at / starts again below, %; -1 = not set */
     double lim_t;            /* when it was last read (monotonic) */
 } battery_t;
+
+/* how much the CPU package may draw: readable without root. The same limits
+ * can be set twice, in the CPU's registers (MSR) and by the firmware through
+ * MMIO; the lower of the two applies. */
+typedef struct {
+    int ok;                          /* the package has a sustained limit */
+    double long_w, long_s;           /* sustained (PL1) and the window it is averaged over; -1 = none */
+    double short_w;                  /* short boosts (PL2), -1 = none */
+    int long_off;                    /* the sustained limit is switched off */
+    double fw_long_w, fw_short_w;    /* the firmware's copy (MMIO), -1 = none */
+    double eff_long_w, eff_short_w;  /* what applies: the lower of the two */
+    double t;                        /* when they were read (monotonic) */
+} cpulim_t;
 
 typedef struct {
     int nrapl;
@@ -362,6 +405,7 @@ typedef struct {
     /* the "psys" (whole platform) domain is left unconnected by some laptop
      * firmware: it then reads far less than the CPU package inside it */
     int psys_low, psys_bad;
+    cpulim_t lim;  /* the CPU's power limits */
     char slow[40]; /* the part that took longest to read this time, for slow-reading events */
     double slow_s;
 } power_t;
@@ -433,6 +477,14 @@ typedef struct {
     long long hours, cycles, realloc, pending, uncorrect, crc, unsafe; /* -1 = unknown */
 } sata_t;
 
+/* the batteries at one moment, for what they lost while the computer slept */
+typedef struct {
+    int ok;        /* there is a battery and it reported its charge */
+    int charger;   /* plugged in (or charging / full) */
+    double pct;    /* charge, % */
+    double wh;     /* charge, Wh, -1 = unknown */
+} batsnap_t;
+
 typedef struct {
     psi_t psi[3]; /* cpu, memory, io */
 
@@ -482,6 +534,12 @@ typedef struct {
     double fan_last, link_last, ro_last;      /* a fan is stopped / a link dropped / a disk went read-only */
     double ulim_last;                         /* a sensor is past the limit you gave it */
 
+    /* the CPU held back by its power limit rather than by heat (needs the
+     * package's power, so root) */
+    int pl_known;                 /* the package's power and its limits are known */
+    int pl_now;                   /* PL_LONG at its sustained limit, PL_SHORT at its boost limit, 0 not */
+    double pl_held_s, pl_busy_s;  /* seconds held back / seconds busy since start */
+
     char slow[40];  /* the check that took longest this time, and how long */
     double slow_s;
 
@@ -494,6 +552,15 @@ typedef struct {
     char governor[24];
     int susp_ok;                   /* the kernel counts failed suspends */
     unsigned long long susp_fail;
+    double pl_since, pl_last, pl_ev_t; /* the stretch began / last at the limit (mono) / last event (wall) */
+    int pl_kind, pl_told;
+    int nq_seen[NQ_COUNT], nq_open[NQ_COUNT]; /* network check: troubles told about / still going */
+    batsnap_t bat_prev;            /* the batteries at the previous sample */
+    struct {                       /* the "woke up" event waits a few seconds for the battery to settle */
+        int on;
+        double dur, wall, due;     /* how long it slept, when it went to sleep (wall), when to tell */
+        batsnap_t pre;             /* the batteries just before */
+    } wake;
 } health_t;
 
 void health_init(health_t *h);
@@ -505,6 +572,7 @@ int event_explain(const char *cat, const char *text, char *out, size_t n);
 int health_alert(const health_t *h, char *out, size_t n);
 /* the busiest process right now, for event texts: " while firefox used 180% CPU" ("" = none) */
 enum { BLAME_CPU, BLAME_MEM, BLAME_IO, BLAME_GPU };
+enum { PL_LONG = 1, PL_SHORT = 2 }; /* which power limit holds the CPU back */
 void health_blame(const procs_t *ps, int what, char *out, size_t n);
 
 /* freeze.c: a watchdog thread that notices when the whole system stops */
@@ -522,6 +590,9 @@ int freeze_take(fz_t *out); /* 1 = got one */
  * how many; *growing = it was flagged, *rate = MB per hour lately */
 int leak_history(pid_t pid, unsigned long long start, float *out, int max, int *growing, double *rate);
 int leak_growing(pid_t pid, unsigned long long start);
+#define RUNAWAY_MIN 15 /* minutes at a whole core before a process is called out */
+int runaway_minutes(pid_t pid, unsigned long long start, int *flagged); /* minutes in a row busy */
+int runaway_count(void);       /* called out and still busy */
 
 /* ata.c: SATA drives */
 void ata_find(health_t *h);
@@ -596,8 +667,19 @@ void svcs_free(svcs_t *v);
 const char *svc_kind_name(int kind);
 
 /* --------------------------------------------------------- Whole system */
+/* the machine, as its firmware describes it (/sys/class/dmi/id, readable by
+ * everyone; serial numbers are root-only and left out) */
+typedef struct {
+    int ok;
+    char vendor[64], model[96], type[64]; /* type: the maker's code when the model is a name (Lenovo) */
+    char board[96];
+    char bios_vendor[64], bios_version[64];
+    int bios_date;                        /* YYYYMMDD, 0 = unknown */
+} machine_t;
+
 typedef struct {
     char host[64], kernel[64], os[96], arch[24];
+    machine_t mach;
     double t_last, dt;
     unsigned long samples;
 
@@ -637,6 +719,7 @@ void sys_sample(sys_t *s);
 void sys_free(sys_t *s);
 void health_sample(sys_t *s); /* after the other collectors: needs CPU, memory and sensors */
 void leak_sample(sys_t *s);   /* once a minute, from health_sample */
+void runaway_sample(sys_t *s); /* once a minute, from health_sample */
 void health_close(health_t *h);
 
 #endif

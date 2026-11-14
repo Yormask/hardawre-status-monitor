@@ -1,16 +1,17 @@
 # hsm — hardware status monitor
 
-A fast, lightweight hardware and process monitor for the Linux terminal, written in C. It shows everything your machine is doing on one screen: CPU, GPU, memory, power draw, disk and network throughput, temperatures, fans, voltages, every process (as a list or a tree) with its CPU, memory, disk I/O, GPU use and open files, and every systemd service and container. A **Health** panel watches for the things that come before a crash: thermal throttling, the whole system freezing, tasks stalling for CPU, memory or disk, out-of-memory kills, fans that stop, disks filling up or turning read-only, network links dropping, processes whose memory only ever grows, PCIe bus errors, NVMe and SATA drive wear and errors, and the kernel's own error messages. You choose which panels appear, arrange them, and pick how bars and graphs look. Colours are your terminal's standard ones, so they follow your terminal's theme, and you can pick the background, the selection colour and the text colours from them.
+A fast, lightweight hardware and process monitor for the Linux terminal, written in C. It shows everything your machine is doing on one screen: CPU, GPU, memory, power draw, disk and network throughput, temperatures, fans, voltages, every process (as a list or a tree) with its CPU, memory, disk I/O, GPU use and open files, and every systemd service and container. A **Health** panel watches for the things that come before a crash: thermal throttling, the whole system freezing, tasks stalling for CPU, memory or disk, out-of-memory kills, fans that stop, disks filling up or turning read-only, network links dropping, processes whose memory only ever grows or that keep a core busy for a long time, PCIe bus errors, NVMe and SATA drive wear and errors, and the kernel's own error messages. You choose which panels appear, arrange them, and pick how bars and graphs look. Colours are your terminal's standard ones, so they follow your terminal's theme, and you can pick the background, the selection colour and the text colours from them.
 
 It is also built to **catch rare failures**: a flight recorder keeps the last 10 minutes of every reading and saves them when something goes wrong, the next start tells you if the computer went down while hsm was running (with the kernel's crash report when the firmware kept one), desktop alerts warn you when a limit is crossed, and a log viewer graphs saved logs right in the terminal. And it **remembers**: every event is kept across runs and reboots in a searchable list, and one line per day of history shows slow changes, such as a machine that runs a few degrees hotter every month.
 
 * **Fast**: reads `/proc` and `/sys` directly and never parses other programs' output. One full sample of every subsystem takes about 0.3 ms. (The only program it ever starts is `notify-send`, for desktop alerts.)
-* **Small**: about 650 KB binary, about 5 MB RAM, a fraction of a percent of one core at a 1 s refresh (2 MB and almost nothing as `--watch`), flight recorder included.
-* **Health**: throttling, freezes, pressure stalls, OOM kills, stopped fans, full or read-only disks, dropped network links, growing processes, PCIe errors, NVMe and SATA drive health and kernel errors in one panel, with an alert in the header while something is wrong. Each event names the busiest process at that moment.
+* **Small**: about 700 KB binary, about 5 MB RAM, a fraction of a percent of one core at a 1 s refresh (2 MB and almost nothing as `--watch`), flight recorder included.
+* **Health**: throttling, freezes, pressure stalls, OOM kills, stopped fans, full or read-only disks, dropped network links, growing and runaway processes, PCIe errors, NVMe and SATA drive health and kernel errors in one panel, with an alert in the header while something is wrong. Each event names the busiest process at that moment.
 * **Catches failures**: the flight recorder, freeze detection, crash detection across reboots and alerts (see [Catching failures](#catching-failures)).
-* **Long memory**: every event kept across runs (view `7`), one line per day of history with trends (view `8`), a cooling check that compares with the previous one, and the drives' own self-tests and error logs.
+* **Long memory**: every event kept across runs (view `7`), one line per day of history with trends and what ran that day (view `8`), a cooling check that compares with the previous one, and the drives' own self-tests and error logs.
 * **Logging**: record temperatures, load, clocks, power, fans, disk and network to CSV files in daily folders, follow single processes, delete old logs automatically, and graph any of it in the built-in log viewer, which opens on a summary of what the log shows.
-* **Laptop-friendly**: a sleeping NVIDIA GPU is left asleep, and hsm lets it power off when it's idle (asking it for its load every second would keep it on at 5-10 W); why the GPU is slowing down (heat or its power limit); battery wear and charge limit.
+* **Laptop-friendly**: a sleeping NVIDIA GPU is left asleep, and hsm lets it power off when it's idle (asking it for its load every second would keep it on at 5-10 W); why the GPU is slowing down (heat or its power limit), and the CPU too (heat, or the power limit it shares with the GPU); what the battery lost while the laptop slept; battery wear and charge limit.
+* **Network check** (off until you switch it on): the delay and lost pings to your router and to the internet, which tells a Wi-Fi problem from one further away and explains lag spikes in games.
 * **Easy to use**: mouse support (click tabs, rows and column headings, scroll with the wheel), everything about a process with `Enter`, process tree, priority (nice) and signals from the process list, `--json` for scripts, `--serve` for Prometheus and Grafana.
 * **Customizable**: show, hide and rearrange panels; choose bar style, graph style, colour mode, selection and title colours, and the background; give sensors your own names and limits. Settings are saved automatically.
 * **No hard dependencies** beyond ncurses. NVIDIA support is loaded at runtime only if the driver is installed.
@@ -19,21 +20,21 @@ It is also built to **catch rare failures**: a flight recorder keeps the last 10
 
 | Panel | Details | Source |
 |---|---|---|
-| CPU | total, and a row per core: a bar for usage, temperature or clock speed (your choice, key `b`) with the other two next to it as numbers; user/sys/iowait/steal, average clock, package temperature and power, load average, context switches, interrupts and forks per second, history graph | `/proc/stat`, cpufreq, hwmon, RAPL |
-| GPU | load, VRAM, core clock bar, memory clock, temperature, power and power limit, fan; NVIDIA: whether it's asleep, and why it's slowing down (heat or its power limit) | see below |
+| CPU | total, and a row per core: a bar for usage, temperature or clock speed (your choice, key `b`) with the other two next to it as numbers; user/sys/iowait/steal, average clock and what holds it down (*slowing: heat* or *power limit*), package temperature and power, load average, context switches, interrupts and forks per second, history graph | `/proc/stat`, cpufreq, hwmon, RAPL |
+| GPU | load, VRAM, core clock bar, memory clock, temperature, power and power limit, fan; NVIDIA: whether it's asleep, why it's slowing down (heat or its power limit), its video encoder and decoder while in use, and its PCIe link | see below |
 | Memory | used/available, cache, shared, dirty, swap usage, swap-in/out rate, major page faults | `/proc/meminfo`, `/proc/vmstat` |
 | Power | CPU package, cores, iGPU (uncore), DRAM, platform (psys), GPU power, battery drain and time left, charge limit, AC state, estimated total (only a complete one: see [How power is estimated](#how-power-is-estimated)) | RAPL powercap, hwmon, `power_supply` |
 | Disk I/O | read/write throughput, IOPS, busy % and **time per request** per physical drive | `/proc/diskstats`, `/sys/block` |
-| Network | download/upload rate per interface, link speed, IPv4 address, errors and dropped packets, Wi-Fi signal | `/proc/net/dev`, `/proc/net/wireless` |
+| Network | download/upload rate per interface, link speed, IPv4 address, errors and dropped packets, Wi-Fi signal; with the [network check](#network-check) on, the delay and lost pings to the router and the internet | `/proc/net/dev`, `/proc/net/wireless`, pings |
 | Temperatures | every temperature sensor (CPU package and each core, NVMe drives, the GPU - NVIDIA's too -, chipset, Wi-Fi...), named so you can tell them apart (*ACPI 1*, *ACPI 2*), with CPU temperature history | `/sys/class/hwmon`, NVML |
 | Fans | every fan speed sensor, plus NVIDIA GPU fans | `/sys/class/hwmon`, NVML |
 | Filesystems | used/total for local filesystems | `/proc/self/mounts`, `statvfs` |
-| Processes | PID, user, state, threads, nice, CPU %, MEM %, RSS/VIRT, **disk read/write per process**, **GPU % per process**, open files, CPU time, full command line; as a list or a **tree** (which process started which) | `/proc/[pid]/*`, DRM fdinfo, NVML |
-| Health | thermal throttling, freezes, pressure stalls (CPU / memory / disk), out-of-memory kills, PCIe errors, NVMe and SATA drive health, kernel errors, and a list of recent events | see [Health](#health-finding-the-cause-of-a-failure) |
+| Processes | PID, user, state, threads, nice, CPU %, MEM %, RSS/VIRT, **disk read/write per process**, **GPU % per process**, open files, CPU time, full command line; as a list or a **tree** (which process started which); a `!` after the CPU % of a process that has kept a whole core busy for 15 minutes, a `↑` after the memory of one that only grows | `/proc/[pid]/*`, DRM fdinfo, NVML |
+| Health | thermal throttling, the CPU's power limit holding it back, freezes, pressure stalls (CPU / memory / disk), out-of-memory kills, PCIe errors, NVMe and SATA drive health, kernel errors, and a list of recent events | see [Health](#health-finding-the-cause-of-a-failure) |
 | Services | CPU, memory, disk I/O and tasks per systemd service, login session, desktop app and container (a panel; the full table is view `6`) | cgroup v2 |
 | Voltages | every voltage the sensor chips report (the motherboard, a laptop's battery, USB-C ports), in red when outside its limits (or yours) | `/sys/class/hwmon` |
 
-The **Hardware** view (key `3`) lists every sensor, GPU detail, RAPL power domain, drive (with totals since boot), filesystem and network interface, plus the full health details (each drive's SMART figures, freezes and suspends, how the last sessions ended when they didn't end normally), the CPU's power settings (driver, governor, energy preference, turbo, frequency limits, platform profile), how long the CPUs sleep in each idle state, battery wear, charge cycles and charge limit, and readings that haven't changed since hsm started (a placeholder the firmware fills in, or an input with nothing on it). In it, `D` shows the [drives' self-tests](#drive-self-tests) and `C` runs the [cooling check](#cooling-check).
+The **Hardware** view (key `3`) lists the machine (its model, board and BIOS version and date, as the firmware describes it), every sensor, GPU detail, RAPL power domain, drive (with totals since boot), filesystem and network interface, plus the full health details (each drive's SMART figures, freezes and suspends, how the last sessions ended when they didn't end normally), the CPU's power settings (driver, governor, energy preference, turbo, frequency limits, platform profile) and [power limits](#cpu-power-limits), the network check's figures, how long the CPUs sleep in each idle state, battery wear, charge cycles and charge limit, and readings that haven't changed since hsm started (a placeholder the firmware fills in, or an input with nothing on it). In it, `D` shows the [drives' self-tests](#drive-self-tests) and `C` runs the [cooling check](#cooling-check).
 
 Two more views keep what happened: **Events** (key `7`), everything hsm noticed since you started using it, and **History** (key `8`), one line per day. See [Events and history](#events-and-history).
 
@@ -43,7 +44,7 @@ Two more views keep what happened: **Events** (key `7`), everything hsm noticed 
 |---|---|---|
 | Intel (i915) | engine busy % (3D / Video / Blit) from the i915 perf counters, the same source `intel_gpu_top` uses. Clocks from sysfs. iGPU power from RAPL "uncore". | Exact load needs root or `CAP_PERFMON`. Without it, hsm estimates load from the GPU's RC6 sleep time (shown as `Load~`). |
 | AMD (amdgpu) | `gpu_busy_percent`, VRAM, plus hwmon temperature, power, clocks and fan | Works as a normal user. |
-| NVIDIA (proprietary) | NVML (`libnvidia-ml.so`), loaded with `dlopen()` at startup; whether it's asleep from its PCI device in sysfs | Works as a normal user. Nothing is needed at build time. A laptop GPU that is powered off is left alone (see below). |
+| NVIDIA (proprietary) | NVML (`libnvidia-ml.so`), loaded with `dlopen()` at startup; whether it's asleep from its PCI device in sysfs | Works as a normal user. Nothing is needed at build time. A laptop GPU that is powered off is left alone (see below). Video engines and the PCIe link too, while it's awake. |
 | Others (nouveau, xe, ...) | whatever the driver exposes through hwmon | Load isn't available for these yet. |
 
 ### NVIDIA GPUs on laptops
@@ -57,7 +58,9 @@ A laptop's NVIDIA GPU powers itself off when nothing uses it (runtime D3) and ba
 
 `hsm --once` and `--json` don't wake a sleeping GPU either. If NVML doesn't start (most often right after a driver update, before a reboot), the GPU says why instead of showing as idle.
 
-**Why it's slowing down.** NVIDIA's driver says why the GPU runs below its top clock. hsm shows it next to the temperature (*slowing: heat*, *slowing: power limit*), in the Health panel, in the Hardware view with the card's own temperature limits (where it starts slowing down, its hardware slowdown and shutdown temperatures), as an event when it lasts, and in two log columns. A laptop GPU at its temperature limit under heavy load is normal; spending most of a game there means the cooling can't keep up (dust, a blocked vent, a soft surface under the laptop) and costs frame rate.
+**Why it's slowing down.** NVIDIA's driver says why the GPU runs below its top clock. hsm shows it next to the temperature (*slowing: heat*, *slowing: power limit*), in the Health panel, in the Hardware view with the card's own temperature limits (where it starts slowing down, its hardware slowdown and shutdown temperatures), as an event when it lasts, and in two log columns. A laptop GPU at its temperature limit under heavy load is normal; spending most of a game there means the cooling can't keep up (dust, a blocked vent, a soft surface under the laptop) and costs frame rate. The *GPU slowing* alert tells you when it has gone on for minutes (see [Alerts](#alerts)).
+
+**Video and the PCIe link.** While the GPU is awake, hsm also shows how busy its video encoder and decoder are (recording, streaming, video played back on the GPU), next to the temperature while they are in use, and the PCIe link it runs at (*PCIe 4.0 x8*). An idle card drops to a slower link to save power and speeds it up again under load; one that stays slow under load has a problem with its slot, riser or power settings. Like everything else, these are only read while the GPU is awake anyway.
 
 ## Build and install
 
@@ -85,6 +88,8 @@ After installing, run `hsm` from anywhere. Use `sudo hsm` to also see power, exa
 For desktop alerts, `notify-send` should be installed (package `libnotify` on Arch and Fedora, `libnotify-bin` on Debian and Ubuntu). Most desktops have it already; without it, alerts use the terminal bell.
 
 `make debug` builds with AddressSanitizer and UBSan for development. `make uninstall` removes the installed binary.
+
+**Upgrading from 1.8**: there are two new alerts, *GPU hotter than* (90 °C) and *GPU slowing* (on), and a network check that stays off until you switch it on (Setup, Behaviour). The History view now also keeps what ran each day, in `programs.csv` next to `history.csv`. Nothing else changes in your settings.
 
 **Upgrading from 1.7**: nothing changes in your settings. Without root, the power total is now left empty in the Power panel, logs and history, where it used to be the GPUs alone. USB devices that fail to connect are now warnings: they no longer start an incident log or a *Problems* alert.
 
@@ -176,6 +181,7 @@ A live **Preview** shows where every panel will go. If a column ends up empty, t
 | Refresh interval | 0.25 s to 10 s |
 | Kernel threads | shown / hidden in the process list |
 | Mouse | on / off |
+| Network check | off / on: pings the router and the internet every 2 s (see [Network check](#network-check)) |
 
 **Colours** (the Colours section of the settings list, same keys):
 
@@ -261,6 +267,8 @@ recorder = on          # flight recorder
 recorder_minutes = 10  # how far back it keeps: 2, 5, 10 or 30 (or 1-60 by hand)
 alert_notify = desktop # desktop | bell | both | off
 alert_cpu_temp = 90    # °C, or off
+alert_gpu_temp = 90    # °C, or off
+alert_gpu_slowing = on # a GPU slowing itself down from heat for minutes
 alert_disk_ms = 500    # time per request, held for 10 s, or off
 alert_low_memory = 5   # % of memory available, or off
 alert_throttling = on
@@ -271,6 +279,8 @@ sensor = coretemp/Package id 0 | name CPU | max 90     # your names and limits (
 sensor = nct6798/fan2 | name Front fan | min 400
 sensor = nct6798/in0 | min 1.1 | max 1.4
 sensor = nct6798/AUXTIN3 | hide
+net_check = off        # ping the router and an internet address every 2 s
+net_check_host = default  # the internet address: default is 1.1.1.1; an IP address or a name
 ```
 
 hsm saves the file when you change something in Setup, and on exit only if you changed something during that session, so hand edits aren't overwritten. When you run `sudo hsm`, it uses *your* config file (not root's) and reads and writes it as you, so the file stays owned by you.
@@ -319,7 +329,7 @@ The `utc_offset` column keeps the times correct when the clocks change: on the n
 
 **Deleting old logs.** Press `d` in the Logging view (or use *Delete logs after* in Setup) to choose how long logs are kept: 7, 14, 30, 60, 90, 180 or 365 days, or never deleted (the default). hsm then removes older ones when it starts and once an hour after that, as long as it is running (also as `--watch` or `--log`). Only its own `hsm-*.csv` files are deleted, a day folder only once it is empty, and nothing that a symbolic link points to. After you change the setting, the first clean-up waits 2 minutes, so stepping through the choices doesn't delete anything you wanted to keep.
 
-Besides temperatures, fans, load and clocks, the system log can record everything from the Health panel (CPU throttled %, pressure, OOM kills, PCIe errors, the time the system stood still, NVMe wear / errors / unsafe shutdowns, SATA wear / bad sectors / cable errors), voltages, disk time per request, network errors and Wi-Fi signal, and CPU idle states and wake-ups. The last column, **Events**, holds the text of anything that happened since the previous row (kernel errors, throttling, an OOM kill...), so the moment of a problem is easy to find in a long log.
+Besides temperatures, fans, load and clocks, the system log can record everything from the Health panel (CPU throttled %, the CPU held back by its power limit, pressure, OOM kills, PCIe errors, the time the system stood still, NVMe wear / errors / unsafe shutdowns, SATA wear / bad sectors / cable errors), voltages, disk time per request, network errors and Wi-Fi signal, the network check's delays and lost pings (when it's on as the log starts), an NVIDIA GPU's video engines and PCIe link, and CPU idle states and wake-ups. The last column, **Events**, holds the text of anything that happened since the previous row (kernel errors, throttling, an OOM kill...), so the moment of a problem is easy to find in a long log.
 
 Process log columns: `time`, `utc_offset`, `elapsed_s`, `pid`, `state`, CPU (% of one core), memory %, RSS (MB), threads, disk read and write (MB/s), GPU % and GPU memory (MB), open files, and the whole system's CPU % and CPU temperature next to it, so you can see whether the process was the cause. A steadily climbing open-files count is the classic sign of a file leak.
 
@@ -416,7 +426,7 @@ The event says how long it lasted and, from the pressure figures, what the syste
 16:05:02  freeze   System froze for 2.4 s
 ```
 
-A freeze without a cause usually comes from a driver or the firmware (BIOS SMIs) holding the CPU, or a virtual machine's host. Freezes of 5 seconds or more are errors (and alerts); every one starts an incident log. Suspends are told apart and noted too (*Woke up after 1h 05m asleep*), as are suspends that failed (*Suspend failed at the suspend step, because of 0000:00:14.0*).
+A freeze without a cause usually comes from a driver or the firmware (BIOS SMIs) holding the CPU, or a virtual machine's host. Freezes of 5 seconds or more are errors (and alerts); every one starts an incident log. Suspends are told apart and noted too, with what the battery lost meanwhile (*Woke up after 7h 12m asleep (suspended at 23:10, woke at 06:22); the battery went from 81% to 74%, 1.0% an hour (0.47 W)*): sleep that drains a laptop's battery is a common problem on Linux, and this shows it every morning. Suspends that failed are noted too (*Suspend failed at the suspend step, because of 0000:00:14.0*).
 
 ### Crash detection across reboots
 
@@ -450,12 +460,14 @@ When a limit is crossed, hsm can tell you even while its window is hidden. Set i
 | Alert by | Desktop | how: a desktop notification, the terminal bell, both, or off (the limits below still count as problems for the Health panel and the flight recorder) |
 | CPU hotter than | 90 °C | the CPU stays above it for 5 seconds |
 | CPU throttling | on | the CPU slows down because of heat |
+| GPU hotter than | 90 °C | a GPU stays above it for 5 seconds |
+| GPU slowing | on | a GPU has slowed itself down from heat for about 3 minutes (short breaks don't reset the count; NVIDIA). It comes back after a proper break. |
 | Disk slower than | 500 ms | a drive takes longer than this per request for 10 seconds, or stops answering |
 | Memory left below | 5% | less memory than this is available, for 5 seconds |
 | Disk fuller than | 95% | a file system has used this much of its space, or of its inodes (the number of files it can hold) |
 | Problems | on | freezes of 5 s or more, fans that stopped, kernel errors, out-of-memory kills, failing drives, a disk turned read-only, a crash found at start |
 
-*Send a test alert* (at the end of the section) checks that notifications reach you. Each kind of alert waits 5 minutes before it repeats, and a temperature alert only comes back once the CPU has cooled down by 5 °C. Every alert is also an event in the Health panel and the logs (and starts an incident log).
+*Send a test alert* (at the end of the section) checks that notifications reach you. Each kind of alert waits 5 minutes before it repeats, and a temperature alert only comes back once the CPU (or the GPU) has cooled down by 5 °C. Every alert is also an event in the Health panel and the logs (and starts an incident log).
 
 Desktop notifications go through `notify-send`, run as you also when hsm runs with `sudo`, so they appear on your desktop. When hsm runs as root without sudo (a system service), they go to everyone logged in to a desktop. In the background (`--watch`), alerts are also printed, so they end up in the service's journal.
 
@@ -503,7 +515,7 @@ Set *Delete logs after* (or `log_keep_days` in that user's config file) so a log
 
 | Address | What |
 |---|---|
-| `/metrics` | Prometheus text format: CPU (total and per core), clock, temperature, load, memory and swap, GPUs (with `hsm_gpu_slowed_down{reason="heat"}` and `hsm_gpu_asleep` for NVIDIA), power and RAPL zones, batteries, every sensor (with your names), disk and network byte counters, disk busy % and time per request, file systems, links up and dropped, pressure, throttling, PCIe errors, freezes, kernel errors, drive wear, media errors and bad sectors, and `hsm_health_status` (0 fine, 1 warning, 2 problem, as the badge in the header) |
+| `/metrics` | Prometheus text format: the machine (`hsm_machine_info`), CPU (total and per core), clock, temperature, load, its power limits and `hsm_cpu_power_limited`, memory and swap, GPUs (with `hsm_gpu_slowed_down{reason="heat"}`, `hsm_gpu_asleep`, `hsm_gpu_video_percent` and `hsm_gpu_pcie_link` for NVIDIA), power and RAPL zones, batteries, every sensor (with your names), disk and network byte counters, disk busy % and time per request, file systems, links up and dropped, pressure, throttling, PCIe errors, freezes, runaway processes, kernel errors, drive wear, media errors and bad sectors, the network check's `hsm_ping_seconds` and `hsm_ping_loss_ratio`, and `hsm_health_status` (0 fine, 1 warning, 2 problem, as the badge in the header) |
 | `/json` | the same as `hsm --json` |
 | `/` | a short page with the links and the state right now |
 
@@ -524,6 +536,7 @@ The **Health** panel (on by default, below the GPU) and the top of the **Hardwar
 |---|---|---|
 | **Waiting** CPU / Mem / I/O | The kernel's *pressure stall information* (PSI): the share of time tasks had to wait for the CPU, for memory, or for the disk. This is the best single measure of "the computer is struggling", better than CPU % or load average. The Hardware view also shows the kernel's 10 s / 1 min / 5 min averages and the "full" figure (every task waiting at once). | under 10%. Memory pressure above a few % means it is swapping or reclaiming hard. |
 | **Throttling** | The CPU slowing itself down because it reached its temperature limit, counted by the CPU itself (Intel). Shows "NOW" while it happens, how often since hsm started, and since boot. | none. Some at heavy load on a small case or laptop is common; often means dust, dried thermal paste or a weak fan. |
+| **Power limit** | The CPU held back by its [power limit](#cpu-power-limits) rather than by heat: it draws what the limit allows while its clock stays below what it can do. Shown while it happens and as the share of its busy time since start; needs root. | common on laptops under sustained load, where the CPU and GPU share one budget |
 | **GPU** | NVIDIA GPUs: holding its clock back now, by heat or by its power limit, or how much of its busy time it did since hsm started (see [NVIDIA GPUs on laptops](#nvidia-gpus-on-laptops)). | *full speed*. A laptop GPU under heavy load often sits at its temperature limit. |
 | **OOM kills** | Processes the kernel killed because memory ran out (the reason behind apps that "crash for no reason"). | none |
 | **PCIe** | Errors on the PCIe bus, counted per device (AER). Corrected errors are retried by the hardware; uncorrected ones lose data. | none. A slowly growing corrected count points at a failing drive, GPU, riser or slot, or a power problem. |
@@ -534,9 +547,10 @@ The **Health** panel (on by default, below the GPU) and the top of the **Hardwar
 | **Froze** | The whole system stood still for 2 s or more (see [Freezes](#freezes)); shown once it happened. | never |
 | *fan* events | A fan that was turning stopped while the CPU (or, for a graphics card's fan, the card) is at 70 °C or more. Fans that rest when it's cool, and headers with nothing plugged in, don't count. | never |
 | *disk* events | A file system almost full (your *Disk fuller than* limit, space or inodes), or one that turned read-only: ext4 and others do that after disk errors, and from then on every write fails. | never |
-| *net* events | A cable or Wi-Fi link lost, back after how long, or dropped for a moment (Linux 4.16+). Links switched off on purpose and the time around a suspend don't count. | rare |
+| *net* events | A cable or Wi-Fi link lost, back after how long, or dropped for a moment (Linux 4.16+). Links switched off on purpose and the time around a suspend don't count. With the [network check](#network-check) on, also pings lost or far slower than usual: to the router (Wi-Fi or cable trouble) or only to the internet (beyond your network). | rare |
 | *slow* events | One of hsm's readings took a second or more, and the screen waited for it: which sensor chip, GPU, process or check. On laptops it's usually the firmware's sensors (fans, battery); hiding that sensor in Setup stops hsm from reading it. When the whole system stood still, that's reported as a freeze instead. | never |
 | *leak* events | A process whose memory only ever grows: by 256 MB and by a third at least, over half an hour or more, hardly ever giving any back. Normal programs go up and down. Its RSS gets a `↑` in the process list, and its details page shows the last two hours. | none, or a program to keep an eye on |
+| *runaway* events | A process that has kept a whole core busy for 15 minutes without a break: a stuck browser tab, something left running after a game closed, an indexer that never finishes. It costs battery and fan noise. Programs using the GPU don't count, so games and video don't set it off, and names stay as the program gives them. Its CPU % gets a `!` in the process list, and its details page says how long. | none |
 | *events* | The latest of all of the above, newest first, with the time. Hsm adds its own: throttling started, memory ran out, new PCIe errors, a temperature reaching its limit, new bad sectors or cable errors, alerts, an unexpected end of the last session, the CPU governor changing. Problems name the [busiest process](#who-was-busy) at that moment. | |
 
 Three of these need root (run `sudo hsm`): the kernel log (most distributions restrict it), the NVMe health log and SATA drive health. Everything else works as a normal user. Your own limits for sensors (see *Sensors* in [Customizing](#customizing-the-dashboard)) add events of their own. Throttling counters exist on Intel CPUs; AMD CPUs throttle too but don't report it this way.
@@ -545,12 +559,24 @@ All of it can be recorded: see [Logging](#logging), which also writes the events
 
 **After a crash**: if hsm was running, it says so at the next start and has saved the minutes before (see [Catching failures](#catching-failures)); the log viewer shows them. Then `journalctl -b -1 -e` shows the end of the previous boot's system log, with the kernel messages from the moment it went down.
 
+## Network check
+
+Off until you switch it on (Setup, Behaviour: *Network check*, or `net_check = on` in the config file). hsm then pings your router (the IPv4 default route's gateway) and one internet address (1.1.1.1 unless you set `net_check_host`) every 2 seconds:
+
+* the **Network** panel shows the delay to each and the share of pings lost over the last minute (*ping router 3.2 ms · internet 18 ms*), the Hardware view the average, the range and the jitter (how much the delay varies);
+* comparing the two tells where a problem is: when the router itself answers late or not at all, it's your Wi-Fi or cable; when only the internet does, it's beyond your network (the provider, or the line);
+* trouble is an event when it starts (3 of the last 10 pings lost, or the delay far above usual, over 100 ms) and when it's over, with how long it lasted, e.g. *Wi-Fi trouble: 40% of the pings to the router are lost*. That also explains lag spikes in games;
+* logs started while it runs get four columns (the delay to each, and the losses), and `/metrics` and `/json` have them too.
+
+Each ping is 44 bytes, so the check costs nothing worth mentioning, but it does send packets every 2 seconds, which is why it's off unless you ask for it. It uses the kernel's unprivileged ping sockets (see [Permissions](#permissions-what-needs-root)); the network check itself runs in a small thread of its own.
+
 ## Process details
 
 `Enter` (or a double click) on a process, in the Processes view or the dashboard's list, opens everything about it:
 
 * where it comes from: the whole command line, the program file, when it started and by whom, its parent (click it to go there), its service or container, its working folder, state, threads and nice value;
 * what it uses: CPU now, in all and on average, with a graph since the page opened; memory in RAM split into its own, files and shared, virtual size, its highest ever, swapped out, and its OOM score (the higher, the sooner the kernel kills it when memory runs out);
+* how long it has kept a whole core busy without a break, once that's 5 minutes or more;
 * growth: how its memory changed over the last two hours, once it uses 64 MB or more, and whether it only ever grows (a leak, or a cache without a limit);
 * disk read and write now and in all, GPU use and memory, open files by kind (files, sockets, pipes) against its limit, and how often it waits or gets taken off the CPU;
 * the processes it started (click one to open it).
@@ -562,6 +588,8 @@ All of it can be recorded: see [Logging](#logging), which also writes the events
 **Events** (view `7`) keeps everything hsm noticed, across runs and reboots, in `~/.local/state/hsm/events.log`: throttling, freezes, suspends, kernel errors, full disks, dropped links, finished drive self-tests, cooling checks, your alerts... grouped by day, newest first, with the counts of the last day and week at the top. `/` searches the text and the category, `e` switches between all, warnings and errors, and errors only; the selected event is shown in full at the bottom, with what it means in plain words for the cryptic ones (USB devices that fail to connect, and whether the port is an outside socket or built in; NVIDIA Xid codes, segfaults, I/O errors, lockups, slow readings...). The same line repeated right away, as the kernel does when it retries, is kept once: *... (3 times)*. Kernel messages from before hsm started are added once, not at every start. The file is plain text with tabs (time, level, category, text), starts over as `events.log.1` at 4 MB, and stays readable by other tools.
 
 **History** (view `8`) keeps one line per day in `~/.local/state/hsm/history.csv`: the hours some hsm was running, CPU use and temperature (average and highest), memory, swap, power, gigabytes read, written, received and sent, the hottest GPU and drive (the drive's own sensor when its health log needs root), time throttled, freezes, out-of-memory kills, errors and warnings, the most worn drive, the fullest file system and the battery's health. The view shows the days, newest first, and above them how things changed: a column per day for the last two months, and the last week against the same week a month before, so *CPU temp, peak: last week 79 °C, a month before 72 °C (+7)* tells you to clean the fan before it turns into throttling. Drive wear also gets an estimate of when it reaches 100% at its current pace.
+
+**What ran each day.** `↑` `↓` (or a click) select a day, and below the list hsm shows what ran on it: the programs that used the most CPU time, GPU time and disk writes, so *what kept the fans going yesterday?* has an answer. Programs are grouped by the name the kernel knows them by, unchanged (a game's process, `firefox`, `baloo_file`); kernel threads are left out, and a program's writes include those of short-lived helpers it started. The hsm that keeps the history counts them, and `programs.csv` (next to `history.csv`, a year's worth) keeps the top ten of each.
 
 Only one hsm writes these files at a time: with a `hsm --watch` service running, an open screen leaves the writing to it, and takes over within a minute if the service stops. A day covers only the hours some hsm was running, so a service gives you whole days. Today's line is saved every 10 minutes and when hsm closes.
 
@@ -619,7 +647,7 @@ Before sending, hsm checks that the PID still belongs to the same process you se
 
 ## JSON output
 
-`hsm --json` prints one snapshot of everything as JSON and exits, for scripts and other tools: the CPU (with every core), memory, GPUs (NVIDIA ones with `state`, `temp_limit_c` and why they're slowing down), power, drives and file systems, network, sensors (with your names and limits), health (pressure, throttling, PCIe errors, every drive's health, the recent events), services and processes (all of them, or the busiest `-n N` by CPU). The same comes from `/json` of [`hsm --serve`](#serving-metrics-prometheus-grafana), where `health.since_start` also counts freezes, suspends, dropped links and stopped fans. Units are in the key names (`_pct`, `_c`, `_mhz`, `_w`, `_bytes`, `_bps`, `_ms`), and anything the machine doesn't report is `null`.
+`hsm --json` prints one snapshot of everything as JSON and exits, for scripts and other tools: the machine (model, board, BIOS), the CPU (with every core, and its `power_limit`), memory, GPUs (NVIDIA ones with `state`, `temp_limit_c`, why they're slowing down, their video engines and PCIe link), power, drives and file systems, network, sensors (with your names and limits), health (pressure, throttling, PCIe errors, every drive's health, the recent events), services and processes (all of them, or the busiest `-n N` by CPU; each with `busy_minutes` and `runaway`). With the network check on, `network_check` has the router's and the internet's delay and losses (`/json` only: a single snapshot has nothing to compare). The same comes from `/json` of [`hsm --serve`](#serving-metrics-prometheus-grafana), where `health.since_start` also counts freezes, suspends, dropped links and stopped fans. Units are in the key names (`_pct`, `_c`, `_mhz`, `_w`, `_bytes`, `_bps`, `_ms`), and anything the machine doesn't report is `null`.
 
 ```sh
 hsm --json | jq '.cpu.temp_c'
@@ -641,6 +669,8 @@ Most things work as a normal user. A few are restricted by the kernel:
 | NVMe and SATA drive health, self-tests and error logs | the drive's device node is root-only | Run `sudo hsm`. |
 | Kernel crash reports saved by systemd | `/var/lib/systemd/pstore` is root-only | Run `sudo hsm` once after a crash. Reports still in `/sys/fs/pstore` are shown to everyone who can read them. |
 | Raising a process's priority (negative nice) | needs `CAP_SYS_NICE` | Run `sudo hsm`. Lowering your own processes' priority always works. |
+| When the power limit holds the CPU back | needs the package's power (RAPL, above) | Run `sudo hsm`. The limits themselves show for everyone. |
+| The network check's pings | ping sockets are allowed for the groups in `net.ipv4.ping_group_range` (everyone on most distributions) | Otherwise run `sudo hsm`, which uses a raw socket instead, or widen the range: `sudo sysctl net.ipv4.ping_group_range="0 2147483647"`. |
 | Open files and GPU use of other users' processes | protected like ptrace | Run `sudo hsm`. Your own processes always show them. |
 
 **Making RAPL readable permanently (optional, single-user machines only).** This re-opens the side channel the kernel restriction closes, so only do it on a machine where you are the only user. Create `/etc/tmpfiles.d/hsm-rapl.conf`:
@@ -666,13 +696,19 @@ The Power panel title shows the best whole-machine figure it can find, in this o
 
 Without the CPU part (RAPL needs root) there is no total: the title says *total needs root*, the power graph shows the GPUs (labelled so), and logs and the daily history leave the total empty rather than record the GPUs as if they were everything. Each power meter keeps the time of its own last read, so a sample that was held up can't turn into a fake spike of power.
 
+### CPU power limits
+
+A CPU may draw only so much power: a **sustained** limit, which its power averaged over a time window (often 28 s) has to stay under, and a higher one for **short boosts**. Laptop makers set them to what the cooling and the power supply can take, and change them with the performance profile (the ASUS and Lenovo keys, `powerprofilesctl`). The Hardware view shows them under the CPU's power settings, and so do `--once`, `--json` and `/metrics`; reading them needs no root. Some firmware keeps a second set of its own (through MMIO): then both are shown, and the lower one is what counts.
+
+With the CPU package's power (root), hsm also says when the limit, not heat, holds the CPU back: it draws what the limit allows while its clock stays below what it can do. The CPU panel then shows *slowing: power limit* next to the clock (*slowing: heat* while it throttles), the Health panel *Power limit: holding the CPU back*, and the Hardware view how much of its busy time it spent there. On a gaming laptop the CPU and GPU share one power budget, so this explains why the CPU clock drops in games although it isn't hot. A log can record it (*CPU held back by power limit*), and the log viewer's summary counts it.
+
 ## Project layout
 
 ```
 src/main.c        argument parsing, main loop (sampling + input on one thread, no busy-waiting), headless --log /
                   --watch / --serve, --cooling-check
 src/config.c      settings file: load, save, defaults (sudo-safe)
-src/sys.c         ties the collectors together, history buffers, total-power estimate
+src/sys.c         ties the collectors together, history buffers, total-power estimate, the machine (DMI)
 src/cpu.c         /proc/stat, cpufreq, topology, /proc/cpuinfo, load, uptime
 src/mem.c         /proc/meminfo, /proc/vmstat
 src/disk.c        /proc/diskstats (physical drives only), filesystems
@@ -683,6 +719,8 @@ src/health.c      throttling, pressure stalls, OOM kills, PCIe AER, NVMe health 
                   fans, links, read-only disks, your sensor limits, events, blame
 src/freeze.c      freeze detection: a watchdog thread that notices when nothing could run, and suspends
 src/leak.c        processes whose memory keeps growing
+src/runaway.c     processes that keep a whole core busy for a long time
+src/netcheck.c    the network check: a thread that pings the router and the internet
 src/ata.c         SATA drive health: SMART attributes through ATA pass-through, without waking sleeping disks
 src/selftest.c    the drives' self-tests and error logs (NVMe admin commands, ATA SMART logs)
 src/cooling.c     the cooling check: load threads, measurements, verdict, cooling.log
@@ -699,13 +737,14 @@ src/ui_log.c      Logging view: choose values, start / stop logs, process logs, 
 src/ui_logview.c  saved logs: the list, and the viewer (CSV loader, graphs, events, SVG pictures)
 src/ui_svc.c      Services view and panel
 src/ui_pdetail.c  process details page (Enter)
-src/ui_events.c   Events view (7) and History view (8)
+src/ui_events.c   Events view (7) and History view (8), with what ran on the selected day
 src/ui_sensors.c  Setup > Sensor names and limits
 src/ui_drives.c   Hardware view > D: drive self-tests
 src/ui_cool.c     Hardware view > C: the cooling check
 src/log.c         logging: the list of values, CSV system and process logs, day folders, clean-up (sudo-safe)
 src/watch.c       what runs after every sample, with or without the screen: the ones below and log clean-up
 src/history.c     events.log and history.csv: one writer at a time, daily figures
+src/programs.c    what ran each day: CPU time, GPU time and writes per program, programs.csv
 src/recorder.c    flight recorder: the last minutes in memory and in rolling files, incident logs
 src/session.c     crash detection: session heartbeat, unexpected ends, pstore crash reports
 src/alert.c       alerts: limits, notify-send as the logged-in user, alert_command, terminal bell
@@ -719,7 +758,7 @@ Every collector keeps its own previous counters and turns them into rates using 
 
 ### Testing against fake hardware
 
-For development, `HSM_SYSFS`, `HSM_PROCFS`, `HSM_DEVFS` and `HSM_PCI_IDS` point the program at a different `/sys`, `/proc`, `/dev` (kernel log, NVMe and SATA drives) or `pci.ids`, and `HSM_PSTORE` at a different folder of saved crash reports. That lets you test GPU, RAPL, battery, fan, sensor and drive code on machines without that hardware: a SATA drive there is a plain file holding its 512-byte SMART data, the 512-byte thresholds, and optionally its self-test log and summary error log (512 bytes each); an NVMe drive its SMART log page, then optionally its self-test log (564 bytes) and error log (1024 bytes). Self-tests started on such a file are pretended. `HSM_FREEZE_SIM="stall:3.5@4,suspend:3600@8"` reports a 3.5 s freeze 4 s after the start and an hour's suspend after 8 s, and `HSM_STILL_AFTER=10` marks sensors as unchanged after 10 s instead of 5 minutes. For NVIDIA code, a small library of your own named `libnvidia-ml.so.1` in `LD_LIBRARY_PATH` stands in for the driver's. These variables are ignored when the binary runs setuid or with file capabilities.
+For development, `HSM_SYSFS`, `HSM_PROCFS`, `HSM_DEVFS` and `HSM_PCI_IDS` point the program at a different `/sys`, `/proc`, `/dev` (kernel log, NVMe and SATA drives) or `pci.ids`, and `HSM_PSTORE` at a different folder of saved crash reports. That lets you test GPU, RAPL, battery, fan, sensor and drive code on machines without that hardware: a SATA drive there is a plain file holding its 512-byte SMART data, the 512-byte thresholds, and optionally its self-test log and summary error log (512 bytes each); an NVMe drive its SMART log page, then optionally its self-test log (564 bytes) and error log (1024 bytes). Self-tests started on such a file are pretended. `HSM_FREEZE_SIM="stall:3.5@4,suspend:3600@8"` reports a 3.5 s freeze 4 s after the start and an hour's suspend after 8 s, `HSM_STILL_AFTER=10` marks sensors as unchanged after 10 s instead of 5 minutes, and `HSM_RUNAWAY_MIN=2` calls out a busy process after 2 minutes instead of 15. A `net/route` file in `HSM_PROCFS` points the network check at any router, and `class/dmi/id` in `HSM_SYSFS` describes a machine. For NVIDIA code, a small library of your own named `libnvidia-ml.so.1` in `LD_LIBRARY_PATH` stands in for the driver's. These variables are ignored when the binary runs setuid or with file capabilities.
 
 ## Ideas for later
 

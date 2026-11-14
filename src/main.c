@@ -154,6 +154,8 @@ static int headless(ui_state_t *u, int sys_log, const pid_t *pids, int npid, dou
 
     sleep_sec(0.25);
     sys_sample(&S);
+    netq_set(u->net_check, u->net_check_host); /* the network check, if it's on: its columns too */
+    netq_read(&S.net.q);
     log_build_channels(&S, u->log_skip);
     if (watch) {
         u->rec_on = 1; /* that's what --watch is for, whatever the screen's setting */
@@ -215,6 +217,7 @@ static int headless(ui_state_t *u, int sys_log, const pid_t *pids, int npid, dou
     }
     if (watch)
         watch_end();
+    netq_set(0, NULL);
     if (sfd >= 0)
         close(sfd);
     print_note();
@@ -402,8 +405,7 @@ int main(int argc, char **argv)
     sensors_apply(&S.sens, u.srule, u.nsrule);
     if (interval > 0)
         u.interval = interval;
-    log_build_channels(&S, u.log_skip);
-    watch_start(&S, &u, "screen", 1); /* how did the last session end? */
+    watch_start(&S, &u, "screen", 1); /* how did the last session end? (and the logs' columns) */
     u.notice_open = g_notice.n > 0;
     if (ui_init(utf8) != 0) {
         const char *t = getenv("TERM");

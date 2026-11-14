@@ -25,6 +25,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
@@ -432,6 +433,17 @@ static void hw_gpus(sys_t *s, lc_t *c)
             lc_kv(c, "  Fan", A_BOLD, "%.0f%%", g->fan_pct);
         else if (g->fan_rpm >= 0)
             lc_kv(c, "  Fan", A_BOLD, "%.0f RPM", g->fan_rpm);
+        if (g->enc_pct >= 0 || g->dec_pct >= 0)
+            lc_kv(c, "  Video", A_BOLD, "encoding %.0f%%, decoding %.0f%%", MAX(g->enc_pct, 0), MAX(g->dec_pct, 0));
+        if (g->pcie_gen > 0 && g->pcie_width > 0) {
+            int below = (g->pcie_gen_max > g->pcie_gen) || (g->pcie_width_max > g->pcie_width);
+            if (below)
+                lc_kv(c, "  PCIe link", A_BOLD, "%d.0 x%d now, up to %d.0 x%d%s", g->pcie_gen, g->pcie_width,
+                      MAX(g->pcie_gen_max, g->pcie_gen), MAX(g->pcie_width_max, g->pcie_width),
+                      g->util < 30 ? "  (slower while idle, to save power)" : "");
+            else
+                lc_kv(c, "  PCIe link", A_BOLD, "%d.0 x%d (its best)", g->pcie_gen, g->pcie_width);
+        }
         if (g->util_est)
             lc_kv(c, "  Note", A_GRAY, "%s", "load estimated from RC6 sleep time; run as root for exact per-engine load");
         else if (g->util >= 0 && g->note[0])
@@ -502,6 +514,55 @@ static void hw_power(sys_t *s, lc_t *c)
         lc_kv(c, "AC adapter", A_BOLD, "%s", p->ac_online ? "online" : "offline");
 }
 
+/* "30 s", "2.4 ms", "4 min" */
+static void fmt_window(double sec, char *out, size_t n)
+{
+    if (sec < 1)
+        sfmt(out, n, "%.1f ms", sec * 1000);
+    else if (sec < 120)
+        sfmt(out, n, "%.0f s", sec);
+    else
+        sfmt(out, n, "%.0f min", sec / 60);
+}
+
+/* how much the CPU package may draw, and whether that holds it back */
+static void hw_cpu_limits(sys_t *s, lc_t *c)
+{
+    const cpulim_t *L = &s->power.lim;
+    const health_t *H = &s->health;
+    if (!L->ok)
+        return;
+    char line[160] = "", win[24];
+    if (L->eff_long_w > 0) {
+        app(line, sizeof line, "%.0f W sustained", L->eff_long_w);
+        if (L->long_s > 0) {
+            fmt_window(L->long_s, win, sizeof win);
+            app(line, sizeof line, " (averaged over %s)", win);
+        }
+    } else if (L->long_off) {
+        app(line, sizeof line, "%s", "no sustained limit (switched off)");
+    }
+    if (L->eff_short_w > 0)
+        app(line, sizeof line, "%s%.0f W in short boosts", line[0] ? ", " : "", L->eff_short_w);
+    lc_kv(c, "Power limits", A_BOLD, "%s", line);
+    /* the firmware's own copy, when it differs: the lower one is what counts */
+    int dl = L->fw_long_w > 0 && L->long_w > 0 && L->fw_long_w != L->long_w;
+    int ds = L->fw_short_w > 0 && L->short_w > 0 && L->fw_short_w != L->short_w;
+    if (dl || ds)
+        lc_kv(c, "", A_GRAY, "CPU %.0f / %.0f W, firmware %.0f / %.0f W: the lower one applies", L->long_w,
+              L->short_w, L->fw_long_w, L->fw_short_w);
+    if (H->pl_now)
+        lc_kv(c, "", CP(C_WARN) | A_BOLD, "holding the CPU back now: the package draws %.1f W%s", s->power.pkg_w,
+              H->pl_now == PL_SHORT ? " (the boost limit)" : "");
+    else if (H->pl_known && H->pl_held_s >= 5 && H->pl_busy_s > 0)
+        lc_kv(c, "", A_NORMAL, "held the CPU back %.0f%% of its busy time since start",
+              100.0 * H->pl_held_s / H->pl_busy_s);
+    else if (H->pl_known)
+        lc_kv(c, "", A_GRAY, "%s", "haven't held the CPU back since start");
+    else if (s->power.rapl_denied && geteuid() != 0)
+        lc_kv(c, "", A_GRAY, "%s", "run 'sudo hsm' to see when they hold the CPU back");
+}
+
 static void hw_system(sys_t *s, lc_t *c)
 {
     cpu_t *cv = &s->cpu;
@@ -509,6 +570,36 @@ static void hw_system(sys_t *s, lc_t *c)
     char a[24], b[24], d[24];
     lc_title(c, "System");
     lc_kv(c, "Host", A_BOLD, "%s", s->host);
+    const machine_t *mc = &s->mach;
+    if (mc->ok) { /* as the firmware describes it */
+        char mm[200] = "";
+        app(mm, sizeof mm, "%s", mc->model[0] ? mc->model : "?");
+        if (mc->type[0])
+            app(mm, sizeof mm, " (%s)", mc->type);
+        lc_kv(c, "Machine", A_BOLD, "%s", mm);
+        mm[0] = '\0';
+        if (mc->vendor[0])
+            app(mm, sizeof mm, "made by %s", mc->vendor);
+        if (mc->board[0])
+            app(mm, sizeof mm, "%sboard %s", mm[0] ? SEP : "", mc->board);
+        if (mm[0])
+            lc_kv(c, "", A_NORMAL, "%s", mm);
+        if (mc->bios_version[0]) {
+            char bd[32] = "";
+            if (mc->bios_date) {
+                struct tm tm;
+                memset(&tm, 0, sizeof tm);
+                tm.tm_year = mc->bios_date / 10000 - 1900;
+                tm.tm_mon = mc->bios_date / 100 % 100 - 1;
+                tm.tm_mday = mc->bios_date % 100;
+                tm.tm_hour = 12;
+                mktime(&tm);
+                strftime(bd, sizeof bd, " from %d %b %Y", &tm);
+            }
+            lc_kv(c, "BIOS", A_NORMAL, "%s%s%s%s%s", mc->bios_version, bd, mc->bios_vendor[0] ? " (" : "",
+                  mc->bios_vendor, mc->bios_vendor[0] ? ")" : "");
+        }
+    }
     lc_kv(c, "OS", A_NORMAL, "%s", s->os);
     lc_kv(c, "Kernel", A_NORMAL, "%s (%s)", s->kernel, s->arch);
     fmt_duration(cv->uptime, a, sizeof a);
@@ -552,6 +643,7 @@ static void hw_system(sys_t *s, lc_t *c)
             lc_kv(c, "", capped || cv->turbo == 0 ? CP(C_WARN) : A_NORMAL, "%s%s", pw,
                   capped ? "  (below what the CPU can do)" : "");
     }
+    hw_cpu_limits(s, c);
     if (cv->nidle) { /* "C1 2%  C6 12%  C10 55%", wrapped to the column */
         char id[256] = "", w[24], tok[48];
         int first = 1, vw = c->w - MIN(16, c->w / 3) - 1;
@@ -671,6 +763,44 @@ static void hw_network(sys_t *s, lc_t *c)
             lc_text(c, f->err_rate + f->drop_rate > 0 ? CP(C_CRIT) | A_BOLD : A_GRAY,
                     "  %llu errors, %llu dropped packets since boot (now %.0f/s)", f->errors, f->drops,
                     f->err_rate + f->drop_rate);
+    }
+    const netq_t *q = &s->net.q;
+    if (!q->on) {
+        lc_kv(c, "Network check", A_GRAY, "%s", "off (Setup > Behaviour: pings for delay and lost packets)");
+        return;
+    }
+    if (q->err) {
+        lc_kv(c, "Network check", CP(C_WARN), "can't ping: %s", q->err == EACCES || q->err == EPERM
+                                                ? "not allowed for this user (sysctl net.ipv4.ping_group_range)" : strerror(q->err));
+        return;
+    }
+    lc_kv(c, "Network check", A_NORMAL, "%s", "a ping every 2 s; figures over the last minute");
+    static const char *const nm[NQ_COUNT] = { "  Router", "  Internet" };
+    for (int k = 0; k < NQ_COUNT; k++) {
+        const nqt_t *t = &q->t[k];
+        char where[80];
+        if (k == NQ_ROUTER && t->addr[0] && q->iface[0])
+            sfmt(where, sizeof where, "%s on %s", t->addr, q->iface);
+        else
+            str_copy(where, sizeof where, t->addr[0] ? t->addr : k == NQ_ROUTER ? "no router (no default route)" : "...");
+        if (t->noroute) {
+            lc_kv(c, nm[k], CP(C_WARN), "%s: no network to reach it", where);
+            continue;
+        }
+        if (t->avg_ms < 0) {
+            lc_kv(c, nm[k], t->loss_pct > 0 ? CP(C_CRIT) | A_BOLD : A_GRAY, "%s%s", where,
+                  t->loss_pct > 0 ? ": no answers" : "");
+            continue;
+        }
+        char now[24];
+        if (t->rtt_ms >= 0)
+            sfmt(now, sizeof now, "%.1f ms now", t->rtt_ms);
+        else
+            str_copy(now, sizeof now, "the last one lost");
+        lc_kv(c, nm[k], t->trouble ? CP(C_WARN) | A_BOLD : A_BOLD, "%s: %s, %.1f ms average (%.1f-%.1f, jitter %.1f)",
+              where, now, t->avg_ms, t->min_ms, t->max_ms, MAX(t->jitter_ms, 0));
+        lc_kv(c, "", t->loss_pct >= 10 ? CP(C_CRIT) | A_BOLD : t->loss_pct > 0 ? CP(C_WARN) : A_GRAY,
+              "%.0f%% lost%s", MAX(t->loss_pct, 0), t->trouble == NQ_LOSS ? "  (trouble now)" : t->trouble == NQ_SLOW ? "  (slow now)" : "");
     }
 }
 

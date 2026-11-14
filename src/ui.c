@@ -170,7 +170,7 @@ static void footer(ui_state_t *u)
         { "1-8", "View", 0 },     { "?", "Help", '?' },   { "q", "Quit", 'q' },
     };
     static const hint_t hikeys[] = {
-        { "Up/Dn", "Scroll", 0 }, { "1-8", "View", 0 }, { "?", "Help", '?' }, { "q", "Quit", 'q' },
+        { "Up/Dn", "Day", 0 }, { "1-8", "View", 0 }, { "?", "Help", '?' }, { "q", "Quit", 'q' },
     };
     static const hint_t hwkeys[] = {
         { "Up/Dn", "Scroll", 0 }, { "D", "Drive tests", 'D' }, { "C", "Cooling check", 'C' },
@@ -237,7 +237,7 @@ static void help_overlay(void)
 {
     static const char *const L[][2] = {
         { "1 - 6, Tab", "Dashboard Processes Hardware Setup Logging Services" },
-        { "7 8", "Events (kept across runs) / History (a line per day)" },
+        { "7 8", "Events (kept across runs) / History (a day each; what ran)" },
         { "Enter", "everything about the selected process (Esc: back)" },
         { "s, F2", "Setup: choose, arrange and style the panels" },
         { "Up Down PgUp PgDn", "move the selection or scroll (Home / End too)" },
@@ -597,6 +597,7 @@ static int mouse_event(sys_t *s, ui_state_t *u)
     case HIT_SENSOR: sensors_page_click(u, h->a, dbl); break;
     case HIT_PD: pdetail_click(s, u, h->a); break;
     case HIT_EVENT: events_click(u, h->a); break;
+    case HIT_HIST: history_click(u, h->a); break;
     case HIT_DRIVE: drives_click(u, h->a); break;
     case HIT_LOGCH: log_click(s, u, h->a, h->b, dbl); break;
     case HIT_FILE:

@@ -92,7 +92,7 @@ typedef struct {
     int ev_level; /* lowest level shown: EV_INFO, EV_WARN, EV_ERR */
     int ev_sel, ev_scroll;
     char ev_filter[64];
-    int hist_scroll;
+    int hist_scroll, hist_sel; /* History view: the first day shown, the selected one (0 = newest) */
 
     /* Hardware view pages: drive self-tests (D), cooling check (C) */
     int drv_open, drv_sel, drv_confirm; /* confirm: 1 short / 2 extended waits for y */
@@ -122,12 +122,16 @@ typedef struct {
     /* alerts */
     int alert_notify;      /* ALERT_* */
     int alert_cpu_temp;    /* °C, 0 = off */
+    int alert_gpu_temp;    /* °C, 0 = off */
     int alert_disk_ms;     /* time per request, 0 = off */
     int alert_mem_pct;     /* memory available below, 0 = off */
     int alert_disk_full;   /* a file system this % full, 0 = off */
     srule_t srule[MAX_SRULES]; /* your sensor names, limits, hidden sensors */
     int nsrule;
     int alert_throttle, alert_problems;
+    int alert_gpu_slow;    /* the GPU slowing itself down from heat for minutes */
+    int net_check;         /* ping the router and an internet address (netcheck.c) */
+    char net_check_host[128]; /* that address; "" = 1.1.1.1 */
     char alert_command[PATHBUF];
 
     /* log viewer (inside view 5) */
