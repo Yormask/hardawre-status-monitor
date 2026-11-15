@@ -48,7 +48,7 @@ enum {
     CH_CPU_TOTAL, CH_CPU_USER, CH_CPU_SYS, CH_CPU_IOWAIT, CH_CPU_CLOCK, CH_CPU_TEMP, CH_LOAD1,
     CH_CORE, CH_CORE_CLOCK, CH_MEM_PCT, CH_MEM_USED, CH_SWAP_USED,
     CH_GPU_LOAD, CH_GPU_TEMP, CH_GPU_POWER, CH_GPU_CLOCK, CH_GPU_VRAM,
-    CH_POWER_TOTAL, CH_RAPL, CH_BAT_POWER, CH_BAT_CHARGE, CH_SENSOR,
+    CH_POWER_TOTAL, CH_RAPL, CH_BAT_POWER, CH_BAT_CHARGE, CH_USBC, CH_SENSOR,
     CH_DISK_R, CH_DISK_W, CH_DISK_BUSY, CH_NET_RX, CH_NET_TX,
     CH_THROTTLE, CH_PSI, CH_OOM, CH_PCIE, CH_NVME_USED, CH_NVME_MEDIA, CH_NVME_UNSAFE, CH_NVME_WARN, CH_NVME_HEAT,
     CH_SATA_WEAR, CH_SATA_REALLOC, CH_SATA_PENDING, CH_SATA_CRC,
@@ -231,11 +231,13 @@ void log_build_channels(sys_t *s, const char *skip)
             sfmt(lab, sizeof lab, "%s VRAM used", gn);
             add("GPU", CH_GPU_VRAM, i, "", "MB", lab, "gpu%d.vram", i);
         }
-        if (nv) { /* held back, as the driver says: 100 = this whole sample, 0 = full speed */
+        if (nv || g->reasons_ok) { /* held back, as the driver says: 100 = this whole sample, 0 = full speed */
             sfmt(lab, sizeof lab, "%s slowed by heat", gn);
             add("GPU", CH_GPU_SLOW_HEAT, i, "", "%", lab, "gpu%d.slow_heat", i);
             sfmt(lab, sizeof lab, "%s slowed by power limit", gn);
             add("GPU", CH_GPU_SLOW_POWER, i, "", "%", lab, "gpu%d.slow_power", i);
+        }
+        if (nv) {
             sfmt(lab, sizeof lab, "%s video encode", gn);
             add("GPU", CH_GPU_ENC, i, "", "%", lab, "gpu%d.encode", i);
             sfmt(lab, sizeof lab, "%s video decode", gn);
@@ -260,20 +262,21 @@ void log_build_channels(sys_t *s, const char *skip)
         sfmt(lab, sizeof lab, "%s charge", s->power.bat[i].name);
         add("Power", CH_BAT_CHARGE, i, "", "%", lab, "power.%s.charge", s->power.bat[i].name);
     }
+    if (s->power.nbat && s->power.nusbc) /* a laptop that charges over USB-C: what the charger gives (0 = none) */
+        add("Power", CH_USBC, 0, "", "W", "USB-C charger", "power.usbc_charger");
 
-    static const char *const unit[] = { "C", "RPM", "W", "V" };
-    static const char *const grp[] = { "Temperatures", "Fans", "Power", "Voltages" };
+    static const char *const grp[] = { "Temperatures", "Fans", "Power", "Voltages", "Your values" };
     for (int i = 0; i < s->sens.n; i++) {
         sensor_t *t = &s->sens.s[i];
         if (t->hidden)
             continue;
         char chip[24];
         sensors_chip_name(t->chip, chip, sizeof chip);
-        if (t->name[0])
-            str_copy(lab, sizeof lab, t->name);
+        if (t->name[0] || t->file)
+            str_copy(lab, sizeof lab, sensor_label(t));
         else
             sfmt(lab, sizeof lab, "%s %s", chip, t->label); /* "CPU Core 0", "NVMe Composite" */
-        add(grp[t->type], CH_SENSOR, i, "", unit[t->type], lab, "sensor.%s.%s", t->chip, t->label);
+        add(grp[t->file ? SENS_OTHER : t->type], CH_SENSOR, i, "", sensor_unit(t), lab, "sensor.%s.%s", t->chip, t->label);
     }
 
     for (int i = 0; i < s->disks.n; i++) {
@@ -316,6 +319,8 @@ void log_build_channels(sys_t *s, const char *skip)
         add("Network", CH_PING_LOSS, NQ_ROUTER, "", "%", "Router pings lost", "net.ping.router_loss");
         add("Network", CH_PING, NQ_NET, "", "ms", "Internet ping", "net.ping.internet");
         add("Network", CH_PING_LOSS, NQ_NET, "", "%", "Internet pings lost", "net.ping.internet_loss");
+        add("Network", CH_PING, NQ_DNS, "", "ms", "DNS answer time", "net.dns");
+        add("Network", CH_PING_LOSS, NQ_DNS, "", "%", "DNS questions unanswered", "net.dns_loss");
     }
 
     /* kernel errors, throttling, OOM kills... as text, in the last column */
@@ -383,6 +388,7 @@ double log_chan_value(const sys_t *s, const chan_t *c)
     case CH_RAPL: return c->a < s->power.nrapl ? nn(s->power.z[c->a].watts) : NAN;
     case CH_BAT_POWER: return c->a < s->power.nbat ? nn(s->power.bat[c->a].watts) : NAN;
     case CH_BAT_CHARGE: return c->a < s->power.nbat ? nn(s->power.bat[c->a].capacity) : NAN;
+    case CH_USBC: return s->power.chg_w > 0 ? s->power.chg_w : 0;
     case CH_SENSOR: return c->a < s->sens.n && s->sens.s[c->a].ok ? s->sens.s[c->a].value : NAN;
     case CH_DISK_R:
     case CH_DISK_W:
@@ -795,6 +801,8 @@ static void proc_row(sys_t *s, plog_t *pl, proc_t *p, double now)
     put_num(pl->f, p->nfds >= 0 ? (double)p->nfds : NAN, 0);
     put_num(pl->f, s->cpu.total, 1);
     put_num(pl->f, nn(s->cpu.temp_c), 1);
+    put_num(pl->f, p->net_rx >= 0 && s->procs.net_ok ? p->net_rx / MB : NAN, 3); /* TCP */
+    put_num(pl->f, p->net_rx >= 0 && s->procs.net_ok ? p->net_tx / MB : NAN, 3);
     fputc('\n', pl->f);
     fflush(pl->f);
     pl->rows++;
@@ -816,7 +824,7 @@ static int plog_open(plog_t *pl, char *err, size_t n)
     pl->day = log_day_key(wall_time());
     fprintf(pl->f, "time,utc_offset,elapsed_s,pid,state,\"CPU (%% of one core)\",\"Memory (%%)\",\"RSS (MB)\","
                    "threads,\"Disk read (MB/s)\",\"Disk write (MB/s)\",\"GPU (%%)\",\"GPU memory (MB)\","
-                   "\"Open files\",\"System CPU (%%)\",\"CPU temperature (C)\"\n");
+                   "\"Open files\",\"System CPU (%%)\",\"CPU temperature (C)\",\"Network in (MB/s)\",\"Network out (MB/s)\"\n");
     return 0;
 }
 
@@ -911,6 +919,8 @@ void log_tick(sys_t *s)
     }
     if (g_log.f && (ev <= 0 || now - g_log.last_row >= ev - 0.05))
         sys_row(s, now);
+    if (g_log.nplog) /* their network use is in the rows */
+        s->procs.net_want_until = now + 5;
     for (int i = 0; i < g_log.nplog;) {
         plog_t *pl = &g_log.pl[i];
         proc_t *p = find_proc(s, pl->pid, pl->start);

@@ -87,7 +87,7 @@ static double fastest_fan(const sensors_t *S)
 {
     double m = -1;
     for (int i = 0; i < S->n; i++)
-        if (S->s[i].type == SENS_FAN && S->s[i].ok && !S->s[i].hidden)
+        if (S->s[i].type == SENS_FAN && S->s[i].ok && !S->s[i].hidden && !S->s[i].file)
             m = MAX(m, S->s[i].value);
     return m;
 }

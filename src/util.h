@@ -27,7 +27,7 @@
 
 #define APP_NAME "hsm"
 #define APP_LONG_NAME "hardware status monitor"
-#define APP_VERSION "1.10.0"
+#define APP_VERSION "1.11.0"
 #define APP_COPYRIGHT "Copyright (C) 2026 Yormask"
 #define PATHBUF 512
 
@@ -50,6 +50,7 @@ int read_ll(const char *path, long long *out);
 int read_ull(const char *path, unsigned long long *out);
 int read_hex(const char *path, unsigned *out);
 int path_exists(const char *path);
+int cpulist_parse(const char *s, unsigned char *set, int max); /* "0-3,8,10-11": set[i] = 1; returns how many */
 
 /* Split a buffer in place: returns the next line or NULL at the end. */
 char *next_line(char **cursor);

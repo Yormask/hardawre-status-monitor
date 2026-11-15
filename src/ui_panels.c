@@ -22,6 +22,7 @@
 #include "ui_int.h"
 
 #include <stdarg.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -44,7 +45,8 @@ typedef struct {
     int bar;     /* CORE_* shown as the bar */
     int val[2];  /* other values printed after it */
     int nval;
-    int idw;     /* digits of the highest CPU number */
+    int idw;     /* digits of the highest CPU number (+1 for the kind of core: "12E") */
+    int types;   /* the cores come in kinds (P-cores, E-cores): a letter after the number */
     int head;    /* draw the heading row */
 } coreview_t;
 
@@ -94,6 +96,8 @@ static void core_view(const sys_t *s, const layout_t *l, coreview_t *v)
     for (int i = 0; i < s->cpu.ncpu; i++)
         maxid = MAX(maxid, s->cpu.id[i]);
     v->idw = maxid >= 100 ? 3 : maxid >= 10 ? 2 : 1;
+    v->types = s->cpu.nctype >= 2;
+    v->idw += v->types;
 }
 
 /* columns of cores; fewer extra values when even one column is too narrow */
@@ -162,7 +166,7 @@ static void core_head(const coreview_t *v, int y, int x, int cw)
     int bw = cw - core_cell_w(v, 0);
     if (bw < 2)
         return;
-    put(y, x, v->idw, A_GRAY, "%*s", v->idw, "#");
+    put(y, x, v->idw - v->types, A_GRAY, "%*s", v->idw - v->types, "#");
     int bx = x + v->idw + 1;
     put(y, bx, bw, A_GRAY, "%s", v->bar == CORE_TEMP ? "temperature" : v->bar == CORE_CLOCK ? "clock speed" : "usage");
     int vx = bx + bw + 1 + 4;
@@ -177,7 +181,10 @@ static void core_cell(const sys_t *s, const coreview_t *v, int i, int y, int x, 
     char txt[16];
     attr_t ba, ta;
     int bw = cw - core_cell_w(v, 0);
-    put(y, x, v->idw, A_GRAY, "%*d", v->idw, s->cpu.id[i]);
+    int id = s->cpu.id[i], t = v->types && id >= 0 && id < MAX_CPUS ? s->cpu.core_type[id] : -1;
+    put(y, x, v->idw - v->types, A_GRAY, "%*d", v->idw - v->types, id);
+    if (t >= 0)
+        put(y, x + v->idw - 1, 1, s->cpu.ctype[t].letter == 'P' ? A_NORMAL : A_GRAY, "%c", s->cpu.ctype[t].letter);
     int bx = x + v->idw + 1;
     core_metric(s, v->bar, i, &bp, txt, sizeof txt, &ba, &ta);
     if (bw >= 2)
@@ -206,6 +213,10 @@ static void panel_cpu(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
     app(info, sizeof info, "%s", c->model);
     if (c->threads)
         app(info, sizeof info, "%s%dC/%dT", SEP, c->cores, c->threads);
+    char kinds[24];
+    cpu_types_text(c, kinds, sizeof kinds);
+    if (kinds[0])
+        app(info, sizeof info, " (%s)", kinds);
     box_(y, x, h, w, "CPU", info);
     int ix = x + 2, iw = w - 4, iy = y + 1, ih = h - 2, r = 0;
     if (ih <= 0 || iw <= 10)
@@ -508,7 +519,7 @@ typedef struct {
     char label[64], val[32];
     attr_t va;
     int sub;
-    int drop; /* short of room, the highest goes first: 3 cores and iGPU, 2 the AC adapter, 1 a sleeping GPU */
+    int drop; /* short of room, the highest goes first: 4 device batteries, 3 cores and iGPU, 2 the AC adapter, 1 a sleeping GPU */
 } pline_t;
 
 static int pl_add(pline_t *L, int n, int max, attr_t va, int sub, const char *label, const char *fmt, ...)
@@ -584,6 +595,21 @@ static int build_power(sys_t *s, pline_t *L, int max)
         n = pl_add(L, n, max, A_BOLD, 0, "AC adapter", "%s", p->ac_online ? "online" : "offline");
         L[n - 1].drop = 2;
     }
+    if (p->chg_w > 0 || p->chg_offer_w > 0) { /* a USB-C charger: what it gives */
+        double w = p->chg_w > 0 ? p->chg_w : p->chg_offer_w;
+        if (charger_weak(p))
+            n = pl_add(L, n, max, CP(C_WARN) | A_BOLD, 1, "USB-C charger", "%.0f W, weak", w);
+        else
+            n = pl_add(L, n, max, A_BOLD, 1, "USB-C charger", "%.0f W", w);
+        L[n - 1].drop = 2;
+    }
+    for (int i = 0; i < p->ndev; i++) { /* a wireless mouse, headset, controller: low ones stay */
+        const devbat_t *b = &p->dev[i];
+        char v[32];
+        devbat_text(b, v, sizeof v);
+        n = pl_add(L, n, max, b->low ? CP(C_CRIT) | A_BOLD : A_BOLD, 0, b->name, "%s", v);
+        L[n - 1].drop = b->low ? 0 : 4;
+    }
     if (!n)
         n = pl_add(L, n, max, A_GRAY, 0, "No power sensors found", "%s", "");
     return n;
@@ -591,14 +617,14 @@ static int build_power(sys_t *s, pline_t *L, int max)
 
 static int power_need(sys_t *s, ui_state_t *u, int w)
 {
-    pline_t L[16];
-    return 2 + build_power(s, L, 16);
+    pline_t L[24];
+    return 2 + build_power(s, L, 24);
 }
 
 static void panel_power(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
 {
-    pline_t L[16];
-    int n = build_power(s, L, 16);
+    pline_t L[24];
+    int n = build_power(s, L, 24);
     char info[64] = "";
     if (s->total_w >= 0)
         sfmt(info, sizeof info, "%s%.1f W (%s)", U ? "≈ " : "~", s->total_w, s->total_w_src);
@@ -717,9 +743,11 @@ static void net_ping_row(const netq_t *q, int y, int x, int w)
                                                  ? "not allowed (sysctl net.ipv4.ping_group_range)" : strerror(q->err));
         return;
     }
-    static const char *const nm[NQ_COUNT] = { "router", "internet" };
+    static const char *const nm[NQ_COUNT] = { "router", "internet", "DNS" };
     for (int k = 0; k < NQ_COUNT; k++) {
         const nqt_t *t = &q->t[k];
+        if (k == NQ_DNS && !t->addr[0])
+            continue; /* no DNS server known */
         if (k)
             xx += put(y, xx, xm - xx, A_GRAY, "%s", SEP);
         xx += put(y, xx, xm - xx, A_GRAY, "%s ", nm[k]);
@@ -783,6 +811,8 @@ static void panel_net(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
             else
                 sfmt(wb, sizeof wb, "  %s", wifi_band(wf->freq));
             xx += put(iy + r, xx, xm - xx, wf->tx_mbps > 0 && wf->tx_mbps < 30 ? CP(C_WARN) : A_NORMAL, "%s", wb);
+            if (wf->crowd_ok && wf->crowd_strong >= 3 && xm - xx >= 10) /* many strong neighbours on its channel */
+                xx += put(iy + r, xx, xm - xx, CP(C_WARN), "  crowded");
         }
         if (f->addr[0] && xm - xx >= (int)strlen(f->addr) + 2)
             put(iy + r, xx, xm - xx, A_GRAY, "  %s", f->addr);
@@ -848,7 +878,7 @@ static int temps_list(sys_t *s, tent_t *T, int max)
     }
     for (int i = 0; i < S->n && n < max; i++) {
         sensor_t *t = &S->s[i];
-        if (t->type != SENS_TEMP || !t->ok || i == S->cpu_idx || t->hidden || !sensor_plausible(t))
+        if (t->type != SENS_TEMP || !t->ok || i == S->cpu_idx || t->hidden || t->file || !sensor_plausible(t))
             continue;
         sensor_short_name(S, i, T[n].name, sizeof T[n].name); /* "ACPI 2", "NVMe", "Core 3" */
         T[n].v = t->value;
@@ -950,7 +980,7 @@ static int fans_list(sys_t *s, fent_t *F, int max)
     int n = 0;
     for (int i = 0; i < S->n && n < max; i++) {
         sensor_t *t = &S->s[i];
-        if (t->type != SENS_FAN || !t->ok || t->hidden)
+        if (t->type != SENS_FAN || !t->ok || t->hidden || t->file)
             continue;
         sensor_short_name(S, i, F[n].name, sizeof F[n].name); /* "asus cpu_fan", "nct6798 fan2" */
         F[n].min = t->ulo;
@@ -1167,7 +1197,7 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
     else if (H->pl_known && H->pl_held_s >= 5 && H->pl_busy_s > 0)
         kv(iy + r, &kx, km, A_NORMAL, "Power limit", "held the CPU back %.0f%% of its busy time",
            100.0 * H->pl_held_s / H->pl_busy_s);
-    /* the GPU: held back by heat or a power limit (NVIDIA's own reasons) */
+    /* the GPU: held back by heat or a power limit (its driver's own reasons) */
     for (int i = 0; i < s->gpus.n; i++) {
         const gpu_t *g = &s->gpus.g[i];
         if (!g->reasons_ok || g->busy_s <= 0)
@@ -1221,6 +1251,10 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         for (int i = 0; i < H->nnvme; i++) {
             nvme_t *v = &H->nvme[i];
             root |= v->state == -1;
+            if (v->link_low >= 2 && dl < 1) { /* a slower PCIe link than it and its slot can do (no root needed) */
+                dl = 1;
+                sfmt(bad, sizeof bad, "%s at PCIe %d.0 x%d", v->name, v->link.gen, v->link.width);
+            }
             if (v->state != 1)
                 continue;
             read++;
@@ -1230,6 +1264,8 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
             } else if (v->heat_open && dl < 1) { /* slowing itself down from heat now */
                 dl = 1;
                 sfmt(bad, sizeof bad, "%s slowed by heat", v->name);
+            } else if (v->link_low >= 2) {
+                /* told above */
             } else {
                 ok++;
                 wear = MAX(wear, v->used);
@@ -1237,7 +1273,7 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         }
         for (int i = 0; i < H->nsata; i++) {
             sata_t *d = &H->sata[i];
-            root |= d->state == -1;
+            root |= d->state == -1 && !d->usb;
             if (d->state != 1 && !(d->state == -3 && d->hours >= 0))
                 continue;
             read++;
@@ -1261,6 +1297,23 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         else
             kv(iy + r, &kx, km, A_GRAY, "Drives", "%s", root ? "needs root" : "n/a");
     }
+    for (int g = 0, told = 0; g < s->gpus.n && !told; g++) /* a 144 Hz monitor at 60 Hz */
+        for (int k = 0; k < s->gpus.g[g].nscr && !told; k++) {
+            const screen_t *sc = &s->gpus.g[g].scr[k];
+            double can;
+            int why = screen_slow(sc, &can);
+            if (why) {
+                kv(iy + r, &kx, km, CP(C_WARN), "Screen", "%s at %.0f Hz (%s %.0f)", sc->conn, sc->hz,
+                   why == SCR_LINK ? "monitor" : "can do", can);
+                told = 1;
+            }
+        }
+    if (s->power.draining) /* plugged in, and the battery still runs down */
+        kv(iy + r, &kx, km, CP(C_WARN) | A_BOLD, "Charger", "battery drains %.0f W", s->power.drain_w);
+    else if (charger_weak(&s->power))
+        kv(iy + r, &kx, km, CP(C_WARN), "Charger", "%.0f W, weak", s->power.chg_w);
+    if (s->mach.ram_channels == 1) /* half the memory bandwidth */
+        kv(iy + r, &kx, km, CP(C_WARN), "RAM", "single channel");
     for (int i = 0; i < s->usb.n && s->usb.nslow; i++) { /* a USB 3 drive held to USB 2 speed: slow copies */
         const usbdev_t *d = &s->usb.d[i];
         if (d->slow && (!strcmp(d->kind, "storage") || !strcmp(d->kind, "network") || !strcmp(d->kind, "Wi-Fi"))) {
@@ -1300,7 +1353,7 @@ static int volt_list(sys_t *s, int *idx, int max)
 {
     int n = 0;
     for (int i = 0; i < s->sens.n && n < max; i++)
-        if (s->sens.s[i].type == SENS_VOLT && s->sens.s[i].ok && !s->sens.s[i].hidden)
+        if (s->sens.s[i].type == SENS_VOLT && s->sens.s[i].ok && !s->sens.s[i].hidden && !s->sens.s[i].file)
             idx[n++] = i;
     return n;
 }
@@ -1345,6 +1398,51 @@ static void panel_volt(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
     }
 }
 
+/* ========================================================== Your values */
+/* your own values, read from files (file_sensor lines in the config file);
+ * the panel only shows up while there are some */
+
+static int values_list(sys_t *s, int *idx, int max)
+{
+    int n = 0;
+    for (int i = 0; i < s->sens.n && n < max; i++)
+        if (s->sens.s[i].file && !s->sens.s[i].hidden)
+            idx[n++] = i;
+    return n;
+}
+
+static int values_need(sys_t *s, ui_state_t *u, int w)
+{
+    int idx[MAX_FSENS], n = values_list(s, idx, MAX_FSENS), c = volt_cols(w - 4);
+    return 2 + MAX(1, MIN((n + c - 1) / c, 8));
+}
+
+static void panel_values(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
+{
+    int idx[MAX_FSENS], n = values_list(s, idx, MAX_FSENS);
+    box_(y, x, h, w, "Your values", NULL);
+    int ix = x + 2, iw = w - 4, iy = y + 1, ih = h - 2;
+    if (ih <= 0 || !n)
+        return;
+    int cols = volt_cols(iw), rows = MIN((n + cols - 1) / cols, ih), cw = iw / cols;
+    for (int k = 0; k < n && k < rows * cols; k++) {
+        sensor_t *t = &s->sens.s[idx[k]];
+        int cy = iy + k % rows, cx = ix + (k / rows) * cw, aw = cw - (cols > 1 ? 3 : 0);
+        char v[32];
+        if (!t->ok)
+            str_copy(v, sizeof v, t->fstale ? "old" : "n/a");
+        else if (t->type == SENS_TEMP)
+            sfmt(v, sizeof v, "%.1f%s", t->value, DEG);
+        else
+            sfmt(v, sizeof v, "%.*f%s%s", fabs(t->value) >= 100 || t->value == floor(t->value) ? 0 : 1, t->value,
+                 t->unit[0] && t->unit[0] != '%' ? " " : "", t->unit);
+        attr_t va = !t->ok ? A_GRAY : sensor_bad(t) ? CP(C_CRIT) | A_BOLD
+                  : t->type == SENS_TEMP ? temp_attr_lim(t->value, t->uhi) | A_BOLD : A_BOLD;
+        put(cy, cx, aw - utf8_cols(v) - 1, A_NORMAL, "%s", sensor_label(t));
+        put(cy, cx + aw - utf8_cols(v), utf8_cols(v), va, "%s", v);
+    }
+}
+
 /* ============================================================ Dashboard */
 
 typedef struct {
@@ -1360,6 +1458,7 @@ static const pdef_t PANELS[P_COUNT] = {
     [P_TEMPS] = { temps_need, panel_temps, 1 }, [P_FANS] = { fans_need, panel_fans, 0 },
     [P_FS] = { fs_need, panel_fs, 0 },          [P_HEALTH] = { health_need, panel_health, 1 },
     [P_SVC] = { svc_panel_need, svc_panel, 0 }, [P_VOLT] = { volt_need, panel_volt, 0 },
+    [P_VALUES] = { values_need, panel_values, 0 },
 };
 
 static int pweight(sys_t *s, int p)
@@ -1449,6 +1548,15 @@ void dashboard(sys_t *s, ui_state_t *u)
     const layout_t *l = &u->lay;
     int top = 1, avail = LINES - 2, W = COLS;
     int ids[2][P_COUNT], n[2] = { visible(l, 0, ids[0]), visible(l, 1, ids[1]) };
+    int vi[1];
+    if (!values_list(s, vi, 1)) /* no values of your own: no panel for them */
+        for (int c = 0; c < 2; c++)
+            for (int i = 0; i < n[c]; i++)
+                if (ids[c][i] == P_VALUES) {
+                    memmove(&ids[c][i], &ids[c][i + 1], (size_t)(n[c] - i - 1) * sizeof ids[c][0]);
+                    n[c]--;
+                    break;
+                }
     int both = n[0] && n[1];
     int lw = both ? left_width(l, W) : W;
     int xs[2] = { 0, both ? lw : 0 }, ws[2] = { lw, both ? W - lw : W };

@@ -371,6 +371,13 @@ void pdetail_view(sys_t *s, ui_state_t *u)
         pl_kv(&c, "Folder", A_NORMAL, "%s", D.cwd);
     pl_kv(&c, "State", p->state == 'D' || p->state == 'Z' ? CP(C_WARN) | A_BOLD : A_NORMAL, "%c %s %s %d thread%s %s nice %d",
           p->state, state_name(p->state), SEP, p->nthreads, p->nthreads == 1 ? "" : "s", SEP, p->nice);
+    if (!p->kthread) { /* where it may run, and its turn at the disk (keys a and i change them) */
+        char aff[256], io[96];
+        sched_aff_text(s, p->pid, aff, sizeof aff);
+        sched_io_text(p->pid, p->nice, io, sizeof io);
+        pl_kv(&c, "Runs on", A_NORMAL, "%s", aff);
+        pl_kv(&c, "Disk prio", A_NORMAL, "%s", io);
+    }
     pl_row(&c);
 
     /* what it uses */
@@ -449,6 +456,30 @@ void pdetail_view(sys_t *s, ui_state_t *u)
         pl_kv(&c, "Disk", A_NORMAL, "read %s, write %s %s %s read, %s written in all", a, b, SEP, c2, d);
     } else if (!p->kthread) {
         pl_kv(&c, "Disk", A_GRAY, "%s", no_access());
+    }
+    s->procs.net_want_until = now_sec() + 3; /* its network use, while this page is open */
+    if (p->net_rx >= 0 && s->procs.net_ok) {
+        fmt_rate(p->net_rx, a, sizeof a);
+        fmt_rate(p->net_tx, b, sizeof b);
+        pl_kv(&c, "Network", A_NORMAL, "%s in, %s out (TCP; UDP isn't counted per program)", a, b);
+    } else if (!p->kthread && s->procs.net_ok) {
+        pl_kv(&c, "Network", A_GRAY, "%s", no_access());
+    }
+    netport_t np[16];
+    int nnp = p->kthread ? 0 : netproc_ports(p->pid, np, 16);
+    if (nnp) { /* "TCP 8080, UDP 5353 (this machine only: TCP 631)" */
+        char all[256] = "", loc[128] = "";
+        for (int k = 0; k < nnp; k++) {
+            char *o = np[k].local ? loc : all;
+            size_t on = np[k].local ? sizeof loc : sizeof all;
+            app(o, on, "%s%s %d", o[0] ? ", " : "", np[k].udp ? "UDP" : "TCP", np[k].port);
+        }
+        if (all[0] && loc[0])
+            pl_kv(&c, "Listens on", A_NORMAL, "%s %s this machine only: %s", all, SEP, loc);
+        else if (all[0])
+            pl_kv(&c, "Listens on", A_NORMAL, "%s (reachable from the network)", all);
+        else
+            pl_kv(&c, "Listens on", A_NORMAL, "%s (this machine only)", loc);
     }
     if (p->gpu >= 0) {
         fmt_bytes((double)p->gpu_mem, a, sizeof a);

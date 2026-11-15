@@ -213,9 +213,10 @@ static void incident_close(const char *why)
 
 static int is_trigger(const event_t *e)
 {
-    /* a USB device that won't connect or a slow reading: CPU, memory and
-     * temperature figures can't explain those, so no recording */
-    if (!strcmp(e->cat, "usb") || !strcmp(e->cat, "slow"))
+    /* a USB device that won't connect, a slow reading or a mouse's battery
+     * running low: CPU, memory and temperature figures can't explain those,
+     * so no recording */
+    if (!strcmp(e->cat, "usb") || !strcmp(e->cat, "slow") || !strcmp(e->cat, "battery") || !strcmp(e->cat, "screen"))
         return 0;
     if (e->level == EV_ERR)
         return 1;

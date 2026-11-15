@@ -147,7 +147,10 @@ void report_print(sys_t *s, int nproc)
         printf("\n");
     }
 
-    printf("\nCPU         %s, %d cores / %d threads\n", cp->model, cp->cores, cp->threads);
+    char kinds[24];
+    cpu_types_text(cp, kinds, sizeof kinds);
+    printf("\nCPU         %s, %d cores / %d threads%s%s%s\n", cp->model, cp->cores, cp->threads, kinds[0] ? " (" : "",
+           kinds, kinds[0] ? ")" : "");
     printf("  usage     %.1f%%  (user %.1f%%, system %.1f%%, iowait %.1f%%, steal %.1f%%)\n", cp->total, cp->user,
            cp->sys, cp->iowait, cp->steal);
     if (cp->mhz_avg > 0)
@@ -279,6 +282,23 @@ void report_print(sys_t *s, int nproc)
             printf(", charge limit %d%%", bt->lim_end);
         printf("\n");
     }
+    if (p->chg_w > 0 || p->chg_offer_w > 0) { /* a USB-C charger */
+        printf("  charger   USB-C");
+        if (p->chg_offer_w > 0)
+            printf(", offers up to %.0f W%s%s%s", p->chg_offer_w, p->chg_volts[0] ? " (" : "", p->chg_volts,
+                   p->chg_volts[0] ? ")" : "");
+        if (p->chg_w > 0)
+            printf(", gives %.0f W (%.0f V at %.2f A)%s", p->chg_w, p->chg_v, p->chg_a,
+                   charger_weak(p) ? ": weak, a phone charger or a weak cable" : "");
+        printf("\n");
+    }
+    if (p->draining)
+        printf("  drains    the battery runs down by %.1f W although it's plugged in\n", p->drain_w);
+    for (int i = 0; i < p->ndev; i++) { /* wireless mice, keyboards, controllers */
+        char v[48];
+        devbat_text(&p->dev[i], v, sizeof v);
+        printf("  device    %s: %s%s\n", p->dev[i].name, v, p->dev[i].low ? " (low)" : "");
+    }
     if (!p->nrapl && !p->nbat)
         printf("  no power sensors found\n");
 
@@ -332,9 +352,8 @@ void report_print(sys_t *s, int nproc)
             sensor_t *t = &s->sens.s[i];
             if (!t->ok || t->hidden)
                 continue;
-            static const char *const unit[] = { "C", "RPM", "W", "V" };
             printf("  %-14s %-22s %8.*f %s%s\n", t->chip, sensor_label(t), t->type == SENS_VOLT ? 3 : 1, t->value,
-                   unit[t->type], sensor_bad(t) ? "  (past your limit)" : "");
+                   sensor_unit(t), sensor_bad(t) ? "  (past your limit)" : "");
         }
     }
 

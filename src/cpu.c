@@ -106,6 +106,169 @@ static const char *arm_part(unsigned impl, unsigned part, const char **maker)
     return NULL;
 }
 
+/* one CPU's core (package, core id), to count cores rather than threads */
+static long core_key(int id)
+{
+    char p[PATHBUF];
+    long long core = id, pkg = 0;
+    sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/topology/core_id", g_sysfs, id);
+    read_ll(p, &core);
+    sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/topology/physical_package_id", g_sysfs, id);
+    read_ll(p, &pkg);
+    return (long)(pkg << 20 | (core & 0xfffff));
+}
+
+static int add_type(cpu_t *c, const char *name, char letter)
+{
+    for (int t = 0; t < c->nctype; t++)
+        if (!strcmp(c->ctype[t].name, name))
+            return t;
+    if (c->nctype >= 4)
+        return c->nctype - 1;
+    str_copy(c->ctype[c->nctype].name, sizeof c->ctype[0].name, name);
+    c->ctype[c->nctype].letter = letter;
+    return c->nctype++;
+}
+
+/* Kinds of cores. Intel hybrid CPUs (12th gen and newer) list their P-cores
+ * and E-cores as two PMUs, cpu_core and cpu_atom; an E-core without the L3
+ * cache the P-cores share is a low-power one (Meteor Lake, Lunar Lake). ARM
+ * big.LITTLE CPUs give each core a capacity: the slowest kind are the
+ * efficient cores, the others the fast ones (named after the core when
+ * /proc/cpuinfo says which). */
+static void cpu_types(cpu_t *c, const unsigned *part_of)
+{
+    char p[PATHBUF], b[1024];
+    static unsigned char set[MAX_CPUS], set2[MAX_CPUS];
+    static long cap[MAX_CPUS];
+    memset(c->core_type, -1, sizeof c->core_type);
+    c->nctype = 0;
+    sfmt(p, sizeof p, "%s/devices/cpu_core/cpus", g_sysfs);
+    if (read_line(p, b, sizeof b) == 0 && cpulist_parse(b, set, MAX_CPUS) > 0) {
+        sfmt(p, sizeof p, "%s/devices/cpu_atom/cpus", g_sysfs);
+        if (read_line(p, b, sizeof b) || cpulist_parse(b, set2, MAX_CPUS) == 0)
+            return;
+        int l3 = 0;
+        for (int i = 0; i < MAX_CPUS; i++)
+            if (set[i]) {
+                sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/cache/index3", g_sysfs, i);
+                l3 = path_exists(p);
+                break;
+            }
+        for (int i = 0; i < MAX_CPUS; i++) {
+            if (set[i]) {
+                c->core_type[i] = (signed char)add_type(c, "P-core", 'P');
+            } else if (set2[i]) {
+                sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/cache/index3", g_sysfs, i);
+                c->core_type[i] = (signed char)(l3 && !path_exists(p) ? add_type(c, "LP E-core", 'L')
+                                                                      : add_type(c, "E-core", 'E'));
+            }
+        }
+    } else {
+        /* ARM: capacity, else (an older kernel) the top clock when the parts differ */
+        int n = 0, parts_differ = 0;
+        for (int i = 0; i < MAX_CPUS; i++) {
+            long long v = -1;
+            sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/cpu_capacity", g_sysfs, i);
+            if (read_ll(p, &v)) {
+                sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d", g_sysfs, i);
+                if (!path_exists(p))
+                    break;
+                v = -1;
+            }
+            cap[i] = (long)v;
+            n = i + 1;
+            if (part_of[i] && part_of[0] && part_of[i] != part_of[0])
+                parts_differ = 1;
+        }
+        int known = 0;
+        for (int i = 0; i < n; i++)
+            known += cap[i] > 0;
+        if (known < n && parts_differ)
+            for (int i = 0; i < n; i++) {
+                long long khz = -1;
+                sfmt(p, sizeof p, "%s/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", g_sysfs, i);
+                cap[i] = read_ll(p, &khz) ? -1 : (long)khz;
+            }
+        long lo = 0, hi = 0;
+        for (int i = 0; i < n; i++)
+            if (cap[i] > 0) {
+                lo = lo && lo < cap[i] ? lo : cap[i];
+                hi = hi > cap[i] ? hi : cap[i];
+            }
+        if (!lo || lo == hi)
+            return;
+        /* each capacity a kind, fastest first; up to 4 kinds */
+        long seen[4];
+        int ns = 0;
+        for (long want = hi + 1; ns < 4;) {
+            long best = 0;
+            for (int i = 0; i < n; i++)
+                if (cap[i] > 0 && cap[i] < want && cap[i] > best)
+                    best = cap[i];
+            if (!best)
+                break;
+            seen[ns++] = best;
+            want = best;
+        }
+        for (int k = 0; k < ns; k++) {
+            /* named after its core, when all of them are the same one */
+            unsigned pp = 0;
+            int same = 1;
+            for (int i = 0; i < n; i++)
+                if (cap[i] == seen[k]) {
+                    if (pp && part_of[i] != pp)
+                        same = 0;
+                    pp = part_of[i];
+                }
+            const char *maker, *nm = same && pp ? arm_part(pp >> 16, pp & 0xffff, &maker) : NULL;
+            char name[24];
+            str_copy(name, sizeof name, nm ? nm : k == ns - 1 ? "efficient core" : ns > 2 && k == 0 ? "fastest core" : "fast core");
+            int t = add_type(c, name, k == ns - 1 ? 'E' : 'P');
+            for (int i = 0; i < n; i++)
+                if (cap[i] == seen[k] || (k == ns - 1 && cap[i] > 0 && cap[i] <= seen[k]))
+                    c->core_type[i] = (signed char)t;
+        }
+    }
+    if (c->nctype < 2) {
+        c->nctype = 0;
+        memset(c->core_type, -1, sizeof c->core_type);
+        return;
+    }
+    /* cores and threads of each kind */
+    static long keys[MAX_CPUS];
+    for (int t = 0; t < c->nctype; t++) {
+        int nk = 0;
+        c->ctype[t].cores = c->ctype[t].threads = 0;
+        for (int i = 0; i < MAX_CPUS; i++)
+            if (c->core_type[i] == t) {
+                long k = core_key(i);
+                int dup = 0;
+                for (int j = 0; j < nk; j++)
+                    dup |= keys[j] == k;
+                if (!dup)
+                    keys[nk++] = k;
+                c->ctype[t].threads++;
+            }
+        c->ctype[t].cores = nk;
+    }
+}
+
+/* "6P+8E": the cores of each kind, by letter; "" when they're all alike */
+void cpu_types_text(const cpu_t *c, char *out, size_t n)
+{
+    out[0] = '\0';
+    static const char order[] = "PEL";
+    for (int o = 0; o < 3; o++) {
+        int cores = 0;
+        for (int t = 0; t < c->nctype; t++)
+            if (c->ctype[t].letter == order[o])
+                cores += c->ctype[t].cores;
+        if (cores)
+            sfmt(out + strlen(out), n - strlen(out), "%s%d%c", out[0] ? "+" : "", cores, order[o]);
+    }
+}
+
 void cpu_init(cpu_t *c)
 {
     char path[PATHBUF];
@@ -119,8 +282,10 @@ void cpu_init(cpu_t *c)
     size_t cap = 0;
     int threads = 0, npairs = 0;
     static int pairs[MAX_CPUS][2];
+    static unsigned part_of[MAX_CPUS]; /* ARM: each processor's implementer << 16 | part */
+    memset(part_of, 0, sizeof part_of);
     if (read_file_grow(path, &buf, &cap) > 0) {
-        int prio = 0, phys = 0, core = -1;
+        int prio = 0, phys = 0, core = -1, curp = -1;
         unsigned impl = 0;
         char arm[96] = ""; /* big.LITTLE: "ARM Cortex-A76 + Cortex-A55" */
         char *cur = buf, *line;
@@ -141,8 +306,10 @@ void cpu_init(cpu_t *c)
             while (isspace((unsigned char)*val))
                 val++;
 
-            if (!strcmp(line, "processor"))
+            if (!strcmp(line, "processor")) {
                 threads++;
+                curp = atoi(val);
+            }
             else if (!strcmp(line, "physical id"))
                 phys = atoi(val);
             else if (!strcmp(line, "core id"))
@@ -152,7 +319,11 @@ void cpu_init(cpu_t *c)
                 prio = strncmp(val, "ARMv", 4) ? 3 : 1; /* "ARMv7 Processor rev 3 (v7l)": the part says more */
             } else if (!strcmp(line, "CPU implementer")) {
                 impl = (unsigned)strtoul(val, NULL, 0);
+            } else if (!strcmp(line, "CPU part") && curp >= 0 && curp < MAX_CPUS && !part_of[curp] && prio >= 3) {
+                part_of[curp] = impl << 16 | ((unsigned)strtoul(val, NULL, 0) & 0xffff);
             } else if (!strcmp(line, "CPU part") && prio < 3) {
+                if (curp >= 0 && curp < MAX_CPUS)
+                    part_of[curp] = impl << 16 | ((unsigned)strtoul(val, NULL, 0) & 0xffff);
                 const char *maker, *nm = arm_part(impl, (unsigned)strtoul(val, NULL, 0), &maker);
                 if (nm && !strstr(arm, nm)) {
                     if (!arm[0])
@@ -175,6 +346,7 @@ void cpu_init(cpu_t *c)
     clean_model(c->model);
     c->threads = threads;
     c->cores = npairs ? npairs : threads;
+    cpu_types(c, part_of);
 }
 
 /* Read once per CPU: topology (for per-core temperatures) and max clock. */

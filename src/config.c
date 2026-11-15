@@ -40,9 +40,10 @@
 #include <unistd.h>
 
 const char *const PANEL_KEY[P_COUNT] = { "cpu",   "gpu",  "memory",      "power",  "disk",     "network",
-                                         "temps", "fans", "filesystems", "health", "services", "voltages" };
+                                         "temps", "fans", "filesystems", "health", "services", "voltages", "values" };
 const char *const PANEL_NAME[P_COUNT] = { "CPU",          "GPU",  "Memory",      "Power",  "Disk I/O", "Network",
-                                          "Temperatures", "Fans", "Filesystems", "Health", "Services", "Voltages" };
+                                          "Temperatures", "Fans", "Filesystems", "Health", "Services", "Voltages",
+                                          "Your values" };
 const char *const SINGLE_NAME[SINGLE_COUNT] = {
     "Cyan", "Blue", "Green", "Yellow", "Red", "Magenta", "White",
     "Bright cyan", "Bright blue", "Bright green", "Bright yellow", "Bright red", "Bright magenta", "Bright white",
@@ -82,14 +83,14 @@ static const char *const GRAPH_KEY[GRAPH_COUNT] = { "blocks", "braille", "off" }
 static const char *const COLOR_KEY[COLOR_COUNT] = { "value", "gradient", "single", "mono" };
 static const char *const CORE_KEY[CORE_COUNT] = { "usage", "temp", "clock" };
 static const char *const NOTIFY_KEY[ALERT_COUNT] = { "off", "desktop", "bell", "both" };
-static const char *const SORT_KEY[SORT_COUNT] = { "cpu", "memory", "io", "pid", "name", "time", "gpu", "files" };
+static const char *const SORT_KEY[SORT_COUNT] = { "cpu", "memory", "io", "pid", "name", "time", "gpu", "files", "net" };
 
 /* what was last loaded from / written to the file, to know if anything changed */
 typedef struct {
     layout_t lay;
     double interval, log_every;
     int sort, reverse, kthreads, tree, keep, rec_on, rec_min;
-    int a_notify, a_temp, a_disk, a_mem, a_full, a_thr, a_prob, a_gtemp, a_gslow;
+    int a_notify, a_temp, a_disk, a_mem, a_full, a_thr, a_prob, a_gtemp, a_gslow, a_devbat;
     char log_dir[PATHBUF], log_skip[8192], a_cmd[PATHBUF], nc_host[128];
     int nc;
     srule_t srule[MAX_SRULES];
@@ -114,6 +115,7 @@ static void snapshot(const ui_state_t *u, snap_t *s)
     s->a_temp = u->alert_cpu_temp;
     s->a_disk = u->alert_disk_ms;
     s->a_mem = u->alert_mem_pct;
+    s->a_devbat = u->alert_devbat;
     s->a_full = u->alert_disk_full;
     s->a_thr = u->alert_throttle;
     s->a_prob = u->alert_problems;
@@ -144,7 +146,7 @@ int config_changed(const ui_state_t *u)
 void layout_defaults(layout_t *l)
 {
     static const int left[] = { P_CPU, P_GPU, P_HEALTH };
-    static const int right[] = { P_MEM, P_POWER, P_DISK, P_NET, P_TEMPS, P_FANS, P_FS, P_SVC, P_VOLT };
+    static const int right[] = { P_MEM, P_POWER, P_DISK, P_NET, P_TEMPS, P_FANS, P_FS, P_SVC, P_VOLT, P_VALUES };
     memset(l, 0, sizeof *l);
     for (size_t i = 0; i < sizeof left / sizeof left[0]; i++)
         l->col[0][l->ncol[0]++] = left[i];
@@ -169,6 +171,7 @@ static void other_defaults(ui_state_t *u)
     u->alert_gpu_slow = 1;
     u->alert_disk_ms = 500;
     u->alert_mem_pct = 5;
+    u->alert_devbat = 15;
     u->alert_disk_full = 95;
     u->alert_throttle = 1;
     u->alert_problems = 1;
@@ -410,6 +413,62 @@ static void parse_srule(ui_state_t *u, char *v)
     config_set_srule(u, &r);
 }
 
+/* "file_sensor = /run/plug.json | name Wall power | unit W | key apower | total",
+ * also "| scale 0.001" and limits ("| min 20 | max 300", the same as a sensor
+ * line for file/NAME) */
+static void parse_fsens(ui_state_t *u, char *v)
+{
+    if (u->nfsens >= MAX_FSENS)
+        return;
+    fsdef_t d;
+    memset(&d, 0, sizeof d);
+    double lo = 0, hi = 0;
+    char *save = NULL;
+    int first = 1;
+    for (char *f = strtok_r(v, "|", &save); f; f = strtok_r(NULL, "|", &save), first = 0) {
+        f = trim(f);
+        if (first)
+            str_copy(d.path, sizeof d.path, f);
+        else if (!strncmp(f, "name ", 5))
+            str_copy(d.name, sizeof d.name, trim(f + 5));
+        else if (!strncmp(f, "unit ", 5))
+            str_copy(d.unit, sizeof d.unit, trim(f + 5));
+        else if (!strncmp(f, "key ", 4))
+            str_copy(d.key, sizeof d.key, trim(f + 4));
+        else if (!strncmp(f, "scale ", 6))
+            d.scale = atof(f + 6);
+        else if (!strncmp(f, "min ", 4))
+            lo = atof(f + 4);
+        else if (!strncmp(f, "max ", 4))
+            hi = atof(f + 4);
+        else if (!strcmp(f, "total"))
+            d.total = 1;
+    }
+    if (d.path[0] != '/' || !isfinite(d.scale) || !isfinite(lo) || !isfinite(hi))
+        return;
+    for (char *q = d.name; *q; q++) /* the name is part of its id, "file/NAME" */
+        if (*q == '/')
+            *q = '-';
+    if (!d.name[0]) { /* the file's own name */
+        const char *b = strrchr(d.path, '/');
+        str_copy(d.name, sizeof d.name, b[1] ? b + 1 : d.path);
+    }
+    u->fsens[u->nfsens++] = d;
+    if ((lo > 0 || hi > 0) && lo >= 0 && hi >= 0) {
+        char id[96];
+        sfmt(id, sizeof id, "file/%s", d.name);
+        const srule_t *old = config_srule(u, id);
+        srule_t r;
+        memset(&r, 0, sizeof r);
+        if (old)
+            r = *old;
+        str_copy(r.id, sizeof r.id, id);
+        r.lo = lo;
+        r.hi = hi;
+        config_set_srule(u, &r);
+    }
+}
+
 /* a number, or "off" for 0 */
 static int parse_off(const char *v)
 {
@@ -452,6 +511,7 @@ int config_load(ui_state_t *u)
     layout_t *l = &u->lay;
     int placed[P_COUNT] = { 0 }, have_cols = 0;
     char hidden[512] = "";
+    u->nfsens = 0; /* the file has them all */
     layout_t nl = *l;
     nl.ncol[0] = nl.ncol[1] = 0;
 
@@ -530,6 +590,8 @@ int config_load(ui_state_t *u)
             l->sel_text = i;
         } else if (!strcmp(k, "titles") && (i = find_key(TXT_KEY, TXT_COUNT, v)) >= 0) {
             l->title_color = i;
+        } else if (!strcmp(k, "colorblind")) {
+            l->colorblind = parse_bool(v);
         } else if (!strcmp(k, "log_dir")) {
             str_copy(u->log_dir, sizeof u->log_dir, strcasecmp(v, "default") ? v : "");
         } else if (!strcmp(k, "log_every")) {
@@ -570,6 +632,9 @@ int config_load(ui_state_t *u)
             i = parse_off(v);
             if (i >= 0 && i <= 50)
                 u->alert_mem_pct = i;
+        } else if (!strcmp(k, "alert_device_battery")) {
+            if ((i = parse_off(v)) >= 0 && i <= 100)
+                u->alert_devbat = i;
         } else if (!strcmp(k, "alert_disk_full")) {
             i = parse_off(v);
             if (i == 0 || (i >= 50 && i <= 100))
@@ -582,6 +647,8 @@ int config_load(ui_state_t *u)
             str_copy(u->alert_command, sizeof u->alert_command, v);
         } else if (!strcmp(k, "sensor")) {
             parse_srule(u, v);
+        } else if (!strcmp(k, "file_sensor")) {
+            parse_fsens(u, v);
         }
     }
     fclose(f);
@@ -685,6 +752,8 @@ int config_save(const ui_state_t *u)
             fprintf(f, "single_color = %s\nhighlight = %s\nselected_text = %s\ntitles = %s\nbackground = %s\n",
                     SINGLE_KEY[l->single_color], SINGLE_KEY[l->highlight], TXT_KEY[l->sel_text],
                     TXT_KEY[l->title_color], BG_KEY[l->background]);
+            fprintf(f, "colorblind = %s       # blue instead of green, writes and uploads in yellow\n",
+                    l->colorblind ? "on" : "off");
             fprintf(f, "\ninterval = %g\nsort = %s\nreverse = %s\nkernel_threads = %s\nprocess_tree = %s\n",
                     u->interval, SORT_KEY[u->sort], u->reverse ? "on" : "off", u->show_kthreads ? "on" : "off",
                     u->tree ? "on" : "off");
@@ -716,12 +785,28 @@ int config_save(const ui_state_t *u)
             fprintf(f, "alert_gpu_slowing = %s\n", u->alert_gpu_slow ? "on" : "off");
             put_off(f, "alert_disk_ms", u->alert_disk_ms);
             put_off(f, "alert_low_memory", u->alert_mem_pct);
+            put_off(f, "alert_device_battery", u->alert_devbat);
             put_off(f, "alert_disk_full", u->alert_disk_full);
             fprintf(f, "alert_throttling = %s\nalert_problems = %s\nalert_command = %s\n",
                     u->alert_throttle ? "on" : "off", u->alert_problems ? "on" : "off", u->alert_command);
             fprintf(f, "\n# Sensors: your own name and limits for a sensor, or \"hide\" to leave it out\n"
                        "# (Setup > Sensor names and limits). min and max are in the sensor's unit\n"
                        "# (C, RPM, V, W); for a fan, min is the slowest a working fan turns.\n");
+            fprintf(f, "\n# Your own values, read from a file (a smart plug's wall power, a UPS, a room\n"
+                       "# thermometer): file_sensor = PATH | name NAME | unit UNIT, and optionally\n"
+                       "# | key WORD (the number after it, as in JSON) | scale 0.001 | total (the\n"
+                       "# machine's whole power). Limits go on a sensor line for file/NAME.\n");
+            for (int i = 0; i < u->nfsens; i++) {
+                const fsdef_t *d = &u->fsens[i];
+                fprintf(f, "file_sensor = %s | name %s", d->path, d->name);
+                if (d->unit[0])
+                    fprintf(f, " | unit %s", d->unit);
+                if (d->key[0])
+                    fprintf(f, " | key %s", d->key);
+                if (d->scale)
+                    fprintf(f, " | scale %g", d->scale);
+                fprintf(f, "%s\n", d->total ? " | total" : "");
+            }
             for (int i = 0; i < u->nsrule; i++) {
                 const srule_t *r = &u->srule[i];
                 fprintf(f, "sensor = %s", r->id);

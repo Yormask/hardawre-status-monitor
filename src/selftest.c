@@ -91,6 +91,7 @@ int drives_sync(const health_t *h)
         str_copy(d->name, sizeof d->name, name);
         str_copy(d->model, sizeof d->model, model);
         d->nvme = nv;
+        d->usb = !nv && h->sata[i - h->nnvme].usb;
         d->errors = d->err_hours = d->hours = -1;
         d->short_min = d->ext_min = -1;
         d->progress = -1;

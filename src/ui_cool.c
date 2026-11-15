@@ -168,7 +168,7 @@ void cool_view(sys_t *s, ui_state_t *u)
     if (c->fan_base >= 0) {
         double f = -1;
         for (int i = 0; i < s->sens.n; i++)
-            if (s->sens.s[i].type == SENS_FAN && s->sens.s[i].ok && !s->sens.s[i].hidden)
+            if (s->sens.s[i].type == SENS_FAN && s->sens.s[i].ok && !s->sens.s[i].hidden && !s->sens.s[i].file)
                 f = MAX(f, s->sens.s[i].value);
         kv(y, &kx, ix + iw, A_BOLD, "Fastest fan", "%.0f RPM (idle %.0f)", f, c->fan_base);
     }

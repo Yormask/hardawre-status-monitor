@@ -25,10 +25,10 @@
 #include <stdio.h>
 
 enum { VIEW_DASH, VIEW_PROCS, VIEW_HW, VIEW_SETUP, VIEW_LOG, VIEW_SVC, VIEW_EVENTS, VIEW_HIST, VIEW_COUNT };
-enum { SORT_CPU, SORT_MEM, SORT_IO, SORT_PID, SORT_NAME, SORT_TIME, SORT_GPU, SORT_FILES, SORT_COUNT };
+enum { SORT_CPU, SORT_MEM, SORT_IO, SORT_PID, SORT_NAME, SORT_TIME, SORT_GPU, SORT_FILES, SORT_NET, SORT_COUNT };
 
 /* dashboard panels */
-enum { P_CPU, P_GPU, P_MEM, P_POWER, P_DISK, P_NET, P_TEMPS, P_FANS, P_FS, P_HEALTH, P_SVC, P_VOLT, P_COUNT };
+enum { P_CPU, P_GPU, P_MEM, P_POWER, P_DISK, P_NET, P_TEMPS, P_FANS, P_FS, P_HEALTH, P_SVC, P_VOLT, P_VALUES, P_COUNT };
 /* appearance choices */
 enum { BAR_BLOCKS, BAR_SQUARES, BAR_LINE, BAR_CLASSIC, BAR_COUNT };
 enum { GRAPH_BLOCKS, GRAPH_BRAILLE, GRAPH_OFF, GRAPH_COUNT };
@@ -70,6 +70,7 @@ typedef struct {
     int background;   /* index into BG_NAME / BG_COLOR, 0 = terminal default */
     int sel_text;     /* text on the highlight: index into TXT_*, 0 = automatic */
     int title_color;  /* box titles and section headings: index into TXT_*, 0 = cyan */
+    int colorblind;   /* colour-blind safe: blue instead of green, uploads and writes in yellow */
 } layout_t;
 
 typedef struct {
@@ -86,6 +87,11 @@ typedef struct {
     int sel_idx, sel_delta, scroll, page_rows;
 
     int hw_scroll, hw_max;
+    char hws_q[48];     /* searching the Hardware view (/) */
+    int hws_edit;       /* typing it */
+    int hws_cur;        /* the match last jumped to */
+    int hws_jump;       /* jump to the first match from the top of the screen */
+    int hws_n, hws_page; /* matching lines, lines on screen (set when drawn) */
     int pd_open, pd_view, pd_scroll; /* process details page (Enter), in the view it was opened from */
 
     /* events (view 7), history (view 8) */
@@ -97,6 +103,7 @@ typedef struct {
     /* Hardware view pages: drive self-tests (D), cooling check (C) */
     int drv_open, drv_sel, drv_confirm; /* confirm: 1 short / 2 extended waits for y */
     int cool_open;
+    int busy_open, busy_scroll; /* U: what keeps each drive busy */
 
     /* services (view 6) */
     int svc_sort, svc_rev, svc_sel, svc_scroll, svc_rows;
@@ -128,8 +135,11 @@ typedef struct {
     int alert_disk_full;   /* a file system this % full, 0 = off */
     srule_t srule[MAX_SRULES]; /* your sensor names, limits, hidden sensors */
     int nsrule;
+    fsdef_t fsens[MAX_FSENS];  /* your own values, read from files ("file_sensor =" lines) */
+    int nfsens;
     int alert_throttle, alert_problems;
     int alert_gpu_slow;    /* the GPU slowing itself down from heat for minutes */
+    int alert_devbat;      /* a wireless device's battery at or below this %, 0 = off */
     int net_check;         /* ping the router and an internet address (netcheck.c) */
     char net_check_host[128]; /* that address; "" = 1.1.1.1 */
     char alert_command[PATHBUF];
@@ -144,6 +154,17 @@ typedef struct {
     pid_t nice_pid;
     unsigned long long nice_start;
     char nice_desc[160];
+
+    /* which CPUs a process may use (a), its disk priority (i) */
+    int aff_open, aff_sel;
+    unsigned char aff_set[MAX_CPUS], aff_old[MAX_CPUS];
+    pid_t aff_pid;
+    unsigned long long aff_start;
+    char aff_desc[160];
+    int iop_open, iop_cls, iop_lvl, iop_ocls, iop_olvl, iop_follows;
+    pid_t iop_pid;
+    unsigned long long iop_start;
+    char iop_desc[160];
 
     /* signal dialog */
     int kill_open, kill_sel, kill_kthread;
@@ -162,6 +183,10 @@ typedef struct {
 enum { ALERT_OFF, ALERT_DESKTOP, ALERT_BELL, ALERT_BOTH, ALERT_COUNT };
 
 int ui_init(int utf8); /* -1 when the terminal type is unknown, -2 when it can't move the cursor ("dumb") */
+void ui_headless(const layout_t *l, int utf8); /* drawing settings without a screen (hsm --report) */
+/* the Hardware view as plain text, width columns wide: each line to fn */
+void hardware_text(sys_t *s, int width, void (*fn)(const char *line, void *ctx), void *ctx);
+int report_write(sys_t *s, ui_state_t *u, const char *path); /* hsm --report; 0 ok */
 void ui_mouse(int on); /* clicks and the wheel on or off */
 void ui_end(void);
 void ui_draw(sys_t *s, ui_state_t *u);

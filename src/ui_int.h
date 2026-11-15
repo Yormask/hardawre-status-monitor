@@ -91,11 +91,21 @@ enum {
     HIT_EVENT,     /* Events view: a = event in the list */
     HIT_DRIVE,     /* drive tests page: a = drive */
     HIT_HIST,      /* History view: a = day in the list (0 = newest) */
+    HIT_AFF,       /* CPU dialog: a = CPU (index in cpu_t.id) */
+    HIT_IOP,       /* disk priority dialog: a = class, b = -1 / +1 for its level */
 };
 typedef struct {
     int y, x, h, w, kind, a, b;
 } hit_t;
 int key_hint(int y, int x, int maxx, const char *key, const char *label, int code);
+/* capture mode: put() records its text (line = y - y0, x) instead of drawing */
+typedef struct {
+    int line, x;
+    const char *text;
+} capseg_t;
+void cap_begin(int y0);
+int cap_end(const capseg_t **segs);
+int cap_on(void);
 void hit_reset(void);
 void hit_add(int y, int x, int h, int w, int kind, int a, int b);
 const hit_t *hit_at(int y, int x);
@@ -106,6 +116,7 @@ void dashboard_preview(const layout_t *l, int y, int x, int h, int w, int hl);
 int dashboard_preview_rows(const layout_t *l);
 void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full);
 void hardware(sys_t *s, ui_state_t *u);
+void hardware_search_step(ui_state_t *u, int dir); /* n / N in the Hardware view */
 void setup_view(sys_t *s, ui_state_t *u);
 int setup_key(ui_state_t *u, int ch); /* 1 when the key was used */
 void log_view(sys_t *s, ui_state_t *u);
@@ -132,6 +143,9 @@ void drives_open(sys_t *s, ui_state_t *u); /* Hardware view > D */
 void drives_view(sys_t *s, ui_state_t *u);
 int drives_key(ui_state_t *u, int ch);
 void drives_click(ui_state_t *u, int i);
+void busy_open(sys_t *s, ui_state_t *u); /* Hardware view > U: what keeps each drive busy */
+void busy_view(sys_t *s, ui_state_t *u);
+int busy_key(sys_t *s, ui_state_t *u, int ch);
 void history_view(sys_t *s, ui_state_t *u); /* view 8 */
 void history_click(ui_state_t *u, int k);
 int history_key(ui_state_t *u, int ch);
@@ -140,6 +154,18 @@ int svc_panel_need(sys_t *s, ui_state_t *u, int w);
 void svc_panel(sys_t *s, ui_state_t *u, int y, int x, int h, int w);
 void event_line(int y, int x, int w, const event_t *e); /* "12:03:44  disk  nvme0n1: I/O error" */
 int core_bar_metric(const sys_t *s, int want); /* CORE_* the core bars can show on this CPU */
+proc_t *ui_proc_target(sys_t *s, ui_state_t *u); /* the selected process, for an action on it (NULL: says why not) */
+/* ui_sched.c: which CPUs a process may use (a), its disk priority (i) */
+void aff_open(sys_t *s, ui_state_t *u);
+void aff_dialog(sys_t *s, ui_state_t *u);
+void aff_key(sys_t *s, ui_state_t *u, int ch);
+void aff_click(sys_t *s, ui_state_t *u, int i, int dbl);
+void iop_open(sys_t *s, ui_state_t *u);
+void iop_dialog(sys_t *s, ui_state_t *u);
+void iop_key(ui_state_t *u, int ch);
+void iop_click(ui_state_t *u, int cls, int step, int dbl);
+void sched_aff_text(const sys_t *s, pid_t pid, char *out, size_t n); /* "all 20 CPUs", "CPUs 0-15: the P-cores (16 of 20)" */
+void sched_io_text(pid_t pid, int nice, char *out, size_t n);         /* "normal 4 (follows its nice value)" */
 extern const char *const NOTIFY_NAME[ALERT_COUNT];
 extern const int KEEP_DAYS[];
 extern const int NKEEP;

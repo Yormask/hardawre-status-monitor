@@ -68,11 +68,14 @@ static void usage(FILE *f)
             "  --log-dir DIR     where to write the files (default: %s)\n"
             "  --serve [ADDR:]PORT  answer over HTTP: /metrics (Prometheus), /json; only this\n"
             "                    machine unless ADDR says otherwise (0.0.0.0:9101: everyone)\n\n"
-            "  --cooling-check   a minute of full CPU load: does the cooling keep up? (exit 1: no)\n\n"
+            "  --cooling-check   a minute of full CPU load: does the cooling keep up? (exit 1: no)\n"
+            "  --report [FILE]   a text file to post when asking for help: the hardware, its\n"
+            "                    health and the last week's problems (- : print it)\n\n"
             "Keys: 1-8 views (6 services, 7 events, 8 history), Enter process details, s setup,\n"
             "      l log sensors, L log the selected process, x kill, N priority (nice),\n"
-            "      T process tree, c/m/d/g/o/p/n/t sort, / filter, b CPU core bars,\n"
-            "      v (in view 5) saved logs, +/- interval, space pause, ? help, q quit\n"
+            "      a CPUs it may use, i disk priority, T process tree, / filter or find,\n"
+            "      c/m/d/g/o/w/p/n/t sort, b CPU core bars, v (in view 5) saved logs,\n"
+            "      +/- interval, space pause, ? help, q quit\n"
             "      The mouse works too: tabs, rows, column headings, the wheel.\n\n"
             "Settings are saved in %s\n\n"
             "Run as root (sudo %s) to also see CPU power (RAPL), exact Intel GPU load,\n"
@@ -232,7 +235,8 @@ static int headless(ui_state_t *u, int sys_log, const pid_t *pids, int npid, dou
 int main(int argc, char **argv)
 {
     double interval = -1; /* -1: use the saved setting */
-    int once = 0, json = 0, ascii = 0, ntop = -1, watch = 0, cooling = 0;
+    int once = 0, json = 0, ascii = 0, ntop = -1, watch = 0, cooling = 0, report = 0;
+    const char *report_path = NULL;
     const char *serve = NULL;
     int sys_log = 0, npid = 0;
     pid_t pids[MAX_PLOG];
@@ -253,6 +257,10 @@ int main(int argc, char **argv)
             watch = 1;
         } else if (!strcmp(a, "--cooling-check")) {
             cooling = 1;
+        } else if (!strcmp(a, "--report")) {
+            report = 1;
+            if (i + 1 < argc && (argv[i + 1][0] != '-' || !strcmp(argv[i + 1], "-")))
+                report_path = argv[++i];
         } else if (!strcmp(a, "--serve") && i + 1 < argc) {
             serve = argv[++i];
         } else if (!strncmp(a, "--serve=", 8)) {
@@ -344,6 +352,7 @@ int main(int argc, char **argv)
         static ui_state_t cu;
         config_defaults(&cu);
         config_load(&cu);
+        sensors_files(&S.sens, cu.fsens, cu.nfsens);
         sensors_apply(&S.sens, cu.srule, cu.nsrule);
         sleep_sec(0.5);
         sys_sample(&S);
@@ -351,13 +360,28 @@ int main(int argc, char **argv)
         sys_free(&S);
         return r;
     }
+    if (report) { /* one text file to post when asking for help */
+        static ui_state_t ru;
+        config_defaults(&ru);
+        config_load(&ru);
+        sensors_files(&S.sens, ru.fsens, ru.nfsens);
+        sensors_apply(&S.sens, ru.srule, ru.nsrule);
+        sleep_sec(1.0);
+        sys_sample(&S);
+        int r = report_write(&S, &ru, report_path);
+        sys_free(&S);
+        return r;
+    }
     if (once || json) {
         static ui_state_t ou; /* only for your sensor names */
         config_defaults(&ou);
         config_load(&ou);
+        sensors_files(&S.sens, ou.fsens, ou.nfsens);
         sensors_apply(&S.sens, ou.srule, ou.nsrule);
         S.svc.want_until = now_sec() + 60; /* services too */
         svcs_sample(&S.svc);
+        S.procs.net_want_until = now_sec() + 60; /* and network use per process */
+        netproc_sample(&S.procs, 0);
         sleep_sec(interval > 0 ? interval : 1.0);
         sys_sample(&S);
         if (json)
@@ -371,6 +395,7 @@ int main(int argc, char **argv)
         static ui_state_t hu;
         config_defaults(&hu);
         config_load(&hu);
+        sensors_files(&S.sens, hu.fsens, hu.nfsens);
         sensors_apply(&S.sens, hu.srule, hu.nsrule);
         if (interval > 0)
             hu.interval = interval;
@@ -402,6 +427,7 @@ int main(int argc, char **argv)
     static ui_state_t u;
     config_defaults(&u);
     config_load(&u); /* ~/.config/hsm/config, if it exists */
+    sensors_files(&S.sens, u.fsens, u.nfsens);
     sensors_apply(&S.sens, u.srule, u.nsrule);
     if (interval > 0)
         u.interval = interval;

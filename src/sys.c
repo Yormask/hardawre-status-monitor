@@ -143,6 +143,7 @@ void sys_init(sys_t *s)
     }
     read_os_name(s->os, sizeof s->os);
     read_machine(&s->mach);
+    smbios_memory(&s->mach);
     s->total_w = -1;
     s->total_w_src = "";
     s->total_why = "";
@@ -173,6 +174,15 @@ static void estimate_total_power(sys_t *s)
         s->total_w = bat;
         s->total_w_src = "battery";
         return;
+    }
+    /* your own wall power figure (a smart plug only this machine is on) */
+    for (int i = 0; i < s->sens.n; i++) {
+        const sensor_t *t = &s->sens.s[i];
+        if (t->file && t->ftotal && t->ok && !t->hidden && t->value >= 0) {
+            s->total_w = t->value;
+            s->total_w_src = "wall";
+            return;
+        }
     }
     /* the platform domain on recent Intel laptops - unless the firmware left
      * it unconnected, which shows as less than the CPU package inside it */
@@ -277,6 +287,7 @@ void sys_sample(sys_t *s)
     timed(worst, sizeof worst, &wd, t0, "the network counters");
     t0 = now_sec();
     procs_sample(&s->procs, dt, s->mem.total);
+    netproc_sample(&s->procs, dt);
     if (s->procs.slow_s >= SLOW_READ) {
         const char *comm = "";
         for (int i = 0; i < s->procs.n; i++)

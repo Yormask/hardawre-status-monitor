@@ -51,7 +51,7 @@
 
 extern char **environ;
 
-enum { AK_TEMP, AK_THROTTLE, AK_DISK, AK_MEM, AK_FULL, AK_PROBLEM, AK_GTEMP, AK_GSLOW, AK_COUNT };
+enum { AK_TEMP, AK_THROTTLE, AK_DISK, AK_MEM, AK_FULL, AK_PROBLEM, AK_GTEMP, AK_GSLOW, AK_DEVBAT, AK_COUNT };
 
 static struct {
     unsigned long seen; /* events already looked at */
@@ -523,6 +523,32 @@ void alert_tick(sys_t *s, ui_state_t *u, int tui)
         A.mem_since = 0;
         if (mlim <= 0 || avail >= mlim + 3)
             A.mem_armed = 1;
+    }
+
+    /* a wireless device's battery running out: once per time it gets low */
+    int blim = u->alert_devbat;
+    for (int i = 0; i < s->power.ndev; i++) {
+        devbat_t *b = &s->power.dev[i];
+        int charging = !strcmp(b->status, "Charging") || !strcmp(b->status, "Full");
+        int low = !charging && blim > 0 &&
+                  (b->capacity >= 0 ? b->capacity <= blim : !strcmp(b->level, "Low") || !strcmp(b->level, "Critical"));
+        if (low && !b->low) {
+            char v[32];
+            devbat_text(b, v, sizeof v);
+            health_event(h, EV_WARN, "battery", "%s: battery at %s, charge it soon", b->name, v);
+            A.seen = h->ev_seq;
+            if (on && ready(AK_DEVBAT, now)) {
+                char ti[96];
+                sfmt(ti, sizeof ti, "%s battery low", b->name);
+                sfmt(body, sizeof body, "Its battery is at %s: charge it soon.", v);
+                deliver(u, EV_WARN, ti, body, tui);
+            }
+        }
+        if (low)
+            b->low = 1;
+        else if (charging || blim <= 0 || (b->capacity >= 0 ? b->capacity >= blim + 10 : strcmp(b->level, "Low") &&
+                                                                                          strcmp(b->level, "Critical")))
+            b->low = 0; /* charged a bit: it may warn again */
     }
 
     /* file systems filling up: space, or inodes (how many files it can hold) */

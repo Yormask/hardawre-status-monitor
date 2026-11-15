@@ -40,6 +40,7 @@ void power_init(power_t *p)
     char base[PATHBUF], dir[PATHBUF], f[PATHBUF];
     p->ac_online = -1;
     p->pkg_w = p->core_w = p->uncore_w = p->dram_w = p->psys_w = -1;
+    p->chg_offer_w = p->chg_w = p->chg_v = p->chg_a = -1;
 
     /* RAPL zones: intel-rapl:0 = package 0, intel-rapl:0:0 = its cores, ...
      * Recent kernels expose the same interface for AMD Zen CPUs too.
@@ -267,8 +268,233 @@ static void note_slow(power_t *p, double t0, const char *what)
     }
 }
 
+/* ---------------------------------------- wireless devices' batteries */
+
+/* the device a battery belongs to: model_name, else its input device's name */
+static void devbat_name(const char *dir, const char *id, char *out, size_t n)
+{
+    char f[PATHBUF];
+    sfmt(f, sizeof f, "%s/model_name", dir);
+    if (!read_line(f, out, n) && out[0])
+        return;
+    sfmt(f, sizeof f, "%s/device/input", dir);
+    DIR *d = opendir(f);
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL)
+        if (!strncmp(e->d_name, "input", 5)) {
+            char nf[PATHBUF];
+            sfmt(nf, sizeof nf, "%s/%s/name", f, e->d_name);
+            if (!read_line(nf, out, n) && out[0]) {
+                closedir(d);
+                return;
+            }
+        }
+    if (d)
+        closedir(d);
+    str_copy(out, n, id);
+}
+
+static void devbat_find(power_t *p)
+{
+    char base[PATHBUF];
+    sfmt(base, sizeof base, "%s/class/power_supply", g_sysfs);
+    DIR *d = opendir(base);
+    if (!d) {
+        p->ndev = 0;
+        return;
+    }
+    devbat_t old[MAX_DEVBAT];
+    int nold = p->ndev;
+    memcpy(old, p->dev, sizeof old);
+    p->ndev = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && p->ndev < MAX_DEVBAT) {
+        if (e->d_name[0] == '.')
+            continue;
+        char dir[PATHBUF], f[PATHBUF], type[32], scope[32];
+        sfmt(dir, sizeof dir, "%s/%s", base, e->d_name);
+        sfmt(f, sizeof f, "%s/type", dir);
+        if (read_line(f, type, sizeof type) || strcmp(type, "Battery"))
+            continue;
+        sfmt(f, sizeof f, "%s/scope", dir);
+        if (read_line(f, scope, sizeof scope) || strcmp(scope, "Device"))
+            continue;
+        devbat_t *b = &p->dev[p->ndev++];
+        int k = 0;
+        while (k < nold && strcmp(old[k].id, e->d_name))
+            k++;
+        if (k < nold) { /* known: keep its low-battery state */
+            *b = old[k];
+            continue;
+        }
+        memset(b, 0, sizeof *b);
+        str_copy(b->id, sizeof b->id, e->d_name);
+        str_copy(b->path, sizeof b->path, dir);
+        devbat_name(dir, e->d_name, b->name, sizeof b->name);
+    }
+    closedir(d);
+}
+
+static void devbat_sample(power_t *p)
+{
+    for (int i = 0; i < p->ndev; i++) {
+        devbat_t *b = &p->dev[i];
+        char f[PATHBUF];
+        long long v;
+        sfmt(f, sizeof f, "%s/capacity", b->path);
+        b->capacity = read_ll(f, &v) == 0 && v >= 0 && v <= 100 ? (double)v : -1;
+        sfmt(f, sizeof f, "%s/capacity_level", b->path);
+        if (read_line(f, b->level, sizeof b->level) || !strcmp(b->level, "Unknown"))
+            b->level[0] = '\0';
+        sfmt(f, sizeof f, "%s/status", b->path);
+        if (read_line(f, b->status, sizeof b->status))
+            b->status[0] = '\0';
+    }
+}
+
+/* ---------------------------------------------------------- USB-C charger */
+
+/* "20000mV" -> 20000 */
+static double num_of(const char *dir, const char *name)
+{
+    char p[PATHBUF], b[32];
+    sfmt(p, sizeof p, "%s/%s", dir, name);
+    return read_line(p, b, sizeof b) ? -1 : atof(b);
+}
+
+/* What a charger offers: the power delivery objects of the partner on a
+ * USB-C port that takes power (/sys/class/typec/portN-partner/usb_power_delivery,
+ * Linux 6.0+). Its rating is its best fixed offer: the programmable ones (PPS)
+ * may promise more than it can give at once. */
+static void charger_offer(power_t *p)
+{
+    p->chg_offer_w = -1;
+    p->chg_volts[0] = '\0';
+    char base[PATHBUF];
+    sfmt(base, sizeof base, "%s/class/typec", g_sysfs);
+    DIR *d = opendir(base);
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL) {
+        const char *dash = strstr(e->d_name, "-partner");
+        if (!dash || dash[8])
+            continue;
+        char role[64] = "", f[PATHBUF]; /* a phone or a drive on the port takes power: it isn't a charger */
+        sfmt(f, sizeof f, "%s/%.*s/power_role", base, (int)(dash - e->d_name), e->d_name);
+        if (read_line(f, role, sizeof role) || !strstr(role, "[sink]"))
+            continue;
+        char caps[PATHBUF];
+        sfmt(caps, sizeof caps, "%s/%s/usb_power_delivery/source-capabilities", base, e->d_name);
+        DIR *c = opendir(caps);
+        struct dirent *o;
+        double fixed = 0, other = 0;
+        int volts[8], nv = 0;
+        while (c && (o = readdir(c)) != NULL) {
+            if (o->d_name[0] == '.')
+                continue;
+            char pdo[PATHBUF];
+            sfmt(pdo, sizeof pdo, "%s/%s", caps, o->d_name);
+            if (strstr(o->d_name, "fixed_supply")) {
+                double mv = num_of(pdo, "voltage"), ma = num_of(pdo, "maximum_current");
+                if (mv > 0 && ma > 0)
+                    fixed = MAX(fixed, mv * ma / 1e6);
+                if (mv > 0 && nv < 8)
+                    volts[nv++] = (int)(mv / 1000 + 0.5);
+            } else if (strstr(o->d_name, "battery")) {
+                other = MAX(other, num_of(pdo, "maximum_power") / 1000);
+            } else if (strstr(o->d_name, "variable")) {
+                double mv = num_of(pdo, "maximum_voltage"), ma = num_of(pdo, "maximum_current");
+                if (mv > 0 && ma > 0)
+                    other = MAX(other, mv * ma / 1e6);
+            }
+        }
+        if (c)
+            closedir(c);
+        double best = fixed > 0 ? fixed : other;
+        if (best > 0 && best > p->chg_offer_w) {
+            p->chg_offer_w = best;
+            p->chg_volts[0] = '\0';
+            for (int i = 1; i < nv; i++) /* lowest first */
+                for (int k = i; k > 0 && volts[k - 1] > volts[k]; k--) {
+                    int t = volts[k];
+                    volts[k] = volts[k - 1];
+                    volts[k - 1] = t;
+                }
+            for (int i = 0; i < nv; i++)
+                if (!i || volts[i] != volts[i - 1])
+                    sfmt(p->chg_volts + strlen(p->chg_volts), sizeof p->chg_volts - strlen(p->chg_volts), "%s%d",
+                         i ? "/" : "", volts[i]);
+            if (nv)
+                sfmt(p->chg_volts + strlen(p->chg_volts), sizeof p->chg_volts - strlen(p->chg_volts), " V");
+        }
+    }
+    if (d)
+        closedir(d);
+}
+
+/* What the laptop and the charger agreed on: the USB-C supply that takes
+ * power. UCSI (most laptops) and TCPM give the agreed voltage as voltage_now
+ * and the agreed current as current_now (an older UCSI gives 0 there without
+ * PD: then current_max, 1.5 or 3 A); other drivers' current_now may be a
+ * measurement, so it is left out for them. */
+static void charger_contract(power_t *p)
+{
+    p->chg_w = p->chg_v = p->chg_a = -1;
+    for (int i = 0; i < p->nusbc; i++) {
+        char dir[PATHBUF];
+        str_copy(dir, sizeof dir, p->usbc_path[i]);
+        char *sl = strrchr(dir, '/'); /* usbc_path is its "online" file */
+        if (!sl)
+            continue;
+        *sl = '\0';
+        const char *nm = strrchr(dir, '/');
+        nm = nm ? nm + 1 : dir;
+        if (strncmp(nm, "ucsi-source-psy", 15) && strncmp(nm, "tcpm-source-psy", 15))
+            continue;
+        long long on = 0;
+        if (read_ll(p->usbc_path[i], &on) || !on)
+            continue;
+        double uv = num_of(dir, "voltage_now"), ua = num_of(dir, "current_now");
+        if (ua <= 0)
+            ua = num_of(dir, "current_max");
+        double v = uv / 1e6, a = ua / 1e6;
+        if (v < 3 || v > 50 || a <= 0 || a > 6) /* not a contract (a PPS offer read as a fixed one) */
+            continue;
+        if (v * a > p->chg_w) {
+            p->chg_v = v;
+            p->chg_a = a;
+            p->chg_w = v * a;
+        }
+    }
+}
+
+int charger_weak(const power_t *p)
+{
+    /* below a small laptop charger's 30 W: a phone charger, or a cable or
+     * adapter that allows only 5 V */
+    return p->nbat && p->chg_w > 0 && p->chg_w < 25;
+}
+
+const char *devbat_text(const devbat_t *b, char *out, size_t n)
+{
+    if (b->capacity >= 0)
+        sfmt(out, n, "%.0f%%", b->capacity);
+    else
+        sfmt(out, n, "%s", b->level[0] ? b->level : "?");
+    if (!strcmp(b->status, "Charging"))
+        sfmt(out + strlen(out), n - strlen(out), ", charging");
+    return out;
+}
+
 void power_sample(power_t *p, double dt)
 {
+    double tn = now_sec();
+    if (!p->dev_t || tn - p->dev_t >= 10) { /* wireless devices connect and go to sleep; chargers come and go */
+        p->dev_t = tn;
+        devbat_find(p);
+        charger_offer(p);
+    }
+    devbat_sample(p);
+    charger_contract(p);
     (void)dt; /* each meter keeps the time of its own last read instead */
     double pkg = 0, core = 0, unc = 0, dram = 0, psys = 0;
     int hp = 0, hc = 0, hu = 0, hd = 0, hs = 0;

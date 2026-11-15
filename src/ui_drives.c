@@ -30,6 +30,36 @@
 
 static sys_t *g_s;
 
+static sata_t *sata_of(sys_t *s, const char *name)
+{
+    for (int i = 0; s && i < s->health.nsata; i++)
+        if (!strcmp(s->health.sata[i].name, name))
+            return &s->health.sata[i];
+    return NULL;
+}
+
+/* a USB drive is only asked when you say so: some adapters reset when asked */
+static void read_one(ui_state_t *u, drive_t *d)
+{
+    if (!d->usb) {
+        drive_read(d);
+        return;
+    }
+    int r = ata_usb_read(&g_s->health, d->name);
+    sata_t *t = sata_of(g_s, d->name);
+    if (!r) {
+        drive_read(d);
+        ui_message(u, 0, "%s: read its health through the USB adapter", d->name);
+    } else if (r == EACCES) {
+        ui_message(u, 1, "Reading a drive's health needs root: sudo hsm");
+    } else if (t && t->nvme_bridge) {
+        ui_message(u, 1, "%s is an NVMe drive in a USB adapter: its health needs the adapter maker's own commands",
+                   d->name);
+    } else {
+        ui_message(u, 1, "%s: the USB adapter doesn't pass the drive's health on", d->name);
+    }
+}
+
 static void ago(long long hours_now, long long then, char *out, size_t n)
 {
     out[0] = '\0';
@@ -50,8 +80,12 @@ void drives_open(sys_t *s, ui_state_t *u)
     u->drv_open = 1;
     u->drv_confirm = 0;
     int n = drives_sync(&s->health);
-    for (int i = 0; i < n; i++)
-        drive_read(drive_at(i));
+    for (int i = 0; i < n; i++) {
+        drive_t *d = drive_at(i);
+        const sata_t *t = d->usb ? sata_of(s, d->name) : NULL;
+        if (!d->usb || (t && t->state == 1)) /* USB drives: not without you asking */
+            drive_read(d);
+    }
 }
 
 static void start(ui_state_t *u, int type)
@@ -108,7 +142,7 @@ int drives_key(ui_state_t *u, int ch)
     case KEY_DOWN: u->drv_sel = MIN(MAX(0, n - 1), u->drv_sel + 1); return 1;
     case 'r':
         if (d)
-            drive_read(d);
+            read_one(u, d);
         return 1;
     case 's':
     case 'e':
@@ -140,7 +174,7 @@ void drives_view(sys_t *s, ui_state_t *u)
     if (ih < 4)
         return;
     if (!n) {
-        put(iy, ix, iw, A_GRAY, "%s", "No NVMe or SATA drives found (USB drives can't be tested from here).");
+        put(iy, ix, iw, A_GRAY, "%s", "No NVMe, SATA or USB drives found (USB sticks have nothing to report).");
         return;
     }
     u->drv_sel = CLAMP(u->drv_sel, 0, n - 1);
@@ -157,13 +191,37 @@ void drives_view(sys_t *s, ui_state_t *u)
         hit_add(y, ix, 1, iw, HIT_DRIVE, i, 0);
         int xx = ix;
         xx += put(y, xx, iw, sel ? base | A_BOLD : CP(C_INFO) | A_BOLD, "%-8s", d->name);
-        xx += put(y, xx, ix + iw - xx, sel ? base : A_BOLD, " %s", d->model[0] ? d->model : (d->nvme ? "NVMe drive" : "SATA drive"));
+        xx += put(y, xx, ix + iw - xx, sel ? base : A_BOLD, " %s%s", d->model[0] ? d->model : (d->nvme ? "NVMe drive" : "SATA drive"),
+                  d->usb ? " (USB)" : "");
         if (d->hours >= 0) {
             char h[40];
             sfmt(h, sizeof h, "%lld h powered on", d->hours);
             put(y, ix + iw - utf8_cols(h), utf8_cols(h), sel ? base : A_GRAY, "%s", h);
         }
         y++;
+        const sata_t *us = d->usb ? sata_of(s, d->name) : NULL;
+        if (us && us->state != 1) { /* a USB drive: read when you ask */
+            char sum[200];
+            int lvl;
+            sata_summary(us, sum, sizeof sum, &lvl, ", ", DEG);
+            put(y++, ix + 2, iw - 2, us->state == -4 && !us->nvme_bridge ? A_NORMAL : A_GRAY, "%s",
+                us->state == -4 && !us->nvme_bridge ? "In a USB enclosure: not read yet. r reads its health (most adapters pass it on;"
+                                                      " a few don't, or reset when asked)."
+                                                    : sum);
+            y++;
+            continue;
+        }
+        if (us) { /* its health, as read when you asked */
+            char sum[200], at[16] = "";
+            int lvl;
+            sata_summary(us, sum, sizeof sum, &lvl, ", ", DEG);
+            struct tm tm;
+            time_t rt = (time_t)us->read_at;
+            if (us->read_at > 0 && localtime_r(&rt, &tm))
+                strftime(at, sizeof at, "%H:%M", &tm);
+            put(y++, ix + 2, iw - 2, lvl > 1 ? CP(C_CRIT) | A_BOLD : lvl ? CP(C_WARN) : A_NORMAL, "Health: %s%s%s%s", sum,
+                at[0] ? " (read at " : "", at, at[0] ? "; r reads it again)" : "");
+        }
         if (d->state == -1) {
             put(y++, ix + 2, iw - 2, A_GRAY, "%s", "needs root (sudo hsm) to read its logs and run tests");
             y++;

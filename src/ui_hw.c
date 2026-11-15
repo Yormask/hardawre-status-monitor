@@ -63,7 +63,14 @@ static void lc_title(lc_t *c, const char *t)
     if (c->line)
         lc_row(c);
     int y = lc_row(c);
-    if (y >= 0) {
+    if (y >= 0 && cap_on()) { /* as text: "System ---------" */
+        char rule[256];
+        int n = put(y, c->x, c->w, A_BOLD, "%s ", t), k = 0;
+        for (; k < c->w - n && k < (int)sizeof rule - 1; k++)
+            rule[k] = '-';
+        rule[k] = '\0';
+        put(y, c->x + n, c->w - n, A_NORMAL, "%s", rule);
+    } else if (y >= 0) {
         int n = put(y, c->x, c->w, CP(C_TITLE) | A_BOLD, "%s ", t);
         attrset(CP(C_BORDER));
         for (int i = n; i < c->w; i++)
@@ -103,8 +110,8 @@ static void hw_sensors(sys_t *s, lc_t *c)
             hidden++;
             continue;
         }
-        if (t->chip_idx != last) {
-            lc_text(c, CP(C_INFO) | A_BOLD, "%s", t->chip);
+        if (t->chip_idx != last && !(t->file && last >= 1000)) {
+            lc_text(c, CP(C_INFO) | A_BOLD, "%s", t->file ? "Your values (from files)" : t->chip);
             last = t->chip_idx;
         }
         int y = lc_row(c);
@@ -112,6 +119,21 @@ static void hw_sensors(sys_t *s, lc_t *c)
             continue;
         int lw = MIN(22, c->w / 2), xx = c->x + 2 + lw, bad = sensor_bad(t);
         put(y, c->x + 2, lw, bad ? CP(C_CRIT) | A_BOLD : A_NORMAL, "%s", sensor_label(t));
+        if (t->file) { /* the value, its unit, where it comes from */
+            char v[32], when[24] = "";
+            if (t->ok && t->type == SENS_TEMP)
+                sfmt(v, sizeof v, "%.1f%s", t->value, DEG);
+            else if (t->ok)
+                sfmt(v, sizeof v, "%g%s%s", t->value, t->unit[0] && t->unit[0] != '%' ? " " : "", t->unit);
+            else
+                str_copy(v, sizeof v, t->fstale ? "old" : "n/a");
+            xx += put(y, xx, 12, !t->ok ? A_GRAY : bad ? CP(C_CRIT) | A_BOLD : A_BOLD, "%s", v);
+            if (t->fstale)
+                fmt_duration((double)time(NULL) - t->fmtime, when, sizeof when);
+            put(y, xx + 2, c->x + c->w - xx - 2, A_GRAY, "%s%s%s%s", t->fstale ? "not updated for " : "",
+                when, t->fstale ? ": " : "", t->path);
+            continue;
+        }
         if (!t->ok) {
             put(y, xx, c->w - lw - 2, A_GRAY, "n/a");
             continue;
@@ -262,13 +284,20 @@ static void hw_health(sys_t *s, lc_t *c)
         nvme_t *v = &H->nvme[i];
         char k[32];
         sfmt(k, sizeof k, "Drive %s", v->name);
+        char lk[160] = "";
+        if (v->link_ok) /* its PCIe link: no root needed */
+            pcie_text(&v->link, lk, sizeof lk);
         if (v->state != 1) {
             lc_kv(c, k, A_GRAY, "%s: health %s", v->model[0] ? v->model : "NVMe",
                   v->state == -1 ? "needs root (sudo hsm)" : "not available");
+            if (lk[0])
+                lc_kv(c, "", v->link.below ? CP(C_WARN) | A_BOLD : A_NORMAL, "%s", lk);
             continue;
         }
         lc_kv(c, k, v->crit || v->media_err ? CP(C_CRIT) | A_BOLD : CP(C_OK) | A_BOLD, "%s: %s", v->model,
               v->crit ? "WARNING" : v->media_err ? "media errors" : "OK");
+        if (lk[0])
+            lc_kv(c, "", v->link.below ? CP(C_WARN) | A_BOLD : A_GRAY, "%s", lk);
         if (v->crit)
             lc_kv(c, "", CP(C_CRIT) | A_BOLD, "%s%s%s%s", v->crit & 1 ? "spare low  " : "", v->crit & 2 ? "temperature  " : "",
                   v->crit & 4 ? "reliability degraded  " : "", v->crit & 8 ? "read-only  " : "");
@@ -312,13 +341,18 @@ static void hw_health(sys_t *s, lc_t *c)
         int lvl;
         sfmt(k, sizeof k, "Drive %s", d->name);
         sata_summary(d, sum, sizeof sum, &lvl, ", ", DEG);
-        const char *what = d->rotational ? "hard disk" : "SSD";
+        const char *what = d->rotational ? "hard disk" : "SSD", *bus = d->usb ? "USB" : "SATA";
         if (d->state != 1 && !(d->state == -3 && d->hours >= 0)) {
-            lc_kv(c, k, A_GRAY, "%s (SATA %s): %s", d->model[0] ? d->model : "drive", what, sum);
+            lc_kv(c, k, A_GRAY, "%s (%s %s): %s", d->model[0] ? d->model : "drive", bus, d->usb ? "drive" : what, sum);
             continue;
         }
-        lc_kv(c, k, lvl > 1 ? CP(C_CRIT) | A_BOLD : lvl ? CP(C_WARN) | A_BOLD : CP(C_OK) | A_BOLD, "%s (SATA %s): %s",
-              d->model, what, d->failing ? "FAILING" : lvl > 1 ? "bad sectors" : lvl ? "cable errors" : "OK");
+        lc_kv(c, k, lvl > 1 ? CP(C_CRIT) | A_BOLD : lvl ? CP(C_WARN) | A_BOLD : CP(C_OK) | A_BOLD, "%s (%s %s): %s",
+              d->model, bus, what, d->failing ? "FAILING" : lvl > 1 ? "bad sectors" : lvl ? "cable errors" : "OK");
+        if (d->usb && d->read_at > 0) {
+            char at[24] = "";
+            fmt_duration((double)time(NULL) - d->read_at, at, sizeof at);
+            lc_kv(c, "", A_GRAY, "read when you asked, %s ago (D, then r reads it again)", at);
+        }
         if (d->state == -3)
             lc_kv(c, "", A_GRAY, "%s", "asleep now; these are the figures from when it last spun");
         lc_kv(c, "", lvl > 1 ? CP(C_CRIT) : A_NORMAL, "%lld reallocated, %lld pending, %lld uncorrectable sectors",
@@ -387,6 +421,8 @@ static void hw_gpus(sys_t *s, lc_t *c)
             app(b, sizeof b, "%sPCI %s", SEP, g->pci);
         app(b, sizeof b, "%s%s%s", SEP, g->card, g->integrated ? " (integrated)" : "");
         lc_kv(c, "  Driver", A_NORMAL, "%s", b);
+        if (g->nscr)
+            gpu_screens_wanted(); /* their refresh rates every 5 s while shown */
         for (int k = 0; k < g->nscr; k++) { /* the screens on its ports */
             const screen_t *sc = &g->scr[k];
             char what[96] = "";
@@ -396,10 +432,28 @@ static void hw_gpus(sys_t *s, lc_t *c)
                 str_copy(what, sizeof what, sc->monitor[0] ? sc->monitor : "a screen");
             if (sc->inch >= 7)
                 app(what, sizeof what, ", %.0f\"", sc->inch);
-            if (sc->w > 0)
+            if (sc->mode_w > 0)
+                app(what, sizeof what, ", %dx%d", sc->mode_w, sc->mode_h);
+            else if (sc->w > 0)
                 app(what, sizeof what, ", %dx%d", sc->w, sc->h);
-            lc_kv(c, k ? "" : "  Screens", sc->on ? A_NORMAL : A_GRAY, "%s: %s%s", sc->conn, what,
-                  sc->on ? "" : " (connected, not in use)");
+            if (sc->hz > 0)
+                app(what, sizeof what, " at %.0f Hz", sc->hz);
+            double can;
+            int slow = screen_slow(sc, &can);
+            lc_kv(c, k ? "" : "  Screens", slow ? CP(C_WARN) | A_BOLD : sc->on ? A_NORMAL : A_GRAY, "%s: %s%s", sc->conn,
+                  what, sc->on ? "" : " (connected, not in use)");
+            /* the refresh rate it could do, variable refresh */
+            if (slow == SCR_SETTING) {
+                lc_kv(c, "", CP(C_WARN), "    it can do %.0f Hz: choose it in the display settings", can);
+            } else if (slow == SCR_LINK) {
+                lc_kv(c, "", CP(C_WARN), "    the monitor can do %.0f Hz; this connection, %.0f Hz:", can, sc->max_hz);
+                lc_kv(c, "", CP(C_WARN), "    %s", "the cable, the port or an adapter holds it back");
+            } else if (sc->max_hz > 0 && sc->hz > 0 && sc->max_hz > sc->hz * 1.15) {
+                lc_kv(c, "", A_GRAY, "    it can do %.0f Hz", sc->max_hz);
+            }
+            if (sc->vrr_cap > 0)
+                lc_kv(c, "", A_GRAY, "    FreeSync / G-Sync (VRR): %s",
+                      sc->vrr_on > 0 ? "on" : sc->vrr_on == 0 ? "supported, off now" : "supported");
         }
         if (g->nv_state != NV_NONE) { /* NVIDIA: asleep or awake, and what hsm does about it */
             char held[64], why[160] = "";
@@ -551,6 +605,28 @@ static void hw_power(sys_t *s, lc_t *c)
     }
     if (p->ac_online >= 0)
         lc_kv(c, "AC adapter", A_BOLD, "%s", p->ac_online ? "online" : "offline");
+    if (p->chg_offer_w > 0 || p->chg_w > 0) { /* a USB-C charger */
+        char off[96] = "";
+        if (p->chg_offer_w > 0)
+            sfmt(off, sizeof off, "offers up to %.0f W%s%s", p->chg_offer_w, p->chg_volts[0] ? " (" : "", p->chg_volts);
+        if (p->chg_offer_w > 0 && p->chg_volts[0])
+            app(off, sizeof off, ")");
+        lc_kv(c, "USB-C charger", A_BOLD, "%s", off[0] ? off : "connected");
+        if (p->chg_w > 0) {
+            lc_kv(c, "", charger_weak(p) ? CP(C_WARN) | A_BOLD : A_NORMAL, "gives %.0f W now: %.0f V at %.2f A", p->chg_w,
+                  p->chg_v, p->chg_a);
+            if (charger_weak(p))
+                lc_kv(c, "", CP(C_WARN), "%s", "a phone charger or a weak cable: slow to charge");
+        }
+    }
+    for (int i = 0; i < p->ndev; i++) { /* wireless devices */
+        const devbat_t *b = &p->dev[i];
+        char v[32];
+        devbat_text(b, v, sizeof v);
+        lc_kv(c, i ? "" : "Device battery", b->low ? CP(C_CRIT) | A_BOLD : A_BOLD, "%s: %s", b->name, v);
+        if (b->low)
+            lc_kv(c, "", CP(C_CRIT), "  %s", "low: charge it soon");
+    }
 }
 
 /* "30 s", "2.4 ms", "4 min" */
@@ -600,6 +676,83 @@ static void hw_cpu_limits(sys_t *s, lc_t *c)
         lc_kv(c, "", A_GRAY, "%s", "haven't held the CPU back since start");
     else if (s->power.rapl_denied && geteuid() != 0)
         lc_kv(c, "", A_GRAY, "%s", "run 'sudo hsm' to see when they hold the CPU back");
+}
+
+/* the memory modules: size, kind, speed, slot, and the channels they use */
+static void hw_ram(const machine_t *mc, lc_t *c)
+{
+    if (mc->ram_state < 0) {
+        lc_kv(c, "Modules", A_GRAY, "%s", "run 'sudo hsm' to see them (size, speed, slot, channels)");
+        return;
+    }
+    if (mc->ram_state <= 0 || !mc->nram)
+        return;
+    /* "2 x 16 GB DDR4 SO-DIMM at 2666 MT/s" when they're alike */
+    const ramdev_t *r0 = &mc->ram[0];
+    int alike = 1, slower = 0, maxs = 0;
+    for (int i = 0; i < mc->nram; i++) {
+        const ramdev_t *r = &mc->ram[i];
+        alike &= r->mb == r0->mb && !strcmp(r->type, r0->type) && r->conf == r0->conf;
+        slower |= r->conf > 0 && r->speed > r->conf;
+        maxs = MAX(maxs, r->speed);
+    }
+    static const char *const FORM[] = { "", " DIMM", " SO-DIMM", " soldered" };
+    char sum[160] = "", sz[24];
+    if (r0->mb % 1024)
+        sfmt(sz, sizeof sz, "%lu MB", r0->mb);
+    else
+        sfmt(sz, sizeof sz, "%lu GB", r0->mb / 1024);
+    if (alike)
+        sfmt(sum, sizeof sum, "%d x %s %s%s", mc->nram, sz, r0->type, FORM[CLAMP(r0->form, 0, 3)]);
+    else
+        sfmt(sum, sizeof sum, "%d modules, not all alike", mc->nram);
+    if (alike && r0->conf > 0)
+        sfmt(sum + strlen(sum), sizeof sum - strlen(sum), " at %d MT/s", r0->conf);
+    if (mc->ram_slots > mc->nram && !mc->ram_soldered)
+        sfmt(sum + strlen(sum), sizeof sum - strlen(sum), ", %d of %d slots used", mc->nram, mc->ram_slots);
+    lc_kv(c, "Modules", A_BOLD, "%s", sum);
+    if (mc->ram_channels == 1) { /* half the bandwidth: integrated graphics and games feel it most */
+        lc_kv(c, "", CP(C_WARN) | A_BOLD, "%s", "single channel: half the memory bandwidth");
+        if (mc->nram == 1)
+            lc_kv(c, "", A_GRAY, "%s", "a second module, the same as this one, doubles it");
+        else
+            lc_kv(c, "", A_GRAY, "all on channel %c: the board's manual says which slots pair up", mc->ram[0].channel);
+    } else if (mc->ram_channels >= 2) {
+        lc_kv(c, "", CP(C_OK), "%s channel", mc->ram_channels == 2 ? "dual" : mc->ram_channels == 3 ? "triple" : "quad");
+    }
+    if (slower && maxs > 0) {
+        lc_kv(c, "", A_NORMAL, "the modules can do %d MT/s", maxs);
+        lc_kv(c, "", A_GRAY, "%s", "the CPU, the board, or XMP / EXPO off in the BIOS keeps them lower");
+    }
+    for (int i = 0; i < mc->nram; i++) {
+        const ramdev_t *r = &mc->ram[i];
+        char line[200];
+        if (r->mb % 1024)
+            sfmt(sz, sizeof sz, "%lu MB", r->mb);
+        else
+            sfmt(sz, sizeof sz, "%lu GB", r->mb / 1024);
+        sfmt(line, sizeof line, "%s%s%s: %s%s%s%s%s", r->slot[0] ? r->slot : "?", r->bank[0] ? " / " : "", r->bank, sz,
+             r->maker[0] ? " " : "", r->maker, r->part[0] ? " " : "", r->part);
+        lc_kv(c, "", A_NORMAL, "  %s", line);
+    }
+}
+
+/* the CPUs of one kind of core, as ranges: "0-11", "12-15,20" */
+static void type_cpus(const cpu_t *c, int t, char *out, size_t n)
+{
+    out[0] = '\0';
+    for (int i = 0; i < MAX_CPUS; i++) {
+        if (c->core_type[i] != t)
+            continue;
+        int j = i;
+        while (j + 1 < MAX_CPUS && c->core_type[j + 1] == t)
+            j++;
+        if (j > i)
+            sfmt(out + strlen(out), n - strlen(out), "%s%d-%d", out[0] ? "," : "", i, j);
+        else
+            sfmt(out + strlen(out), n - strlen(out), "%s%d", out[0] ? "," : "", i);
+        i = j;
+    }
 }
 
 static void hw_system(sys_t *s, lc_t *c)
@@ -654,6 +807,19 @@ static void hw_system(sys_t *s, lc_t *c)
     lc_title(c, "CPU");
     lc_kv(c, "Model", A_BOLD, "%s", cv->model);
     lc_kv(c, "Topology", A_NORMAL, "%d cores, %d threads (%d online)", cv->cores, cv->threads, cv->ncpu);
+    for (int t = 0; t < cv->nctype; t++) { /* P-cores and E-cores, big and LITTLE */
+        char cpus[96], th[24] = "";
+        const char *nm = cv->ctype[t].name;
+        type_cpus(cv, t, cpus, sizeof cpus);
+        if (cv->ctype[t].threads != cv->ctype[t].cores)
+            sfmt(th, sizeof th, " (%d threads)", cv->ctype[t].threads);
+        size_t ln = strlen(nm);
+        int plural = cv->ctype[t].cores != 1 && ln >= 4 && !strcmp(nm + ln - 4, "core");
+        int named = ln < 4 || strcmp(nm + ln - 4, "core"); /* an ARM core's name: say which kind it is */
+        const char *what = named ? cv->ctype[t].letter == 'E' ? ", efficient" : ", fast" : "";
+        lc_kv(c, t ? "" : "Kinds of cores", A_NORMAL, "%c: %d %s%s%s%s, CPUs %s", cv->ctype[t].letter,
+              cv->ctype[t].cores, nm, plural ? "s" : "", th, what, cpus);
+    }
     lc_kv(c, "Usage", A_NORMAL, "%.1f%%  (user %.1f%%, system %.1f%%, iowait %.1f%%, steal %.1f%%)", cv->total,
           cv->user, cv->sys, cv->iowait, cv->steal);
     if (cv->mhz_avg > 0)
@@ -717,6 +883,7 @@ static void hw_system(sys_t *s, lc_t *c)
     lc_title(c, "Memory");
     fmt_bytes((double)m->total, a, sizeof a);
     lc_kv(c, "Total", A_BOLD, "%s", a);
+    hw_ram(&s->mach, c);
     fmt_bytes((double)m->used, a, sizeof a);
     lc_kv(c, "Used", A_BOLD, "%s (%.1f%%)", a, m->total ? 100.0 * (double)m->used / (double)m->total : 0);
     fmt_bytes((double)m->avail, a, sizeof a);
@@ -850,6 +1017,37 @@ static void hw_network(sys_t *s, lc_t *c)
             }
             lc_text(c, wf->retry_pct >= 15 || (wf->tx_mbps > 0 && wf->tx_mbps < 30) ? CP(C_WARN) : A_NORMAL,
                     "  link %s Mb/s out, %s Mb/s in%s%s", tx, rx, rs, ct);
+            if (wf->crowd_ok) { /* the neighbours: they take turns on the air with it */
+                char line[200] = "", age[24] = "";
+                int share = wf->crowd_same + wf->crowd_near;
+                if (!share)
+                    sfmt(line, sizeof line, "no other network on its channel");
+                else if (wf->freq < 3000)
+                    sfmt(line, sizeof line, "%d other network%s on its channel, %d next to it", wf->crowd_same,
+                         wf->crowd_same == 1 ? "" : "s", wf->crowd_near);
+                else
+                    sfmt(line, sizeof line, "%d other network%s on its channel%s", share, share == 1 ? "" : "s",
+                         wf->width >= 40 ? " (inside its width)" : "");
+                if (wf->crowd_strong)
+                    sfmt(line + strlen(line), sizeof line - strlen(line), ", %d of them strong", wf->crowd_strong);
+                if (wf->crowd_age >= 0) {
+                    fmt_duration(wf->crowd_age, age, sizeof age);
+                    sfmt(line + strlen(line), sizeof line - strlen(line), " (the last scan, %s ago)", age);
+                }
+                lc_text(c, wf->crowd_strong >= 3 ? CP(C_WARN) : A_NORMAL, "  %s", line);
+                if (wf->freq < 3000) { /* 2.4 GHz: three channels don't overlap; the quietest one helps */
+                    static const int chn[3] = { 1, 6, 11 };
+                    int q = 0;
+                    for (int k = 1; k < 3; k++)
+                        if (wf->ch24[k] < wf->ch24[q])
+                            q = k;
+                    char tip[64] = "";
+                    if (wf->channel != chn[q] && wf->ch24[q] + 2 <= share)
+                        sfmt(tip, sizeof tip, ": %d is the quietest (set in the router)", chn[q]);
+                    lc_text(c, A_GRAY, "  channels 1 / 6 / 11: %d / %d / %d networks%s", wf->ch24[0], wf->ch24[1],
+                            wf->ch24[2], tip);
+                }
+            }
         } else if (f->quality >= 0) {
             lc_text(c, sa, "  Wi-Fi signal %.0f dBm, link quality %d%%", f->signal_dbm, f->quality);
         }
@@ -869,7 +1067,7 @@ static void hw_network(sys_t *s, lc_t *c)
         return;
     }
     lc_kv(c, "Network check", A_NORMAL, "%s", "a ping every 2 s; figures over the last minute");
-    static const char *const nm[NQ_COUNT] = { "  Router", "  Internet" };
+    static const char *const nm[NQ_COUNT] = { "  Router", "  Internet", "  DNS" };
     for (int k = 0; k < NQ_COUNT; k++) {
         const nqt_t *t = &q->t[k];
         char where[80];
@@ -894,7 +1092,8 @@ static void hw_network(sys_t *s, lc_t *c)
         lc_kv(c, nm[k], t->trouble ? CP(C_WARN) | A_BOLD : A_BOLD, "%s: %s, %.1f ms average (%.1f-%.1f, jitter %.1f)",
               where, now, t->avg_ms, t->min_ms, t->max_ms, MAX(t->jitter_ms, 0));
         lc_kv(c, "", t->loss_pct >= 10 ? CP(C_CRIT) | A_BOLD : t->loss_pct > 0 ? CP(C_WARN) : A_GRAY,
-              "%.0f%% lost%s", MAX(t->loss_pct, 0), t->trouble == NQ_LOSS ? "  (trouble now)" : t->trouble == NQ_SLOW ? "  (slow now)" : "");
+              "%.0f%% %s%s", MAX(t->loss_pct, 0), k == NQ_DNS ? "unanswered (the last 5 minutes, example.com)" : "lost",
+              t->trouble == NQ_LOSS ? "  (trouble now)" : t->trouble == NQ_SLOW ? "  (slow now)" : "");
     }
 }
 
@@ -935,41 +1134,183 @@ static void hw_usb(sys_t *s, lc_t *c)
     }
 }
 
+#define HWS_MAX 1024
+static int g_hws_line[HWS_MAX]; /* the lines (from the top of the view) that match */
+
+static void hw_all(sys_t *s, int wide, lc_t *L, lc_t *R)
+{
+    if (wide) {
+        hw_health(s, L);
+        hw_sensors(s, L);
+        hw_gpus(s, L);
+        hw_power(s, L);
+        hw_system(s, R);
+        hw_storage(s, R);
+        hw_network(s, R);
+        hw_usb(s, R);
+    } else {
+        hw_health(s, L);
+        hw_system(s, L);
+        hw_sensors(s, L);
+        hw_gpus(s, L);
+        hw_power(s, L);
+        hw_storage(s, L);
+        hw_network(s, L);
+        hw_usb(s, L);
+    }
+}
+
+/* the search: the whole view once, recorded below the screen, for the lines
+ * that match; returns how many */
+static int hw_find(sys_t *s, ui_state_t *u, int wide, int lw, const capseg_t **segs, int *nseg)
+{
+    const int Y0 = 100000;
+    lc_t L = { Y0, 2, (wide ? lw : COLS) - 4, 1 << 20, 0, 0 };
+    lc_t R = { Y0, lw + 2, COLS - lw - 4, 1 << 20, 0, 0 };
+    cap_begin(Y0);
+    hw_all(s, wide, &L, &R);
+    *nseg = cap_end(segs);
+    int n = 0;
+    for (int i = 0; i < *nseg && n < HWS_MAX; i++) {
+        if (!strcasestr((*segs)[i].text, u->hws_q))
+            continue;
+        int ln = (*segs)[i].line, k = n;
+        while (k > 0 && g_hws_line[k - 1] > ln) /* sorted, once each */
+            k--;
+        if (k > 0 && g_hws_line[k - 1] == ln)
+            continue;
+        memmove(&g_hws_line[k + 1], &g_hws_line[k], (size_t)(n - k) * sizeof g_hws_line[0]);
+        g_hws_line[k] = ln;
+        n++;
+    }
+    return n;
+}
+
+/* n / N: the next or previous matching line, brought to the upper third of the screen */
+void hardware_search_step(ui_state_t *u, int dir)
+{
+    if (!u->hws_q[0] || !u->hws_n)
+        return;
+    u->hws_cur = (u->hws_cur + dir + u->hws_n) % u->hws_n;
+    u->hw_scroll = MAX(0, g_hws_line[u->hws_cur] - u->hws_page / 3);
+}
+
+void hardware_text(sys_t *s, int width, void (*fn)(const char *line, void *ctx), void *ctx)
+{
+    const int Y0 = 100000;
+    int cols = COLS;
+    COLS = width + 1;
+    lc_t C = { Y0, 0, width, 1 << 20, 0, 0 };
+    cap_begin(Y0);
+    hw_all(s, 0, &C, NULL);
+    const capseg_t *seg;
+    int n = cap_end(&seg);
+    COLS = cols;
+    /* each line: its pieces at their columns, one character per cell */
+    static char cell[512][5];
+    for (int ln = 0; ln < C.line; ln++) {
+        int w = 0;
+        for (int i = 0; i < n; i++) {
+            if (seg[i].line != ln)
+                continue;
+            int x = seg[i].x;
+            for (const char *t = seg[i].text; *t && x < (int)(sizeof cell / sizeof cell[0]);) {
+                int len = (*t & 0x80) == 0 ? 1 : (*t & 0xE0) == 0xC0 ? 2 : (*t & 0xF0) == 0xE0 ? 3 : 4;
+                while (w < x) /* gaps between the pieces */
+                    str_copy(cell[w++], sizeof cell[0], " ");
+                memcpy(cell[x], t, (size_t)len);
+                cell[x][len] = '\0';
+                for (int k = 1; k < len; k++)
+                    if (!t[k]) { /* cut short */
+                        cell[x][k] = '\0';
+                        len = k;
+                        break;
+                    }
+                t += len;
+                x++;
+                if (x > w)
+                    w = x;
+            }
+        }
+        char out[2048];
+        size_t o = 0;
+        for (int k = 0; k < w && o + 5 < sizeof out; k++) {
+            size_t l = strlen(cell[k]);
+            memcpy(out + o, cell[k], l);
+            o += l;
+        }
+        while (o && out[o - 1] == ' ')
+            o--;
+        out[o] = '\0';
+        fn(out, ctx);
+    }
+}
+
 void hardware(sys_t *s, ui_state_t *u)
 {
-    int top = 1, h = LINES - 2, inner = h - 2;
-    u->hw_scroll = CLAMP(u->hw_scroll, 0, u->hw_max);
-    if (COLS >= 110) {
-        int lw = COLS / 2;
+    int top = 1, h = LINES - 2, inner = h - 2, wide = COLS >= 110, lw = COLS / 2;
+    const capseg_t *segs = NULL;
+    int nseg = 0;
+    u->hws_page = inner;
+    if (u->hws_q[0]) {
+        u->hws_n = hw_find(s, u, wide, lw, &segs, &nseg);
+        if (u->hws_jump && u->hws_n) { /* the first match from where the screen is */
+            u->hws_jump = 0;
+            int k = 0;
+            while (k + 1 < u->hws_n && g_hws_line[k] < u->hw_scroll)
+                k++;
+            u->hws_cur = k;
+            if (g_hws_line[k] < u->hw_scroll || g_hws_line[k] >= u->hw_scroll + inner)
+                u->hw_scroll = MAX(0, g_hws_line[k] - inner / 3);
+        }
+        u->hws_cur = u->hws_n ? CLAMP(u->hws_cur, 0, u->hws_n - 1) : 0;
+    } else {
+        u->hws_n = 0;
+    }
+    u->hw_scroll = CLAMP(u->hw_scroll, 0, MAX(u->hw_max, u->hws_n ? g_hws_line[u->hws_n - 1] : 0));
+    if (wide) {
         box_(top, 0, h, lw, "Health · Sensors · Graphics · Power", NULL);
         box_(top, lw, h, COLS - lw, "System · Storage · Network · USB", NULL);
         lc_t L = { top + 1, 2, lw - 4, inner, 0, u->hw_scroll };
         lc_t R = { top + 1, lw + 2, COLS - lw - 4, inner, 0, u->hw_scroll };
-        hw_health(s, &L);
-        hw_sensors(s, &L);
-        hw_gpus(s, &L);
-        hw_power(s, &L);
-        hw_system(s, &R);
-        hw_storage(s, &R);
-        hw_network(s, &R);
-        hw_usb(s, &R);
+        hw_all(s, 1, &L, &R);
         u->hw_max = MAX(0, MAX(L.line, R.line) - inner);
     } else {
         box_(top, 0, h, COLS, "Hardware", NULL);
         lc_t C = { top + 1, 2, COLS - 4, inner, 0, u->hw_scroll };
-        hw_health(s, &C);
-        hw_system(s, &C);
-        hw_sensors(s, &C);
-        hw_gpus(s, &C);
-        hw_power(s, &C);
-        hw_storage(s, &C);
-        hw_network(s, &C);
-        hw_usb(s, &C);
+        hw_all(s, 0, &C, NULL);
         u->hw_max = MAX(0, C.line - inner);
+    }
+    /* what matches, on screen: reversed */
+    size_t ql = strlen(u->hws_q);
+    for (int i = 0; ql && i < nseg; i++) {
+        int r = segs[i].line - u->hw_scroll;
+        if (r < 0 || r >= inner)
+            continue;
+        for (const char *t = segs[i].text, *m; (m = strcasestr(t, u->hws_q)) != NULL; t = m + ql) {
+            char pre[1024];
+            size_t pl = (size_t)(m - segs[i].text);
+            memcpy(pre, segs[i].text, pl);
+            pre[pl] = '\0';
+            char hit[64];
+            str_copy(hit, sizeof hit, m);
+            hit[MIN(ql, sizeof hit - 1)] = '\0';
+            int cx = segs[i].x + utf8_cols(pre);
+            if (cx < COLS)
+                mvchgat(top + 1 + r, cx, MIN(utf8_cols(hit), COLS - cx), A_REVERSE | A_BOLD, 0, NULL);
+        }
     }
     if (u->hw_max > 0) {
         char m[64];
         sfmt(m, sizeof m, " %s scroll %d/%d ", U ? "↑↓" : "up/down", u->hw_scroll, u->hw_max);
         put(top + h - 1, COLS - 2 - utf8_cols(m), utf8_cols(m), A_GRAY, "%s", m);
+    }
+    if (u->hws_q[0] && !u->hws_edit) {
+        char m[96];
+        if (u->hws_n)
+            sfmt(m, sizeof m, " \"%s\": line %d of %d with it (n / N) ", u->hws_q, u->hws_cur + 1, u->hws_n);
+        else
+            sfmt(m, sizeof m, " \"%s\": not found ", u->hws_q);
+        put(top + h - 1, 2, COLS / 2, u->hws_n ? CP(C_KEY) : CP(C_WARN) | A_BOLD, "%s", m);
     }
 }

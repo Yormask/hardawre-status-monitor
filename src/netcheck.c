@@ -18,7 +18,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* netcheck.c - the network's quality: delay and lost pings
+/* netcheck.c - the network's quality: delay and lost pings, and DNS
  *
  * Off unless switched on (Setup, or net_check in the config file). A small
  * thread pings the router and one internet address every 2 seconds, with
@@ -26,7 +26,11 @@
  * (net.ipv4.ping_group_range); as root it can fall back to a raw socket.
  * Comparing the two tells a Wi-Fi or cable problem (the router itself
  * answers late or not at all) from one further away (only the internet
- * does), and the delays explain lag spikes in games. */
+ * does), and the delays explain lag spikes in games. Every 10 seconds it
+ * also asks the DNS server for example.com: "pings work but pages don't
+ * load" is often a DNS server that answers slowly or not at all. The
+ * server is the first one systemd-resolved uses, else the first in
+ * /etc/resolv.conf. */
 #define _GNU_SOURCE
 #include "collect.h"
 
@@ -54,9 +58,11 @@
 #define BAD_FOR 2        /* pings in a row with trouble before it counts */
 #define GOOD_FOR 5       /* ... and without, before it's over */
 #define DEFAULT_HOST "1.1.1.1"
+#define DNS_EVERY 10.0   /* s between DNS questions */
 
 typedef struct {
     struct sockaddr_in to;
+    double every;        /* s between questions */
     int have;            /* an address to ping */
     double ms[WINDOW];   /* ring: the delay of each ping, -1 = lost */
     int n, head;
@@ -221,7 +227,7 @@ static void judge(tgt_t *t, nqt_t *q)
         if (++t->bad_run >= BAD_FOR && !q->trouble) {
             q->trouble = now;
             q->episode++;
-            q->since = wall() - MAX(oldest_bad, BAD_FOR - 1) * EVERY;
+            q->since = wall() - MAX(oldest_bad, BAD_FOR - 1) * t->every;
             q->until = 0;
             q->worst_loss = q->worst_ms = 0;
         }
@@ -229,7 +235,7 @@ static void judge(tgt_t *t, nqt_t *q)
         t->bad_run = 0;
         if (q->trouble && ++t->good_run >= GOOD_FOR) { /* over: since the last bad ping */
             q->trouble = NQ_FINE;
-            q->until = t->last_bad > q->since ? t->last_bad + EVERY : wall();
+            q->until = t->last_bad > q->since ? t->last_bad + t->every : wall();
         }
     }
     if (q->trouble) {
@@ -238,6 +244,70 @@ static void judge(tgt_t *t, nqt_t *q)
         q->worst_loss = MAX(q->worst_loss, 100.0 * lost / MAX(last, 1));
         q->worst_ms = MAX(q->worst_ms, med);
     }
+}
+
+/* ------------------------------------------------------------- DNS */
+
+/* the DNS server this machine asks: systemd-resolved's first upstream one
+ * (its own 127.0.0.53 would answer from its cache), else resolv.conf's */
+static int dns_server(struct sockaddr_in *out)
+{
+    const char *files[] = { "/run/systemd/resolve/resolv.conf", "/etc/resolv.conf" };
+    const char *fake = secure_getenv("HSM_RESOLV"); /* test hook: another resolv.conf */
+    if (fake && *fake)
+        files[0] = files[1] = fake;
+    for (int i = 0; i < 2; i++) {
+        FILE *f = fopen(files[i], "re");
+        char line[256], ip[64];
+        while (f && fgets(line, sizeof line, f)) {
+            if (sscanf(line, " nameserver %63s", ip) != 1)
+                continue;
+            memset(out, 0, sizeof *out);
+            out->sin_family = AF_INET;
+            out->sin_port = htons(53);
+            if (inet_pton(AF_INET, ip, &out->sin_addr) == 1) {
+                fclose(f);
+                return 0;
+            }
+        }
+        if (f)
+            fclose(f);
+    }
+    return -1;
+}
+
+/* "example.com, address?" with this ID */
+static int send_dns(int fd, uint16_t qid)
+{
+    static const unsigned char name[] = "\7example\3com";
+    unsigned char b[64];
+    size_t n = 0;
+    b[n++] = (unsigned char)(qid >> 8);
+    b[n++] = (unsigned char)qid;
+    b[n++] = 0x01; /* recursion desired */
+    b[n++] = 0x00;
+    b[n++] = 0; /* one question */
+    b[n++] = 1;
+    memset(b + n, 0, 6);
+    n += 6;
+    memcpy(b + n, name, sizeof name); /* with the closing 0 */
+    n += sizeof name;
+    b[n++] = 0; /* type A */
+    b[n++] = 1;
+    b[n++] = 0; /* class IN */
+    b[n++] = 1;
+    return send(fd, b, n, 0) < 0 ? errno : 0;
+}
+
+/* an answer: 1 good, 0 the server said it failed (SERVFAIL, REFUSED), -1 not ours */
+static int read_dns(int fd, uint16_t qid)
+{
+    unsigned char b[512];
+    ssize_t r = recv(fd, b, sizeof b, 0);
+    if (r < 12 || (uint16_t)(b[0] << 8 | b[1]) != qid || !(b[2] & 0x80))
+        return -1;
+    int rcode = b[3] & 0x0f;
+    return rcode == 0 || rcode == 3 ? 1 : 0; /* no such name is still an answer */
 }
 
 static int send_ping(int fd, int raw, uint16_t id, tgt_t *t, uint16_t seq)
@@ -280,7 +350,7 @@ static void read_answers(int fd, int raw, uint16_t id, tgt_t *T, nqt_t *Q)
         uint16_t seq = ntohs(h->un.echo.sequence);
         for (int k = 0; k < NQ_COUNT; k++) {
             tgt_t *t = &T[k];
-            if (t->sent > 0 && t->seq == seq && t->to.sin_addr.s_addr == from.sin_addr.s_addr) {
+            if (k != NQ_DNS && t->sent > 0 && t->seq == seq && t->to.sin_addr.s_addr == from.sin_addr.s_addr) {
                 push(t, (mono() - t->sent) * 1000.0);
                 t->sent = 0;
                 pthread_mutex_lock(&N.mu);
@@ -317,11 +387,13 @@ static void *pinger(void *arg)
         poll(&pf, 1, -1); /* until it's switched off */
         return NULL;
     }
-    uint16_t id = (uint16_t)(getpid() & 0xffff), seq = 0;
+    uint16_t id = (uint16_t)(getpid() & 0xffff), seq = 0, qid = (uint16_t)(mono() * 1000);
     tgt_t T[NQ_COUNT];
     nqt_t Q[NQ_COUNT];
     memset(T, 0, sizeof T);
     memset(Q, 0, sizeof Q);
+    int dfd = -1;
+    double next_dns = 0, next_dsrv = 0;
     for (int k = 0; k < NQ_COUNT; k++)
         Q[k].rtt_ms = Q[k].avg_ms = Q[k].min_ms = Q[k].max_ms = Q[k].jitter_ms = Q[k].loss_pct = Q[k].normal_ms = -1;
     char iface[32] = "";
@@ -353,6 +425,48 @@ static void *pinger(void *arg)
             }
             snprintf(iface, sizeof iface, "%s", ifc);
         }
+        if (now >= next_dsrv) { /* the DNS server: it changes with the network too */
+            next_dsrv = now + 30;
+            struct sockaddr_in ds;
+            int have = dns_server(&ds) == 0;
+            if (!have || !T[NQ_DNS].have || ds.sin_addr.s_addr != T[NQ_DNS].to.sin_addr.s_addr) {
+                nqt_t *q = &Q[NQ_DNS];
+                memset(&T[NQ_DNS], 0, sizeof T[NQ_DNS]);
+                if (q->trouble) {
+                    q->trouble = NQ_FINE;
+                    q->until = wall();
+                }
+                q->addr[0] = '\0';
+                q->rtt_ms = q->avg_ms = q->min_ms = q->max_ms = q->jitter_ms = q->loss_pct = q->normal_ms = -1;
+                if (dfd >= 0)
+                    close(dfd);
+                dfd = -1;
+                if (have && (dfd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)) >= 0 &&
+                    connect(dfd, (struct sockaddr *)&ds, sizeof ds) == 0) {
+                    T[NQ_DNS].have = 1;
+                    T[NQ_DNS].to = ds;
+                    inet_ntop(AF_INET, &ds.sin_addr, q->addr, sizeof q->addr);
+                } else if (dfd >= 0) {
+                    close(dfd);
+                    dfd = -1;
+                }
+            }
+            T[NQ_DNS].every = DNS_EVERY;
+        }
+        if (now >= next_dns && T[NQ_DNS].have) {
+            next_dns = MAX(next_dns + DNS_EVERY, now);
+            tgt_t *t = &T[NQ_DNS];
+            if (t->sent > 0) { /* no answer in 10 s: lost */
+                push(t, -1);
+                judge(t, &Q[NQ_DNS]);
+            }
+            qid++;
+            int e = send_dns(dfd, qid);
+            Q[NQ_DNS].noroute = e == ENETUNREACH || e == EHOSTUNREACH;
+            t->sent = e ? 0 : mono();
+            t->seq = qid;
+        }
+        T[NQ_ROUTER].every = T[NQ_NET].every = EVERY;
         if (!T[NQ_NET].have && now >= next_host) { /* the internet address, looked up again if it failed */
             next_host = now + 60;
             if (resolve(N.host, &T[NQ_NET].to) == 0) {
@@ -365,7 +479,7 @@ static void *pinger(void *arg)
             seq++;
             for (int k = 0; k < NQ_COUNT; k++) {
                 tgt_t *t = &T[k];
-                if (!t->have)
+                if (!t->have || k == NQ_DNS)
                     continue;
                 if (t->sent > 0) { /* no answer in time */
                     push(t, -1);
@@ -385,16 +499,30 @@ static void *pinger(void *arg)
             snprintf(N.q.iface, sizeof N.q.iface, "%s", iface);
             pthread_mutex_unlock(&N.mu);
         }
-        struct pollfd pf[2] = { { fd, POLLIN, 0 }, { N.wake[0], POLLIN, 0 } };
-        int ms = (int)((next - mono()) * 1000.0) + 1;
-        if (poll(pf, 2, MAX(ms, 0)) > 0) {
+        struct pollfd pf[3] = { { fd, POLLIN, 0 }, { N.wake[0], POLLIN, 0 }, { dfd, POLLIN, 0 } };
+        int ms = (int)((MIN(next, T[NQ_DNS].have ? next_dns : next) - mono()) * 1000.0) + 1;
+        if (poll(pf, dfd >= 0 ? 3 : 2, MAX(ms, 0)) > 0) {
             if (pf[1].revents)
                 break;
             if (pf[0].revents & POLLIN)
                 read_answers(fd, raw, id, T, Q);
+            if (dfd >= 0 && (pf[2].revents & POLLIN)) {
+                tgt_t *t = &T[NQ_DNS];
+                int r = read_dns(dfd, t->seq);
+                if (r >= 0 && t->sent > 0) {
+                    push(t, r ? (mono() - t->sent) * 1000.0 : -1); /* a failure counts as no answer */
+                    t->sent = 0;
+                    pthread_mutex_lock(&N.mu);
+                    judge(t, &Q[NQ_DNS]);
+                    N.q.t[NQ_DNS] = Q[NQ_DNS];
+                    pthread_mutex_unlock(&N.mu);
+                } /* r < 0: someone else's datagram, already read and dropped */
+            }
         }
     }
     close(fd);
+    if (dfd >= 0)
+        close(dfd);
     return NULL;
 }
 

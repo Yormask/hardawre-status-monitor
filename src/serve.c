@@ -233,9 +233,14 @@ void metrics_write(FILE *f, sys_t *s)
                     two("gpu_video_percent", "gpu", b, "engine", "encode", nn(s->gpus.g[i].enc_pct));
                     two("gpu_video_percent", "gpu", b, "engine", "decode", nn(s->gpus.g[i].dec_pct));
                 }
+        }
+        any = 0; /* NVIDIA's while awake (from NVML), AMD's and Intel's cards from sysfs */
+        for (int i = 0; i < s->gpus.n; i++)
+            any |= s->gpus.g[i].nv_state != NV_NONE || s->gpus.g[i].pcie_gen > 0;
+        if (any) {
             help("gpu_pcie_link", "gauge", "the GPU's PCIe link now: generation and width (lanes)");
             for (int i = 0; i < s->gpus.n; i++)
-                if (s->gpus.g[i].nv_state != NV_NONE) {
+                if (s->gpus.g[i].nv_state != NV_NONE || s->gpus.g[i].pcie_gen > 0) {
                     const gpu_t *g = &s->gpus.g[i];
                     sfmt(b, sizeof b, "%d", i);
                     two("gpu_pcie_link", "gpu", b, "what", "generation", g->pcie_gen > 0 ? g->pcie_gen : NAN);
@@ -261,6 +266,15 @@ void metrics_write(FILE *f, sys_t *s)
         help("battery_health_percent", "gauge", "full charge now against new");
         for (int i = 0; i < s->power.nbat; i++)
             one("battery_health_percent", "battery", s->power.bat[i].name, nn(s->power.bat[i].health));
+    }
+    if (s->power.chg_w > 0) { /* a USB-C charger */
+        help("usbc_charger_watts", "gauge", "what the USB-C charger gives, as agreed with the machine");
+        plain("usbc_charger_watts", s->power.chg_w);
+    }
+    if (s->power.ndev) { /* wireless devices */
+        help("device_battery_percent", "gauge", "the charge of a wireless mouse, keyboard, headset or controller");
+        for (int i = 0; i < s->power.ndev; i++)
+            one("device_battery_percent", "device", s->power.dev[i].name, nn(s->power.dev[i].capacity));
     }
 
     /* sensors */
@@ -288,6 +302,20 @@ void metrics_write(FILE *f, sys_t *s)
             fputc('}', M);
             val(x->ok ? x->value : NAN);
         }
+    }
+    /* your own values in other units */
+    int anyv = 0;
+    for (int i = 0; i < s->sens.n; i++) {
+        const sensor_t *x = &s->sens.s[i];
+        if (x->type != SENS_OTHER || x->hidden)
+            continue;
+        if (!anyv++)
+            help("value", "gauge", "your own values, read from files (unit in the label)");
+        fprintf(M, "hsm_value{");
+        lab("name", sensor_label(x), 1);
+        lab("unit", x->unit, 0);
+        fputc('}', M);
+        val(x->ok ? x->value : NAN);
     }
 
     /* disks */
@@ -357,7 +385,7 @@ void metrics_write(FILE *f, sys_t *s)
         }
     }
     if (s->net.q.on && !s->net.q.err) { /* the network check */
-        static const char *const nm[NQ_COUNT] = { "router", "internet" };
+        static const char *const nm[NQ_COUNT] = { "router", "internet", "dns" };
         help("ping_seconds", "gauge", "the latest ping's delay (NaN: lost)");
         for (int k = 0; k < NQ_COUNT; k++)
             if (s->net.q.t[k].addr[0])
@@ -470,6 +498,18 @@ void metrics_write(FILE *f, sys_t *s)
             help("drive_heat_slowed_seconds_total", "counter", "seconds the drive ran slowed down from heat, in its life");
         two("drive_heat_slowed_seconds_total", "drive", v->name, "kind", "light", (double)v->heat_s[0]);
         two("drive_heat_slowed_seconds_total", "drive", v->name, "kind", "hard", (double)v->heat_s[1]);
+    }
+    any = 0; /* the PCIe link (no root needed) */
+    for (int i = 0; i < h->nnvme; i++) {
+        const nvme_t *v = &h->nvme[i];
+        if (!v->link_ok)
+            continue;
+        if (!any++)
+            help("drive_pcie_link", "gauge", "an NVMe drive's PCIe link: generation and width (lanes) now and the most it and its slot allow");
+        two("drive_pcie_link", "drive", v->name, "what", "generation", v->link.gen > 0 ? v->link.gen : NAN);
+        two("drive_pcie_link", "drive", v->name, "what", "width", v->link.width > 0 ? v->link.width : NAN);
+        two("drive_pcie_link", "drive", v->name, "what", "best_generation", v->link.best_gen > 0 ? v->link.best_gen : NAN);
+        two("drive_pcie_link", "drive", v->name, "what", "best_width", v->link.best_width > 0 ? v->link.best_width : NAN);
     }
     any = 0;
     for (int i = 0; i < h->nsata; i++) {

@@ -33,8 +33,10 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/perf_event.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -323,6 +325,87 @@ static int rd(const char *dir, const char *name, long long *v)
     char p[PATHBUF];
     sfmt(p, sizeof p, "%s/%s", dir, name);
     return read_ll(p, v);
+}
+
+/* a binary file, whole (sysfs binary attributes) */
+static ssize_t read_bin(const char *path, unsigned char *buf, size_t size)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t n = read(fd, buf, size);
+    close(fd);
+    return n;
+}
+
+/* AMD: why the GPU runs below full speed, from gpu_metrics. Layouts 1.3
+ * (graphics cards) and 2.2 to 2.4 (APUs) carry the "independent throttle
+ * status", the same bits on every chip: 0-31 power and current limits
+ * (PPT, TDC, EDC), 32-47 temperatures (edge, hotspot, memory, VRs, and VRHOT
+ * and PROCHOT, 44-47, where the hardware steps in), 56 peak power. Fields
+ * the firmware doesn't fill in read as all ones. Returns GS_* or -1. */
+static int amd_reasons(const gpu_t *g, int *hw)
+{
+    unsigned char b[512];
+    char p[PATHBUF];
+    sfmt(p, sizeof p, "%s/gpu_metrics", g->dev);
+    ssize_t n = read_bin(p, b, sizeof b);
+    if (n < 4)
+        return -1;
+    unsigned size = (unsigned)b[0] | (unsigned)b[1] << 8, fmt = b[2], content = b[3];
+    size_t off = fmt == 1 && content == 3 ? 112 : fmt == 2 && content >= 2 && content <= 4 ? 120 : 0;
+    if (!off || (size_t)n < off + 8 || size < off + 8)
+        return -1;
+    unsigned long long st = 0;
+    for (int k = 7; k >= 0; k--) /* little-endian, whatever this machine is */
+        st = st << 8 | b[off + (size_t)k];
+    if (st == ~0ULL)
+        return -1;
+    *hw = (st & (0xFULL << 44)) != 0;
+    return ((st & 0xFFFFFFFFULL) || (st & (1ULL << 56)) ? GS_POWER : 0) | ((st & 0xFFFF00000000ULL) ? GS_HEAT : 0);
+}
+
+/* Intel: i915 (Ice Lake and newer) has gt/gt0/throttle_reason_*, xe
+ * tile0/gt0/freq0/throttle/reason_*, each 0 or 1, and a status that is 1
+ * while any of them holds the clock back. Returns GS_* or -1. */
+static int intel_reasons(const gpu_t *g, int *hw)
+{
+    char dir[PATHBUF], f[48];
+    const char *pre;
+    long long v;
+    if (!strcmp(g->driver, "i915")) {
+        sfmt(dir, sizeof dir, "%s/gt/gt0", g->drm);
+        pre = "throttle_reason_";
+    } else if (!strcmp(g->driver, "xe")) {
+        sfmt(dir, sizeof dir, "%s/tile0/gt0/freq0/throttle", g->dev);
+        pre = "reason_";
+    } else {
+        return -1;
+    }
+    sfmt(f, sizeof f, "%sstatus", !strcmp(g->driver, "i915") ? pre : "");
+    if (rd(dir, f, &v))
+        return -1;
+    *hw = 0;
+    if (!v)
+        return 0;
+    static const char *const heat[] = { "thermal", "prochot", "ratl", "vr_thermalert", "vr_thermal", "soc_thermal",
+                                        "mem_thermal", "soc_avg_thermal", NULL };
+    static const char *const power[] = { "pl1", "pl2", "pl4", "vr_tdc", "iccmax", "pwrbrk", "psys_pl1", "psys_pl2",
+                                         "psys_crit", "fastvmode", NULL };
+    int bits = 0;
+    for (int k = 0; heat[k]; k++) {
+        sfmt(f, sizeof f, "%s%s", pre, heat[k]);
+        if (!rd(dir, f, &v) && v) {
+            bits |= GS_HEAT;
+            *hw |= !strcmp(heat[k], "prochot") || !strcmp(heat[k], "vr_thermalert");
+        }
+    }
+    for (int k = 0; power[k]; k++) {
+        sfmt(f, sizeof f, "%s%s", pre, power[k]);
+        if (!rd(dir, f, &v) && v)
+            bits |= GS_POWER;
+    }
+    return bits;
 }
 
 static double first_ll(const char *dir, const char *const *names)
@@ -741,6 +824,13 @@ static void sysfs_sample(gpu_t *g)
         if (!rd(g->dev, "mem_info_vram_total", &v))
             g->mem_total = (double)v;
     }
+    /* why it runs below full speed, where the driver says (NVIDIA's comes through NVML) */
+    int hw = 0, bits = !strcmp(g->driver, "amdgpu") ? amd_reasons(g, &hw) : intel_reasons(g, &hw);
+    g->sys_bits = bits > 0 ? bits : 0;
+    g->slow_hw = bits > 0 && hw;
+    if (bits >= 0)
+        g->reasons_ok = 1;
+
     if (g->neng) {
         intel_perf_sample(g);
     } else if (!strcmp(g->driver, "i915")) {
@@ -892,6 +982,72 @@ static void edid_parse(const unsigned char *e, size_t n, screen_t *s)
             nm[--k] = '\0';
         str_copy(s->monitor, sizeof s->monitor, nm);
     }
+    /* the monitor's own timings, whatever the connection allows: the detailed
+     * timings of the base block and of CTA-861 extensions, the CTA video codes
+     * of fast modes (a TV's 4K at 120 Hz) and DisplayID type I and VII timings */
+    s->nown = 0;
+    for (size_t b = 0; b + 128 <= n && b < 128 * 8; b += 128) {
+        const unsigned char *x = e + b;
+        size_t dt0 = 54, dt1 = 126;
+        if (b) {
+            if (x[0] == 0x02) { /* CTA-861 */
+                dt0 = x[2] >= 4 ? x[2] : 127;
+                for (size_t k = 4; k < dt0 && k < 127;) { /* data blocks: the video codes */
+                    int tag = x[k] >> 5, len = x[k] & 31;
+                    if (tag == 2)
+                        for (int v = 1; v <= len && k + (size_t)v < dt0; v++) {
+                            int vic = x[k + v];
+                            if (vic >= 129 && vic <= 192)
+                                vic &= 0x7f;
+                            static const struct { unsigned char vic; unsigned short w, h, hz; } V[] = {
+                                { 63, 1920, 1080, 120 }, { 64, 1920, 1080, 100 }, { 117, 3840, 2160, 100 },
+                                { 118, 3840, 2160, 120 }, { 119, 3840, 2160, 100 }, { 120, 3840, 2160, 120 } };
+                            for (size_t q = 0; q < sizeof V / sizeof V[0]; q++)
+                                if (V[q].vic == vic && s->nown < 16) {
+                                    s->own[s->nown].w = V[q].w;
+                                    s->own[s->nown].h = V[q].h;
+                                    s->own[s->nown++].hz = V[q].hz;
+                                }
+                        }
+                    k += 1 + (size_t)len;
+                }
+            } else if (x[0] == 0x70) { /* DisplayID */
+                size_t end = MIN(5 + (size_t)x[2], 127);
+                for (size_t k = 5; k + 3 <= end && x[k];) {
+                    int tag = x[k], len = x[k + 2];
+                    if ((tag == 0x03 || tag == 0x22) && k + 3 + (size_t)len <= end)
+                        for (int t = 0; t + 20 <= len && s->nown < 16; t += 20) {
+                            const unsigned char *d = x + k + 3 + t;
+                            double clk = (double)((d[0] | d[1] << 8 | d[2] << 16) + 1) * (tag == 0x22 ? 1e3 : 1e4);
+                            int w = (d[4] | d[5] << 8) + 1, hb = (d[6] | d[7] << 8) + 1;
+                            int h = (d[12] | d[13] << 8) + 1, vb = (d[14] | d[15] << 8) + 1;
+                            if (!(d[3] & 0x10) && w > 0 && h > 0) {
+                                s->own[s->nown].w = (unsigned short)w;
+                                s->own[s->nown].h = (unsigned short)h;
+                                s->own[s->nown++].hz = (float)(clk / ((double)(w + hb) * (h + vb)));
+                            }
+                        }
+                    k += 3 + (size_t)len;
+                }
+                continue;
+            } else {
+                continue;
+            }
+        }
+        for (size_t d = dt0; d + 18 <= dt1 + 1 && s->nown < 16; d += 18) {
+            const unsigned char *t = x + d;
+            unsigned clk = t[0] | t[1] << 8; /* 10 kHz; 0 = a descriptor, not a timing */
+            if (!clk)
+                continue;
+            int w = t[2] | (t[4] & 0xf0) << 4, hb = t[3] | (t[4] & 0x0f) << 8;
+            int h = t[5] | (t[7] & 0xf0) << 4, vb = t[6] | (t[7] & 0x0f) << 8;
+            if ((t[17] & 0x80) || w <= 0 || h <= 0) /* interlaced */
+                continue;
+            s->own[s->nown].w = (unsigned short)w;
+            s->own[s->nown].h = (unsigned short)h;
+            s->own[s->nown++].hz = (float)(clk * 1e4 / ((double)(w + hb) * (h + vb)));
+        }
+    }
 }
 
 /* the DRM card of a GPU known by its PCI address (NVIDIA comes through NVML): "card0", or "" */
@@ -927,8 +1083,218 @@ static void drm_card_of(const gpu_t *g, const char *base, char *out, size_t n)
 }
 
 /* the screens on a GPU's ports: /sys/class/drm/card1-HDMI-A-1/ (status, enabled, modes, edid) */
+/* -------------------------------------- the refresh rate a screen runs at */
+#if defined(__has_include)
+#if __has_include(<drm/drm_mode.h>)
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+#include <sys/ioctl.h>
+#define HAVE_DRM_UAPI 1
+#endif
+#endif
+
+#ifdef HAVE_DRM_UAPI
+static double mode_hz(const struct drm_mode_modeinfo *m)
+{
+    if (!m->clock || !m->htotal || !m->vtotal)
+        return m->vrefresh;
+    double hz = (double)m->clock * 1000.0 / ((double)m->htotal * (double)m->vtotal);
+    if (m->flags & DRM_MODE_FLAG_INTERLACE)
+        hz *= 2;
+    if (m->flags & DRM_MODE_FLAG_DBLSCAN)
+        hz /= 2;
+    if (m->vscan > 1)
+        hz /= m->vscan;
+    return hz;
+}
+
+/* the value of the property called name on an object, -1 = none */
+static long long drm_prop(int fd, unsigned obj, unsigned type, const char *name)
+{
+    struct drm_mode_obj_get_properties op;
+    uint32_t ids[64];
+    uint64_t vals[64];
+    memset(&op, 0, sizeof op);
+    op.obj_id = obj;
+    op.obj_type = type;
+    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &op) || !op.count_props)
+        return -1;
+    op.count_props = MIN(op.count_props, 64);
+    op.props_ptr = (uint64_t)(uintptr_t)ids;
+    op.prop_values_ptr = (uint64_t)(uintptr_t)vals;
+    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &op))
+        return -1;
+    for (unsigned i = 0; i < op.count_props && i < 64; i++) {
+        struct drm_mode_get_property gp;
+        memset(&gp, 0, sizeof gp);
+        gp.prop_id = ids[i];
+        if (!ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &gp) && !strcmp(gp.name, name))
+            return (long long)vals[i];
+    }
+    return -1;
+}
+
+/* A desktop draws on the screens, so its compositor is the cards' master:
+ * hsm's questions then never make it master for a moment (on a text console
+ * the first to open a card becomes its master, and closing it puts the
+ * console's mode back). This terminal's desktop, or an active graphical
+ * session in logind's records (for sudo, ssh and services). */
+static int desktop_running(void)
+{
+    const char *e;
+    if (((e = getenv("WAYLAND_DISPLAY")) && *e) || ((e = getenv("DISPLAY")) && *e))
+        return 1;
+    DIR *d = opendir("/run/systemd/sessions");
+    struct dirent *s;
+    int yes = 0;
+    while (d && !yes && (s = readdir(d)) != NULL) {
+        if (s->d_name[0] == '.' || strchr(s->d_name, '.'))
+            continue;
+        char p[PATHBUF], b[2048];
+        sfmt(p, sizeof p, "/run/systemd/sessions/%s", s->d_name);
+        if (read_file(p, b, sizeof b) <= 0)
+            continue;
+        int gfx = strstr(b, "\nTYPE=wayland") || strstr(b, "\nTYPE=x11") || strstr(b, "\nTYPE=mir");
+        yes = gfx && (strstr(b, "\nACTIVE=1") || strstr(b, "\nSTATE=active"));
+    }
+    if (d)
+        closedir(d);
+    return yes;
+}
+
+/* the connectors' modes through the card's DRM node (read-only questions
+ * any client may ask; hsm never sets anything) */
+static void drm_modes(gpu_t *g, const char *card)
+{
+    static const char *const TYPE[] = { "Unknown", "VGA", "DVI-I", "DVI-D", "DVI-A", "Composite", "SVIDEO", "LVDS",
+                                        "Component", "DIN", "DP", "HDMI-A", "HDMI-B", "TV", "eDP", "Virtual", "DSI",
+                                        "DPI", "Writeback", "SPI", "USB" };
+    char p[PATHBUF];
+    sfmt(p, sizeof p, "%s/dri/%s", g_devfs, card);
+    int fd = open(p, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    /* with nothing else drawing (a text console), the first to open the card
+     * becomes its master, and a master's questions make the screens be probed
+     * again: give that up at once (an error just means it wasn't master) */
+    ioctl(fd, DRM_IOCTL_DROP_MASTER, 0);
+    struct drm_mode_card_res res;
+    uint32_t conn[32];
+    memset(&res, 0, sizeof res);
+    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) || !res.count_connectors) {
+        close(fd);
+        return;
+    }
+    unsigned nc = MIN(res.count_connectors, 32);
+    memset(&res, 0, sizeof res);
+    res.count_connectors = nc;
+    res.connector_id_ptr = (uint64_t)(uintptr_t)conn;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res)) {
+        close(fd);
+        return;
+    }
+    static struct drm_mode_modeinfo modes[256];
+    for (unsigned i = 0; i < MIN(res.count_connectors, nc); i++) {
+        /* the modes asked for at once: asked for none, the kernel would probe
+         * the screen again (for the card's master, or anyone on older kernels) */
+        struct drm_mode_get_connector c;
+        memset(&c, 0, sizeof c);
+        c.connector_id = conn[i];
+        c.count_modes = 256;
+        c.modes_ptr = (uint64_t)(uintptr_t)modes;
+        if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &c) || c.connection != 1)
+            continue;
+        char name[32];
+        sfmt(name, sizeof name, "%s-%u", c.connector_type < sizeof TYPE / sizeof TYPE[0] ? TYPE[c.connector_type] : "?",
+             c.connector_type_id);
+        screen_t *s = NULL;
+        for (int k = 0; k < g->nscr; k++)
+            if (!strcmp(g->scr[k].conn, name))
+                s = &g->scr[k];
+        if (!s)
+            continue;
+        unsigned nm = c.count_modes <= 256 ? c.count_modes : 0, enc = c.encoder_id; /* more than fit: none copied */
+        /* what it runs at now: its encoder's CRTC */
+        unsigned crtc_id = 0;
+        if (enc) {
+            struct drm_mode_get_encoder e;
+            memset(&e, 0, sizeof e);
+            e.encoder_id = enc;
+            if (!ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &e))
+                crtc_id = e.crtc_id;
+        }
+        if (crtc_id) {
+            struct drm_mode_crtc cr;
+            memset(&cr, 0, sizeof cr);
+            cr.crtc_id = crtc_id;
+            if (!ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &cr) && cr.mode_valid) {
+                s->mode_w = cr.mode.hdisplay;
+                s->mode_h = cr.mode.vdisplay;
+                s->hz = mode_hz(&cr.mode);
+            }
+            long long v = drm_prop(fd, crtc_id, DRM_MODE_OBJECT_CRTC, "VRR_ENABLED");
+            s->vrr_on = v < 0 ? -1 : v != 0;
+        }
+        /* the most it offers at the size it runs at (or its preferred one) */
+        int w = s->mode_w, h = s->mode_h;
+        for (unsigned k = 0; !w && k < nm; k++)
+            if (modes[k].type & DRM_MODE_TYPE_PREFERRED) {
+                w = modes[k].hdisplay;
+                h = modes[k].vdisplay;
+            }
+        for (unsigned k = 0; k < nm; k++)
+            if (modes[k].hdisplay == w && modes[k].vdisplay == h && !(modes[k].flags & DRM_MODE_FLAG_INTERLACE))
+                s->max_hz = MAX(s->max_hz, mode_hz(&modes[k]));
+        long long v = drm_prop(fd, conn[i], DRM_MODE_OBJECT_CONNECTOR, "vrr_capable");
+        s->vrr_cap = v < 0 ? -1 : v != 0;
+    }
+    close(fd);
+}
+#endif
+
+/* test hook: HSM_DRM_FAKE=dir answers from dir/card0-DP-1 ("mode 2560x1440 60",
+ * "max 165", "vrr_capable 1", "vrr 0") */
+static void drm_fake(gpu_t *g, const char *dir, const char *card)
+{
+    for (int k = 0; k < g->nscr; k++) {
+        screen_t *s = &g->scr[k];
+        char p[PATHBUF], b[512];
+        sfmt(p, sizeof p, "%s/%s-%s", dir, card, s->conn);
+        if (read_file(p, b, sizeof b) <= 0)
+            continue;
+        char *cur = b, *l;
+        while ((l = next_line(&cur)) != NULL) {
+            int a, c, v;
+            double hz;
+            if (sscanf(l, "mode %dx%d %lf", &a, &c, &hz) == 3) {
+                s->mode_w = a;
+                s->mode_h = c;
+                s->hz = hz;
+            } else if (sscanf(l, "max %lf", &hz) == 1) {
+                s->max_hz = hz;
+            } else if (sscanf(l, "vrr_capable %d", &v) == 1) {
+                s->vrr_cap = v;
+            } else if (sscanf(l, "vrr %d", &v) == 1) {
+                s->vrr_on = v;
+            }
+        }
+    }
+}
+
+static double g_scr_want; /* when the Hardware view last showed the screens (monotonic) */
+
+void gpu_screens_wanted(void)
+{
+    g_scr_want = now_sec();
+}
+
 static void screens_read(gpu_t *g)
 {
+    screen_t old[MAX_SCREENS];
+    int nold = g->nscr;
+    memcpy(old, g->scr, sizeof old);
     g->nscr = 0;
     char base[PATHBUF], card[24];
     sfmt(base, sizeof base, "%s/class/drm", g_sysfs);
@@ -949,6 +1315,7 @@ static void screens_read(gpu_t *g)
             continue;
         screen_t *s = &g->scr[g->nscr++];
         memset(s, 0, sizeof *s);
+        s->vrr_cap = s->vrr_on = -1;
         str_copy(s->conn, sizeof s->conn, e->d_name + cl + 1);
         s->builtin = !strncmp(s->conn, "eDP", 3) || !strncmp(s->conn, "LVDS", 4) || !strncmp(s->conn, "DSI", 3);
         sfmt(p, sizeof p, "%s/%s/enabled", base, e->d_name);
@@ -963,6 +1330,54 @@ static void screens_read(gpu_t *g)
             edid_parse(ed, (size_t)n, s);
     }
     closedir(d);
+    /* the refresh rates, from the card's DRM node: every 60 s, every 5 s while
+     * the Hardware view shows them, at once when a screen comes or goes. Only
+     * from a card that lights a screen: one without could go to sleep, and
+     * opening it would keep it awake. */
+    double tn = now_sec();
+    int changed = g->nscr != nold, lit = 0;
+    for (int k = 0; k < g->nscr; k++) {
+        const screen_t *o = NULL;
+        for (int j = 0; j < nold; j++)
+            if (!strcmp(old[j].conn, g->scr[k].conn))
+                o = &old[j];
+        if (!o || o->on != g->scr[k].on || strcmp(o->monitor, g->scr[k].monitor))
+            changed = 1;
+        lit |= g->scr[k].on;
+    }
+    const char *fake = secure_getenv("HSM_DRM_FAKE");
+    if (changed || !g->drm_t || tn - g->drm_t >= (tn - g_scr_want < 3 ? 4.5 : 60)) {
+        g->drm_t = tn;
+        char rs[24] = "", f[PATHBUF];
+        sfmt(f, sizeof f, "%s/power/runtime_status", g->dev);
+        read_line(f, rs, sizeof rs);
+        if (fake && *fake)
+            drm_fake(g, fake, card);
+#ifdef HAVE_DRM_UAPI
+        else if (lit && strcmp(rs, "suspended") && (g->nv_state == NV_NONE || g->nv_state == NV_ON) && desktop_running())
+            drm_modes(g, card);
+#endif
+    } else { /* not asked this time: what was read last */
+        for (int k = 0; k < g->nscr; k++)
+            for (int j = 0; j < nold; j++)
+                if (!strcmp(old[j].conn, g->scr[k].conn)) {
+                    screen_t *s = &g->scr[k];
+                    s->mode_w = old[j].mode_w;
+                    s->mode_h = old[j].mode_h;
+                    s->hz = old[j].hz;
+                    s->max_hz = old[j].max_hz;
+                    s->vrr_cap = old[j].vrr_cap;
+                    s->vrr_on = old[j].vrr_on;
+                }
+    }
+    for (int k = 0; k < g->nscr; k++) { /* what the monitor itself can do at the size it runs at */
+        screen_t *s = &g->scr[k];
+        int w = s->mode_w ? s->mode_w : s->w, h = s->mode_w ? s->mode_h : s->h;
+        s->mon_hz = 0;
+        for (int j = 0; j < s->nown; j++)
+            if (s->own[j].w == w && s->own[j].h == h)
+                s->mon_hz = MAX(s->mon_hz, s->own[j].hz);
+    }
     for (int i = 1; i < g->nscr; i++) /* the built-in screen first, then by name */
         for (int k = i; k > 0; k--) {
             screen_t *a = &g->scr[k - 1], *c = &g->scr[k];
@@ -972,6 +1387,23 @@ static void screens_read(gpu_t *g)
             *a = *c;
             *c = t;
         }
+}
+
+int screen_slow(const screen_t *s, double *can)
+{
+    *can = 0;
+    /* the built-in panel may run slower on purpose (to save battery) */
+    if (s->builtin || !s->on || s->hz <= 0)
+        return SCR_FINE;
+    if (s->max_hz >= 70 && s->max_hz > s->hz * 1.15) { /* a faster mode is there: a setting never changed */
+        *can = s->max_hz;
+        return SCR_SETTING;
+    }
+    if (s->max_hz > 0 && s->mon_hz >= 70 && s->mon_hz > MAX(s->hz, s->max_hz) * 1.15) {
+        *can = s->mon_hz; /* the monitor can, the connection doesn't offer it */
+        return SCR_LINK;
+    }
+    return SCR_FINE;
 }
 
 /* a screen on a GPU that could sleep without it: "HDMI-A-1 (DELL U2720Q)", or "" */
@@ -1022,16 +1454,38 @@ void gpus_sample(gpus_t *gs, double dt)
         if (!g->scr_t || now - g->scr_t >= 5.0) { /* screens come and go now and then */
             g->scr_t = now;
             screens_read(g);
+            /* a graphics card's PCIe link (NVIDIA's comes from NVML, while it's awake);
+             * not while it's powered off: its registers don't answer then */
+            char rs[24] = "", f[PATHBUF];
+            sfmt(f, sizeof f, "%s/power/runtime_status", g->dev);
+            read_line(f, rs, sizeof rs);
+            pcilink_t l;
+            if (g->nv_state == NV_NONE && !g->integrated && strcmp(rs, "suspended") && pcie_link(g->dev, &l) == 0) {
+                g->lk_gen = l.gen;
+                g->lk_width = l.width;
+                g->pcie_gen_max = l.best_gen;
+                g->pcie_width_max = l.best_width;
+            } else if (g->nv_state == NV_NONE) {
+                g->lk_gen = g->lk_width = 0;
+            }
+        }
+        if (g->nv_state == NV_NONE && g->lk_gen) {
+            g->pcie_gen = g->lk_gen;
+            g->pcie_width = g->lk_width;
         }
         double took = now_sec() - t0;
         if (took > gs->slow_s) {
             gs->slow_s = took;
             str_copy(gs->slow, sizeof gs->slow, g->name);
         }
-        /* how much of its work it did held back, by heat or by a power limit */
-        if (g->reasons_ok && g->nvml) {
-            int busy = g->util >= 30, bits = busy ? slow_bits(g->reasons) : 0;
-            if (busy && dt > 0 && dt < 30) {
+        /* how much of its work it did held back, by heat or by a power limit; a
+         * GPU whose load isn't known (xe) counts as busy, but not towards the share */
+        if (g->reasons_ok && (g->nvml || g->nv_state == NV_NONE)) {
+            int busy = g->util < 0 || g->util >= 30;
+            int bits = !busy ? 0 : g->nvml ? slow_bits(g->reasons) : g->sys_bits;
+            if (g->nvml)
+                g->slow_hw = bits && (g->reasons & 0xC0ULL) != 0; /* hardware slowdown, power brake */
+            if (busy && g->util >= 0 && dt > 0 && dt < 30) {
                 g->busy_s += dt;
                 if (bits & GS_HEAT)
                     g->heat_s += dt;

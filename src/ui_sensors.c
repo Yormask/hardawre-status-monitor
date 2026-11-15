@@ -122,7 +122,7 @@ static void store(ui_state_t *u, const srule_t *r, const char *what)
         ui_message(u, 0, "%s", what);
 }
 
-static const char *const UNIT[] = { "°C", "RPM", "W", "V" };
+static const char *const UNIT[] = { "°C", "RPM", "W", "V", "" };
 
 /* your limits as you would type them: "95", "400", "1.10-1.40" */
 static void limit_input(const sensor_t *t, const srule_t *r, char *o, size_t n)
@@ -132,7 +132,7 @@ static void limit_input(const sensor_t *t, const srule_t *r, char *o, size_t n)
     if (type == SENS_FAN) {
         if (r->lo > 0)
             sfmt(o, n, "%g", r->lo);
-    } else if (type == SENS_VOLT) {
+    } else if (type == SENS_VOLT || type == SENS_OTHER) {
         if (r->lo > 0 || r->hi > 0) {
             char a[16] = "", b[16] = "";
             if (r->lo > 0)
@@ -150,7 +150,7 @@ static void limit_text(const sensor_t *t, const srule_t *r, char *o, size_t n, i
 {
     o[0] = '\0';
     *mine = r->lo > 0 || r->hi > 0;
-    const char *u = t ? (t->type == SENS_TEMP ? DEG : UNIT[t->type]) : "";
+    const char *u = t ? (t->type == SENS_TEMP ? DEG : t->file ? sensor_unit(t) : UNIT[t->type]) : "";
     if (!t) { /* away: its type isn't known, the numbers are */
         if (r->lo > 0 && r->hi > 0)
             sfmt(o, n, "%g - %g", r->lo, r->hi);
@@ -177,6 +177,12 @@ static void limit_text(const sensor_t *t, const srule_t *r, char *o, size_t n, i
         else if (t->lo > 0 || t->hi > 0)
             sfmt(o, n, "(chip: %.2f - %.2f V)", t->lo, t->hi);
         break;
+    case SENS_OTHER: /* your own value: either side */
+        if (r->lo > 0 && r->hi > 0)
+            sfmt(o, n, "%g - %g %s", r->lo, r->hi, u);
+        else if (r->lo > 0 || r->hi > 0)
+            sfmt(o, n, "%s %g %s", r->lo > 0 ? "at least" : "at most", r->lo > 0 ? r->lo : r->hi, u);
+        break;
     default:
         if (r->hi > 0)
             sfmt(o, n, "%.1f W", r->hi);
@@ -202,7 +208,7 @@ static int parse_limit(const char *in, int type, double *lo, double *hi)
     if (*p == '-')
         dash = p;
     char *end;
-    if (type == SENS_VOLT && dash) {
+    if ((type == SENS_VOLT || type == SENS_OTHER) && dash) {
         *dash = '\0';
         if (*p) {
             *lo = strtod(p, &end);
@@ -254,8 +260,9 @@ static void edit_start(ui_state_t *u, int what)
             "Slowest this fan should turn, in RPM: slower raises an alert",
             "Most this may draw, in W",
             "Range in V, like 1.10-1.40 (or 1.10- / -1.40 for one side)",
+            "Range, like 20-80 (or 20- for at least, -80 for at most)",
         };
-        str_copy(u->sens_prompt, sizeof u->sens_prompt, how[t->type]);
+        str_copy(u->sens_prompt, sizeof u->sens_prompt, how[t ? t->type : SENS_VOLT]);
     }
 }
 
@@ -507,6 +514,8 @@ void sensors_page(sys_t *s, ui_state_t *u)
         char v[24] = "";
         if (t && t->ok && t->type == SENS_TEMP)
             sfmt(v, sizeof v, "%.1f%s", t->value, DEG);
+        else if (t && t->ok && t->type == SENS_OTHER)
+            sfmt(v, sizeof v, "%g %s", t->value, sensor_unit(t));
         else if (t && t->ok)
             sfmt(v, sizeof v, t->type == SENS_VOLT ? "%.3f %s" : t->type == SENS_POWER ? "%.1f %s" : "%.0f %s",
                  t->value, UNIT[t->type]);

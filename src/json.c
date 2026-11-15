@@ -163,6 +163,17 @@ static void cpu(sys_t *s)
     s_("model", c->model);
     integer("cores", c->cores);
     integer("threads", c->threads);
+    open_("core_kinds", '['); /* P-cores and E-cores, ARM's big and LITTLE ones; [] = all alike */
+    for (int t = 0; t < c->nctype; t++) {
+        open_(NULL, '{');
+        char l[2] = { c->ctype[t].letter, 0 };
+        s_("kind", l);
+        s_("name", c->ctype[t].name);
+        integer("cores", c->ctype[t].cores);
+        integer("threads", c->ctype[t].threads);
+        close_('}');
+    }
+    close_(']');
     num("usage_pct", c->total, 1);
     num("user_pct", c->user, 1);
     num("system_pct", c->sys, 1);
@@ -202,6 +213,10 @@ static void cpu(sys_t *s)
         int id = c->id[i];
         open_(NULL, '{');
         integer("cpu", id);
+        if (id >= 0 && id < MAX_CPUS && c->core_type[id] >= 0) {
+            char l[2] = { c->ctype[(int)c->core_type[id]].letter, 0 };
+            s_("kind", l);
+        }
         num("usage_pct", c->pct[i], 1);
         num("clock_mhz", c->mhz[i] > 0 ? c->mhz[i] : NAN, 0);
         double t = id >= 0 && id < MAX_CPUS ? sensors_core_temp(&s->sens, c->pkg_id[id], c->core_id[id] >= 0 ? c->core_id[id] : id) : -1;
@@ -221,6 +236,33 @@ static void memory(sys_t *s)
     integer("available_bytes", (long long)m->avail);
     integer("cache_bytes", (long long)m->buffcache);
     num("used_pct", m->total ? 100.0 * (double)m->used / (double)m->total : NAN, 1);
+    const machine_t *mc = &s->mach;
+    if (mc->ram_state == 1) { /* the modules (root) */
+        open_("modules", '[');
+        for (int i = 0; i < mc->nram; i++) {
+            const ramdev_t *r = &mc->ram[i];
+            static const char *const form[] = { "", "DIMM", "SO-DIMM", "soldered" };
+            open_(NULL, '{');
+            sn("slot", r->slot);
+            sn("bank", r->bank);
+            integer("size_bytes", (long long)r->mb * 1048576LL);
+            sn("type", r->type);
+            sn("form", form[CLAMP(r->form, 0, 3)]);
+            pos("speed_mts", r->speed > 0 ? r->speed : -1, 0);
+            pos("configured_mts", r->conf > 0 ? r->conf : -1, 0);
+            sn("maker", r->maker);
+            sn("part", r->part);
+            close_('}');
+        }
+        close_(']');
+        integer("slots", mc->ram_slots);
+        if (mc->ram_channels)
+            integer("channels", mc->ram_channels);
+        else
+            null_("channels");
+    } else {
+        null_("modules");
+    }
     integer("swap_total_bytes", (long long)m->swap_total);
     integer("swap_used_bytes", (long long)m->swap_used);
     open_("swaps", '[');
@@ -292,11 +334,27 @@ static void gpus(sys_t *s)
             sn("monitor", sc->monitor);
             boolean("built_in", sc->builtin);
             boolean("in_use", sc->on);
-            if (sc->w > 0) {
+            if (sc->mode_w > 0) { /* the size it runs at, else its preferred size */
+                integer("width", sc->mode_w);
+                integer("height", sc->mode_h);
+            } else if (sc->w > 0) {
                 integer("width", sc->w);
                 integer("height", sc->h);
             }
             pos("inches", sc->inch > 0 ? sc->inch : -1, 1);
+            pos("refresh_hz", sc->hz > 0 ? sc->hz : -1, 1);
+            pos("max_refresh_hz", sc->max_hz > 0 ? sc->max_hz : -1, 1);
+            pos("monitor_max_refresh_hz", sc->mon_hz > 0 ? sc->mon_hz : -1, 1);
+            double can;
+            int why = screen_slow(sc, &can);
+            if (why)
+                s_("refresh_held_back_by", why == SCR_SETTING ? "setting" : "connection");
+            else
+                null_("refresh_held_back_by");
+            if (sc->vrr_cap >= 0)
+                boolean("vrr_capable", sc->vrr_cap);
+            if (sc->vrr_on >= 0)
+                boolean("vrr_on", sc->vrr_on);
             close_('}');
         }
         close_(']');
@@ -340,6 +398,31 @@ static void power(sys_t *s)
             integer("charge_limit_pct", b->lim_end);
         else
             null_("charge_limit_pct");
+        close_('}');
+    }
+    close_(']');
+    if (p->chg_offer_w > 0 || p->chg_w > 0) { /* a USB-C charger */
+        open_("charger", '{');
+        pos("offered_w", p->chg_offer_w, 1);
+        sn("voltages", p->chg_volts);
+        pos("agreed_w", p->chg_w, 1);
+        pos("agreed_v", p->chg_v, 2);
+        pos("agreed_a", p->chg_a, 2);
+        if (p->chg_w > 0 && p->nbat)
+            boolean("weak", charger_weak(p));
+        close_('}');
+    } else {
+        null_("charger");
+    }
+    open_("device_batteries", '['); /* wireless mice, keyboards, headsets, controllers */
+    for (int i = 0; i < p->ndev; i++) {
+        const devbat_t *b = &p->dev[i];
+        open_(NULL, '{');
+        s_("name", b->name);
+        pos("charge_pct", b->capacity, 0);
+        sn("level", b->level);
+        sn("status", b->status);
+        boolean("low", b->low);
         close_('}');
     }
     close_(']');
@@ -424,6 +507,23 @@ static void network(sys_t *s)
             pos("rx_mbps", w->rx_mbps, 1);
             pos("resent_pct", w->retry_pct, 1);
             integer("connected_s", w->connected_s);
+            if (w->crowd_ok) { /* the other networks the last scan found */
+                open_("neighbours", '{');
+                integer("same_channel", w->crowd_same);
+                integer("overlapping", w->crowd_near);
+                integer("strong", w->crowd_strong);
+                integer("on_band", w->crowd_band);
+                pos("scan_age_s", w->crowd_age, 0);
+                if (w->freq < 3000) {
+                    open_("channels_1_6_11", '[');
+                    for (int k = 0; k < 3; k++)
+                        integer(NULL, w->ch24[k]);
+                    close_(']');
+                }
+                close_('}');
+            } else {
+                null_("neighbours");
+            }
             close_('}');
         } else if (f->wireless) {
             null_("wifi");
@@ -441,7 +541,7 @@ static void network_check(sys_t *s)
         null_("network_check");
         return;
     }
-    static const char *const nm[NQ_COUNT] = { "router", "internet" };
+    static const char *const nm[NQ_COUNT] = { "router", "internet", "dns" };
     open_("network_check", '{');
     for (int k = 0; k < NQ_COUNT; k++) {
         const nqt_t *t = &q->t[k];
@@ -494,8 +594,7 @@ static void usb(sys_t *s)
 
 static void sensors(sys_t *s)
 {
-    static const char *const type[] = { "temp", "fan", "power", "voltage" };
-    static const char *const unit[] = { "C", "RPM", "W", "V" };
+    static const char *const type[] = { "temp", "fan", "power", "voltage", "other" };
     open_("sensors", '[');
     for (int i = 0; i < s->sens.n; i++) {
         sensor_t *t = &s->sens.s[i];
@@ -508,8 +607,14 @@ static void sensors(sys_t *s)
         if (t->name[0])
             s_("name", t->name);
         s_("type", type[t->type]);
-        num("value", t->ok ? t->value : NAN, t->type == SENS_VOLT ? 3 : 1);
-        s_("unit", unit[t->type]);
+        num("value", t->ok ? t->value : NAN, t->type == SENS_VOLT || t->type == SENS_OTHER ? 3 : 1);
+        s_("unit", sensor_unit(t));
+        if (t->file) { /* your own value, from a file */
+            s_("file", t->path);
+            boolean("stale", t->fstale);
+            if (t->ftotal)
+                boolean("machine_total", 1);
+        }
         if (t->type == SENS_TEMP && t->crit > 0)
             num("critical", t->crit, 1);
         if (t->ulo > 0)
@@ -583,6 +688,16 @@ static void health(sys_t *s)
         s_("type", "nvme");
         sn("model", v->model);
         s_("state", v->state == 1 ? "ok" : v->state == -1 ? "needs root" : v->state == 0 ? "not read yet" : "n/a");
+        if (v->link_ok) { /* its PCIe link */
+            open_("pcie", '{');
+            integer("gen", v->link.gen);
+            integer("width", v->link.width);
+            integer("gen_max", v->link.best_gen);
+            integer("width_max", v->link.best_width);
+            boolean("slower_than_it_could", v->link.below);
+            boolean("slot_limits_it", v->link.slot_less);
+            close_('}');
+        }
         if (v->state == 1) {
             integer("critical_warning", v->crit);
             integer("wear_used_pct", v->used);
@@ -605,9 +720,12 @@ static void health(sys_t *s)
         sata_t *d = &h->sata[i];
         open_(NULL, '{');
         s_("name", d->name);
-        s_("type", d->rotational ? "sata-hdd" : "sata-ssd");
+        s_("type", d->usb ? (d->rotational ? "usb-hdd" : "usb-ssd") : d->rotational ? "sata-hdd" : "sata-ssd");
         sn("model", d->model);
-        s_("state", d->state == 1 ? "ok" : d->state == -1 ? "needs root" : d->state == -3 ? "asleep" : d->state == 0 ? "not read yet" : "n/a");
+        s_("state", d->state == 1 ? "ok" : d->state == -1 ? "needs root" : d->state == -3 ? "asleep" : d->state == 0 ? "not read yet"
+                  : d->state == -4 ? "read when asked" : "n/a");
+        if (d->usb && d->read_at > 0)
+            integer("read_at", (long long)d->read_at);
         if (d->state == 1) {
             boolean("failing", d->failing);
             sn("failing_attribute", d->fail_attr);
@@ -714,6 +832,23 @@ static void processes(sys_t *s, int nproc)
             num("read_bps", p->io_ok ? p->rd_bps : NAN, 0);
             num("write_bps", p->io_ok ? p->wr_bps : NAN, 0);
             pos("gpu_pct", p->gpu, 1);
+            if (s->procs.net_ok && p->net_rx >= 0) { /* TCP only */
+                num("net_in_bps", p->net_rx, 0);
+                num("net_out_bps", p->net_tx, 0);
+            }
+            netport_t np[16];
+            int nnp = p->kthread ? 0 : netproc_ports(p->pid, np, 16);
+            if (nnp) {
+                open_("listens", '[');
+                for (int j = 0; j < nnp; j++) {
+                    open_(NULL, '{');
+                    s_("proto", np[j].udp ? "udp" : "tcp");
+                    integer("port", np[j].port);
+                    boolean("local_only", np[j].local);
+                    close_('}');
+                }
+                close_(']');
+            }
             if (p->nfds >= 0)
                 integer("open_files", p->nfds);
             else

@@ -560,6 +560,46 @@ static void nvme_find(health_t *h)
         }
 }
 
+/* Each NVMe drive's PCIe link, every minute: one slower than both it and its
+ * slot can do, twice in a row, is a warning (copies run slower). */
+static void nvme_links(health_t *h)
+{
+    for (int i = 0; i < h->nnvme; i++) {
+        nvme_t *v = &h->nvme[i];
+        char p[PATHBUF];
+        sfmt(p, sizeof p, "%s/class/nvme/%s/device", g_sysfs, v->name);
+        v->link_ok = pcie_link(p, &v->link) == 0;
+        v->link_low = v->link_ok && v->link.below ? v->link_low + 1 : 0;
+        if (v->link_low >= 2 && !v->link_told) {
+            v->link_told = 1;
+            health_event(h, EV_WARN, "disk",
+                         "%s runs at PCIe %d.0 x%d, though it and its slot can do %d.0 x%d: a riser, a contact or a BIOS "
+                         "setting; it reads and writes slower",
+                         v->name, v->link.gen, v->link.width, v->link.best_gen, v->link.best_width);
+        }
+    }
+}
+
+/* A graphics card under load on a slower link than it and its slot can do
+ * (idle ones slow the link down to save power: that's normal) */
+static void gpu_links(health_t *h, gpus_t *gs)
+{
+    for (int i = 0; i < gs->n; i++) {
+        gpu_t *g = &gs->g[i];
+        int low = g->util >= 50 && g->pcie_gen > 0 && g->pcie_gen_max > 0 &&
+                  (g->pcie_gen < g->pcie_gen_max || g->pcie_width < g->pcie_width_max);
+        g->pcie_slow_n = low ? g->pcie_slow_n + 1 : 0;
+        if (g->pcie_slow_n >= 10 && !g->pcie_told) {
+            g->pcie_told = 1;
+            char gn[16];
+            sfmt(gn, sizeof gn, gs->n > 1 ? "GPU%d" : "The GPU", i);
+            health_event(h, EV_WARN, "gpu", "%s runs at PCIe %d.0 x%d under load, though it and its slot can do %d.0 x%d: "
+                         "a riser cable, the slot or a BIOS setting", gn, g->pcie_gen, g->pcie_width, g->pcie_gen_max,
+                         g->pcie_width_max);
+        }
+    }
+}
+
 /* The drive counts its own heat slowdowns (thermal management): a long copy
  * or a game install on a hot laptop shows up here. One event when it starts,
  * one if it gets to the hard kind, one when it's over. */
@@ -1132,11 +1172,11 @@ static void freeze_events(health_t *h, const procs_t *ps, double now, double mon
 
 static void limit_events(health_t *h, sensors_t *S, double now, double mono)
 {
-    static const char *const unit[] = { "°C", "RPM", "W", "V" };
     for (int i = 0; i < S->n; i++) {
         sensor_t *t = &S->s[i];
         if ((t->ulo <= 0 && t->uhi <= 0) || !t->ok || t->hidden)
             continue;
+        const char *un = t->type == SENS_TEMP ? "°C" : sensor_unit(t);
         int low = t->ulo > 0 && t->value < t->ulo && t->type != SENS_TEMP && t->type != SENS_POWER;
         int high = t->uhi > 0 && t->value >= t->uhi && t->type != SENS_FAN;
         if (!low && !high) {
@@ -1157,15 +1197,15 @@ static void limit_events(health_t *h, sensors_t *S, double now, double mono)
         t->lim_flagged = 1;
         char chip[24], v[24], l[24];
         sensors_chip_name(t->chip, chip, sizeof chip);
-        int dec = t->type == SENS_VOLT ? 3 : 0;
-        sfmt(v, sizeof v, "%.*f %s", dec, t->value, unit[t->type]);
-        sfmt(l, sizeof l, "%.*f %s", t->type == SENS_VOLT ? 2 : 0, low ? t->ulo : t->uhi, unit[t->type]);
+        int dec = t->type == SENS_VOLT ? 3 : t->type == SENS_OTHER && fabs(t->value) < 100 ? 1 : 0;
+        sfmt(v, sizeof v, "%.*f%s%s", dec, t->value, un[0] && un[0] != '%' ? " " : "", un);
+        sfmt(l, sizeof l, "%.*g%s%s", 6, low ? t->ulo : t->uhi, un[0] && un[0] != '%' ? " " : "", un);
         char nm[80];
-        if (t->name[0])
-            str_copy(nm, sizeof nm, t->name);
+        if (t->name[0] || t->file)
+            str_copy(nm, sizeof nm, sensor_label(t));
         else
             sfmt(nm, sizeof nm, "%s %s", chip, t->label);
-        static const char *const cat[] = { "thermal", "fan", "power", "voltage" };
+        static const char *const cat[] = { "thermal", "fan", "power", "voltage", "value" };
         if (t->type == SENS_FAN)
             health_event(h, EV_WARN, cat[t->type], "%s turns at %s, below your minimum of %s: slowing down, dusty?", nm,
                          v, l);
@@ -1184,7 +1224,7 @@ static void fan_events(health_t *h, sensors_t *S, double now, double mono)
     double cpu = sensors_cpu_temp(S);
     for (int i = 0; i < S->n; i++) {
         sensor_t *f = &S->s[i];
-        if (f->type != SENS_FAN || !f->ok || f->hidden)
+        if (f->type != SENS_FAN || !f->ok || f->hidden || f->file)
             continue;
         if (f->value >= 50) { /* turning */
             f->fan_seen = 1;
@@ -1345,7 +1385,7 @@ static void temp_events(health_t *h, sensors_t *S, const procs_t *ps, double now
 {
     for (int i = 0; i < S->n; i++) {
         sensor_t *t = &S->s[i];
-        if (t->type != SENS_TEMP || !t->ok || t->hidden || !sensor_plausible(t))
+        if (t->type != SENS_TEMP || !t->ok || t->hidden || t->file || !sensor_plausible(t))
             continue;
         double lim = t->crit > 0 ? t->crit : (i == S->cpu_idx ? 100.0 : -1);
         if (lim <= 0 || t->value < lim - 2)
@@ -1371,9 +1411,86 @@ static void temp_events(health_t *h, sensors_t *S, const procs_t *ps, double now
     }
 }
 
-/* NVIDIA GPUs say why they run below full speed: an event when one has been
- * held back for a while (heat or its power limit is normal for a laptop
- * GPU under load: information; a hardware slowdown is a warning) */
+/* NVIDIA, AMD and newer Intel GPUs say why they run below full speed: an
+ * event when one has been held back for a while (heat or its power limit is
+ * normal for a laptop GPU under load: information; the hardware stepping in
+ * is a warning) */
+/* the battery running down although the charger is plugged in: the charger
+ * gives less than the laptop uses (a phone charger, a weak cable) */
+static void drain_events(health_t *h, power_t *p, double mono)
+{
+    double w = 0;
+    int dis = 0;
+    for (int i = 0; i < p->nbat; i++) {
+        const battery_t *b = &p->bat[i];
+        /* above its charge limit a battery may run down to it on purpose */
+        if (b->lim_end > 0 && b->capacity > b->lim_end + 1)
+            continue;
+        if (!strcmp(b->status, "Discharging") && b->watts > 0) {
+            dis = 1;
+            w += b->watts;
+        }
+    }
+    p->draining = 0;
+    if (p->ac_online != 1 && p->chg_w <= 0) {
+        p->drain_told = 0; /* unplugged: the next plug-in may be told again */
+        p->drain_since = 0;
+        return;
+    }
+    if (!dis || w < 3) {
+        p->drain_since = 0;
+        return;
+    }
+    if (!p->drain_since)
+        p->drain_since = mono;
+    if (mono - p->drain_since < 30)
+        return;
+    p->draining = 1;
+    p->drain_w = w;
+    if (p->drain_told)
+        return;
+    p->drain_told = 1;
+    char chg[64] = "";
+    if (p->chg_w > 0)
+        sfmt(chg, sizeof chg, " (the charger gives %.0f W)", p->chg_w);
+    health_event(h, EV_WARN, "power", "The battery drains while plugged in, by %.1f W%s: the charger gives less than the "
+                 "machine uses; a stronger charger or a better cable keeps it charging", w, chg);
+}
+
+/* an outside screen running well below the refresh rate it can do (a 144 Hz
+ * monitor at 60 Hz): once per screen and rate */
+static void refresh_events(health_t *h, gpus_t *gs)
+{
+    for (int i = 0; i < gs->n; i++) {
+        gpu_t *g = &gs->g[i];
+        for (int k = 0; k < g->nscr; k++) {
+            const screen_t *sc = &g->scr[k];
+            double can;
+            int why = screen_slow(sc, &can);
+            if (!why)
+                continue;
+            char key[40];
+            sfmt(key, sizeof key, "%s@%.0f,", sc->conn, sc->hz);
+            if (strstr(g->hz_told, key))
+                continue;
+            if (strlen(g->hz_told) + strlen(key) < sizeof g->hz_told)
+                strcat(g->hz_told, key);
+            char who[64];
+            if (sc->monitor[0])
+                sfmt(who, sizeof who, "%s (%s)", sc->monitor, sc->conn);
+            else
+                sfmt(who, sizeof who, "The screen on %s", sc->conn);
+            if (why == SCR_SETTING)
+                health_event(h, EV_WARN, "screen", "%s runs at %.0f Hz, though it can do %.0f Hz: choose it in the display "
+                             "settings", who, sc->hz, can);
+            else
+                health_event(h, EV_WARN, "screen", "%s runs at %.0f Hz; the monitor can do %.0f Hz, but this connection "
+                             "allows %.0f Hz: the cable, the port or an adapter holds it back (HDMI 1.4, a DisplayPort "
+                             "to HDMI adapter, a dock)", who, sc->hz, can, sc->max_hz);
+        }
+    }
+}
+
 static void gpu_events(health_t *h, gpus_t *gs, const procs_t *ps, double now, double mono)
 {
     for (int i = 0; i < gs->n; i++) {
@@ -1396,8 +1513,7 @@ static void gpu_events(health_t *h, gpus_t *gs, const procs_t *ps, double now, d
             else
                 app_s(why, sizeof why, "its power limit");
         }
-        int hw = (g->reasons & 0xC0ULL) != 0; /* the hardware stepped in: thermal or power brake */
-        health_event(h, hw ? EV_WARN : EV_INFO, "gpu", "%s is slowing itself down: %s%s", gn, why, who);
+        health_event(h, g->slow_hw ? EV_WARN : EV_INFO, "gpu", "%s is slowing itself down: %s%s", gn, why, who);
     }
 }
 
@@ -1411,7 +1527,7 @@ static void netq_events(health_t *h, const net_t *nt, double now)
     if (!q->on)
         return;
     int wifi = 0;
-    char air[80] = ""; /* the Wi-Fi as it is: a weak signal or a crowded band explains most lag */
+    char air[140] = ""; /* the Wi-Fi as it is: a weak signal or a crowded band explains most lag */
     for (int i = 0; i < nt->n; i++)
         if (!strcmp(nt->i[i].name, q->iface)) {
             const netif_t *f = &nt->i[i];
@@ -1422,6 +1538,10 @@ static void netq_events(health_t *h, const net_t *nt, double now)
                     sfmt(sp, sizeof sp, ", %.0f Mb/s", f->wifi.tx_mbps);
                 sfmt(air, sizeof air, "; Wi-Fi signal %.0f dBm, %s channel %d%s", f->signal_dbm, wifi_band(f->wifi.freq),
                      f->wifi.channel, sp);
+                const wifi_t *w = &f->wifi;
+                if (w->crowd_ok && w->crowd_same + w->crowd_near >= 3)
+                    sfmt(air + strlen(air), sizeof air - strlen(air), ", sharing it with %d other networks",
+                         w->crowd_same + w->crowd_near);
             } else if (wifi && f->quality >= 0)
                 sfmt(air, sizeof air, "; Wi-Fi signal %.0f dBm", f->signal_dbm);
         }
@@ -1437,10 +1557,24 @@ static void netq_events(health_t *h, const net_t *nt, double now)
         if (t->trouble && t->episode != h->nq_seen[k]) { /* a new one */
             h->nq_seen[k] = t->episode;
             /* the router too: that's the local link's trouble, told by its own event */
-            if (k == NQ_NET && q->t[NQ_ROUTER].trouble)
+            if ((k == NQ_NET || k == NQ_DNS) && q->t[NQ_ROUTER].trouble)
                 continue;
             h->nq_open[k] = 1;
             char what[96];
+            if (k == NQ_DNS) { /* pings fine, names not: pages that won't load */
+                int net_ok = !q->t[NQ_NET].trouble;
+                if (t->trouble == NQ_LOSS)
+                    health_event(h, EV_WARN, "net", "DNS trouble: the DNS server (%s) doesn't answer %.0f%% of the time%s",
+                                 t->addr, t->worst_loss,
+                                 net_ok ? ", while pings go through: pages won't load though the internet works" : "");
+                else if (t->normal_ms > 0)
+                    health_event(h, EV_WARN, "net", "DNS trouble: the DNS server (%s) answers in %.0f ms, normally %.0f ms: "
+                                 "pages are slow to start loading", t->addr, t->worst_ms, t->normal_ms);
+                else
+                    health_event(h, EV_WARN, "net", "DNS trouble: the DNS server (%s) answers in %.0f ms: pages are slow to "
+                                 "start loading", t->addr, t->worst_ms);
+                continue;
+            }
             if (t->trouble == NQ_LOSS)
                 sfmt(what, sizeof what, "%.0f%% of the pings to %s are lost", t->worst_loss,
                      k == NQ_ROUTER ? "the router" : t->addr);
@@ -1459,7 +1593,7 @@ static void netq_events(health_t *h, const net_t *nt, double now)
             char d[24] = "";
             if (t->until > t->since && t->since > 0)
                 fmt_duration(t->until - t->since, d, sizeof d);
-            health_event(h, EV_INFO, "net", "%s back to normal%s%s", k == NQ_ROUTER ? link : "Internet",
+            health_event(h, EV_INFO, "net", "%s back to normal%s%s", k == NQ_ROUTER ? link : k == NQ_DNS ? "DNS" : "Internet",
                          d[0] ? " after " : "", d);
         }
     }
@@ -1607,6 +1741,8 @@ void health_sample(sys_t *s)
     }
     fs_events(h, &s->disks, now);
     gpu_events(h, &s->gpus, &s->procs, now, mono);
+    refresh_events(h, &s->gpus);
+    drain_events(h, &s->power, mono);
     power_limit_sample(h, s, dt, now, mono);
     leak_sample(s);
     runaway_sample(s);
@@ -1627,11 +1763,22 @@ void health_sample(sys_t *s)
             health_event(h, EV_INFO, "cpu", "CPU governor changed from %s to %s", h->governor, s->cpu.governor);
         str_copy(h->governor, sizeof h->governor, s->cpu.governor);
     }
+    static double link_t;
+    if (h->nnvme && (!link_t || mono - link_t >= NVME_EVERY)) {
+        link_t = mono;
+        nvme_links(h);
+    }
+    gpu_links(h, &s->gpus);
     if (h->nnvme && mono >= h->next_nvme) {
         h->next_nvme = mono + NVME_EVERY;
         t0 = now_sec();
         nvme_sample(h, &s->procs);
         slow_part(h, t0, "the NVMe drives' health");
+    }
+    static double usb_scan_t;
+    if (mono - usb_scan_t >= 5) { /* USB drives plugged in or out */
+        usb_scan_t = mono;
+        ata_usb_scan(h);
     }
     if (h->nsata && mono >= h->next_sata) {
         h->next_sata = mono + NVME_EVERY;

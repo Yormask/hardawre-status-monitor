@@ -117,6 +117,14 @@ static void footer(ui_state_t *u)
             u->sens_edit == 1 ? "   (empty: the chip's name)" : "   (empty: none)");
         return;
     }
+    if (u->view == VIEW_HW && u->hws_edit) { /* looking for something in the Hardware view */
+        x += put(y, x, COLS, CP(C_KEY), " Find ");
+        x += put(y, x, COLS - x, A_BOLD, " %s", u->hws_q);
+        x += put(y, x, 1, A_REVERSE, " ");
+        put(y, x, COLS - x, A_GRAY, "   %s   Enter: keep   Esc: clear",
+            !u->hws_q[0] ? "" : u->hws_n ? "" : "(not found)");
+        return;
+    }
     if (u->filter_edit) { /* what is typed goes to the filter of the view */
         const char *f = u->view == VIEW_SVC ? u->svc_filter : u->view == VIEW_EVENTS ? u->ev_filter : u->filter;
         x += put(y, x, COLS, CP(C_KEY), " Filter ");
@@ -144,8 +152,9 @@ static void footer(ui_state_t *u)
     static const hint_t keys[] = {
         { "q", "Quit", 'q' },     { "?", "Help", '?' },      { "s", "Setup", 's' },        { "l", "Log", 'l' },
         { "Enter", "Details", '\n' },
-        { "x", "Kill", 'x' },     { "N", "Nice", 'N' },      { "T", "Tree", 'T' },         { "L", "Log proc", 'L' },
-        { "1-8", "View", 0 },     { "c/m/d/g/o/p/n/t", "Sort", 0 }, { "/", "Filter", '/' }, { "b", "CPU bars", 'b' },
+        { "x", "Kill", 'x' },     { "N", "Nice", 'N' },      { "a", "CPUs", 'a' },         { "i", "Disk prio", 'i' },
+        { "T", "Tree", 'T' },     { "L", "Log proc", 'L' },
+        { "1-8", "View", 0 },     { "c/m/d/g/o/w/p/n/t", "Sort", 0 }, { "/", "Filter", '/' }, { "b", "CPU bars", 'b' },
         { "k", "Kthreads", 'k' }, { "f", "Follow", 'f' },    { "+/-", "Interval", 0 },     { "Spc", "Pause", ' ' },
     };
     static const hint_t lkeys[] = {
@@ -174,18 +183,22 @@ static void footer(ui_state_t *u)
     };
     static const hint_t hwkeys[] = {
         { "Up/Dn", "Scroll", 0 }, { "D", "Drive tests", 'D' }, { "C", "Cooling check", 'C' },
-        { "1-8", "View", 0 },     { "?", "Help", '?' },        { "q", "Quit", 'q' },
+        { "U", "Drives in use", 'U' }, { "/", "Find", '/' }, { "1-8", "View", 0 }, { "?", "Help", '?' },
+        { "q", "Quit", 'q' },
+    };
+    static const hint_t busykeys[] = {
+        { "Up/Dn", "Scroll", 0 }, { "r", "Look again", 'r' }, { "Esc", "Back", 27 }, { "q", "Quit", 'q' },
     };
     static const hint_t drvkeys[] = {
         { "Up/Dn", "Drive", 0 }, { "s", "Short test", 's' }, { "e", "Extended test", 'e' }, { "a", "Stop test", 'a' },
-        { "r", "Read again", 'r' }, { "Esc", "Back", 27 },   { "q", "Quit", 'q' },
+        { "r", "Read (USB too)", 'r' }, { "Esc", "Back", 27 },   { "q", "Quit", 'q' },
     };
     static const hint_t coolkeys[] = {
         { "Enter", "Start", '\n' }, { "Esc", "Stop / back", 27 }, { "q", "Quit", 'q' },
     };
     static const hint_t pdkeys[] = {
         { "Esc", "Back", 27 }, { "Up/Dn", "Scroll", 0 }, { "x", "Kill", 'x' }, { "N", "Nice", 'N' },
-        { "L", "Log it", 'L' }, { "q", "Quit", 'q' },
+        { "a", "CPUs", 'a' },   { "i", "Disk prio", 'i' }, { "L", "Log it", 'L' }, { "q", "Quit", 'q' },
     };
     static const hint_t senskeys[] = {
         { "Up/Dn", "Select", 0 }, { "Enter", "Rename", '\n' }, { "l", "Limit", 'l' }, { "h", "Hide", 'h' },
@@ -204,6 +217,8 @@ static void footer(ui_state_t *u)
         PICK(drvkeys);
     else if (u->view == VIEW_HW && u->cool_open)
         PICK(coolkeys);
+    else if (u->view == VIEW_HW && u->busy_open)
+        PICK(busykeys);
     else if (u->view == VIEW_HW)
         PICK(hwkeys);
     else if (u->view == VIEW_SETUP && u->sens_open)
@@ -245,15 +260,18 @@ static void help_overlay(void)
         { "L", "start / stop logging the selected process" },
         { "x, F9", "send a signal to (kill) the selected process" },
         { "N, F7 F8", "priority (nice) of the selected process" },
+        { "a", "which CPUs the selected process may use" },
+        { "i", "its disk priority (ionice)" },
         { "T, F5", "process tree: which process started which" },
         { "c m d p n t", "sort: CPU mem I/O PID name time (twice: reverse)" },
-        { "g o", "sort by GPU use / by open files" },
+        { "g o w", "sort by GPU use / by open files / by network use" },
         { "Enter (6)", "Services: show the processes of the selected one" },
         { "/", "filter by name, command, user or PID (Esc clears)" },
         { "f k", "follow the process, not the row / kernel threads" },
         { "b", "CPU core bars: usage, temperature or clock speed" },
         { "v (5)", "saved logs: a summary, graphs, events; s saves it" },
-        { "D C (3)", "Hardware view: drive self-tests, cooling check" },
+        { "D C U (3)", "self-tests, cooling check, what keeps a drive busy" },
+        { "/ n N (3)", "find in the Hardware view; next / previous match" },
         { "+ -", "slower / faster refresh" },
         { "Space", "pause / resume sampling" },
         { "Mouse", "click tabs, rows and headings; the wheel scrolls" },
@@ -407,7 +425,7 @@ static void nice_apply(ui_state_t *u, pid_t pid, unsigned long long start, int o
         ui_message(u, 1, "Could not change the priority of PID %d: %s", (int)pid, strerror(rc));
 }
 
-static proc_t *nice_target(sys_t *s, ui_state_t *u)
+proc_t *ui_proc_target(sys_t *s, ui_state_t *u)
 {
     if (!proc_view(u)) {
         ui_message(u, 1, "Open the process list first (press 2)");
@@ -417,13 +435,13 @@ static proc_t *nice_target(sys_t *s, ui_state_t *u)
     if (!p)
         ui_message(u, 1, "No process selected");
     else if (p->kthread)
-        ui_message(u, 1, "[%s] is a kernel thread: its priority is the kernel's business", p->comm);
+        ui_message(u, 1, "[%s] is a kernel thread: the kernel decides about it", p->comm);
     return p && !p->kthread ? p : NULL;
 }
 
 static void nice_open(sys_t *s, ui_state_t *u)
 {
-    proc_t *p = nice_target(s, u);
+    proc_t *p = ui_proc_target(s, u);
     if (!p)
         return;
     u->nice_open = 1;
@@ -436,7 +454,7 @@ static void nice_open(sys_t *s, ui_state_t *u)
 /* F7 / F8: one step at a time, no dialog (like htop) */
 static void nice_step(sys_t *s, ui_state_t *u, int dir)
 {
-    proc_t *p = nice_target(s, u);
+    proc_t *p = ui_proc_target(s, u);
     if (!p)
         return;
     int v = CLAMP(p->nice + dir, -20, 19);
@@ -549,7 +567,7 @@ static int mouse_event(sys_t *s, ui_state_t *u)
         dir = 1;
 #endif
     if (dir) { /* the wheel scrolls (or zooms the graph in the log viewer) */
-        if (u->help || u->notice_open || u->nice_open)
+        if (u->help || u->notice_open || u->nice_open || u->aff_open || u->iop_open)
             return 1;
         if (u->kill_open)
             return ui_key(s, u, dir < 0 ? KEY_UP : KEY_DOWN);
@@ -575,7 +593,7 @@ static int mouse_event(sys_t *s, ui_state_t *u)
     }
     if (!h)
         return 1;
-    if ((u->kill_open || u->nice_open || u->notice_open) && h->kind == HIT_SCROLL)
+    if ((u->kill_open || u->nice_open || u->notice_open || u->aff_open || u->iop_open) && h->kind == HIT_SCROLL)
         return 1;
     switch (h->kind) {
     case HIT_KEY: return ui_key(s, u, h->a);
@@ -618,6 +636,8 @@ static int mouse_event(sys_t *s, ui_state_t *u)
     case HIT_NICE:
         u->nice_val = CLAMP(h->b ? u->nice_val + h->b : h->a, -20, 19);
         break;
+    case HIT_AFF: aff_click(s, u, h->a, dbl); break;
+    case HIT_IOP: iop_click(u, h->a, h->b, dbl); break;
     }
     return 1;
 }
@@ -685,6 +705,8 @@ void ui_draw(sys_t *s, ui_state_t *u)
             drives_view(s, u);
         else if (u->cool_open)
             cool_view(s, u);
+        else if (u->busy_open)
+            busy_view(s, u);
         else
             hardware(s, u);
         break;
@@ -698,6 +720,10 @@ void ui_draw(sys_t *s, ui_state_t *u)
         kill_dialog(u);
     if (u->nice_open)
         nice_dialog(u);
+    if (u->aff_open)
+        aff_dialog(s, u);
+    if (u->iop_open)
+        iop_dialog(s, u);
     if (u->notice_open && g_notice.n)
         notice_dialog();
     if (u->help)
@@ -733,6 +759,14 @@ int ui_key(sys_t *s, ui_state_t *u, int ch)
         nice_key(u, ch);
         return 1;
     }
+    if (u->aff_open) {
+        aff_key(s, u, ch);
+        return 1;
+    }
+    if (u->iop_open) {
+        iop_key(u, ch);
+        return 1;
+    }
     if (u->filter_edit) { /* typing a filter: processes, or services in view 6 */
         char *f = u->view == VIEW_SVC ? u->svc_filter : u->view == VIEW_EVENTS ? u->ev_filter : u->filter;
         size_t cap = u->view == VIEW_SVC      ? sizeof u->svc_filter
@@ -766,17 +800,55 @@ int ui_key(sys_t *s, ui_state_t *u, int ch)
     }
     if (u->pd_open && u->view == u->pd_view && pdetail_key(u, ch))
         return 1;
+    if (u->view == VIEW_HW && u->hws_edit) { /* typing what to look for */
+        size_t len = strlen(u->hws_q);
+        if (ch == 27) {
+            u->hws_q[0] = '\0';
+            u->hws_edit = 0;
+        } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            u->hws_edit = 0;
+        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (len)
+                u->hws_q[len - 1] = '\0';
+            u->hws_jump = 1;
+        } else if (ch >= 32 && ch < 127 && len + 1 < sizeof u->hws_q) {
+            u->hws_q[len] = (char)ch;
+            u->hws_q[len + 1] = '\0';
+            u->hws_jump = 1;
+        }
+        return 1;
+    }
     if (u->view == VIEW_HW) {
         if (u->drv_open && drives_key(u, ch))
             return 1;
         if (u->cool_open && cool_key(s, u, ch))
             return 1;
-        if (!u->drv_open && !u->cool_open && ch == 'D') {
+        if (u->busy_open && busy_key(s, u, ch))
+            return 1;
+        int page = u->drv_open || u->cool_open || u->busy_open;
+        if (!page && ch == 'D') {
             drives_open(s, u);
             return 1;
         }
-        if (!u->drv_open && !u->cool_open && ch == 'C') {
+        if (!page && ch == 'C') {
             u->cool_open = 1;
+            return 1;
+        }
+        if (!page && ch == 'U') {
+            busy_open(s, u);
+            return 1;
+        }
+        if (!page && ch == '/') { /* look for something in it */
+            u->hws_edit = 1;
+            u->hws_q[0] = '\0';
+            return 1;
+        }
+        if (!page && (ch == 'n' || ch == 'N') && u->hws_q[0]) {
+            hardware_search_step(u, ch == 'n' ? 1 : -1);
+            return 1;
+        }
+        if (!page && ch == 27 && u->hws_q[0]) {
+            u->hws_q[0] = '\0';
             return 1;
         }
     }
@@ -824,6 +896,8 @@ int ui_key(sys_t *s, ui_state_t *u, int ch)
     case 'x':
     case KEY_F(9): kill_open(u); break;
     case 'N': nice_open(s, u); break;
+    case 'a': aff_open(s, u); break;
+    case 'i': iop_open(s, u); break;
     case KEY_F(7): nice_step(s, u, -1); break;
     case KEY_F(8): nice_step(s, u, 1); break;
     case 'T':
@@ -853,6 +927,7 @@ int ui_key(sys_t *s, ui_state_t *u, int ch)
     case 't': set_sort(u, SORT_TIME); break;
     case 'g': set_sort(u, SORT_GPU); break;
     case 'o': set_sort(u, SORT_FILES); break;
+    case 'w': set_sort(u, SORT_NET); break;
     case 'r': u->reverse ^= 1; break;
     case 'k': u->show_kthreads ^= 1; break;
     case 'f': u->follow ^= 1; break;

@@ -22,11 +22,19 @@
 #define _GNU_SOURCE
 #include "collect.h"
 
+#include <ctype.h>
 #include <dirent.h>
+#include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+static int file_value(sensor_t *t);
 
 typedef struct {
     int type, num, pref;
@@ -149,7 +157,7 @@ static int scan_chip(sensors_t *S, const char *dir, const char *chip, int chip_i
 
 static int cpu_score(const sensor_t *s)
 {
-    if (s->type != SENS_TEMP)
+    if (s->type != SENS_TEMP || s->file)
         return 0;
     const char *c = s->chip, *l = s->label;
     if (!strncmp(c, "coretemp", 8))
@@ -245,7 +253,7 @@ static void still_update(sensors_t *S, double now)
             moved = MAX(moved, S->s[i].vmax - S->s[i].vmin);
     for (int i = 0; i < S->n; i++) {
         sensor_t *t = &S->s[i];
-        if (!t->ok || !t->t_first) {
+        if (!t->ok || !t->t_first || t->file) { /* your own values may well stay put */
             t->still = 0;
             continue;
         }
@@ -271,6 +279,10 @@ void sensors_sample(sensors_t *S)
             chip_s = 0;
         if (s->hidden) { /* not even read: hiding one that is slow to answer helps */
             s->ok = 0;
+            continue;
+        }
+        if (s->file) {
+            s->ok = file_value(s);
             continue;
         }
         s->ok = read_ll(s->path, &v) == 0;
@@ -300,6 +312,136 @@ void sensors_sample(sensors_t *S)
         }
     }
     still_update(S, t);
+}
+
+/* ---------------------------------------------------- your own values */
+
+/* "W", "kW", "°F"...: the kind of sensor, and how the number becomes the
+ * unit hsm keeps that kind in (°C, RPM, W, V) */
+static int unit_kind(const char *u, double *mul, double *add, char *shown, size_t n)
+{
+    *mul = 1;
+    *add = 0;
+    const char *v = u;
+    if (!strncmp(v, "°", strlen("°")))
+        v += strlen("°");
+    str_copy(shown, n, u);
+    if (!strcasecmp(v, "C") || !strcasecmp(v, "degC") || !strcasecmp(v, "celsius")) {
+        str_copy(shown, n, "C");
+        return SENS_TEMP;
+    }
+    if (!strcasecmp(v, "F") || !strcasecmp(v, "degF")) { /* kept in °C, like every temperature */
+        *mul = 5.0 / 9.0;
+        *add = -32.0 * 5.0 / 9.0;
+        str_copy(shown, n, "C");
+        return SENS_TEMP;
+    }
+    if (!strcasecmp(v, "RPM"))
+        return SENS_FAN;
+    if (!strcmp(v, "W") || !strcmp(v, "kW") || !strcmp(v, "mW")) {
+        *mul = v[0] == 'k' ? 1000 : v[0] == 'm' ? 0.001 : 1;
+        str_copy(shown, n, "W");
+        return SENS_POWER;
+    }
+    if (!strcmp(v, "V") || !strcmp(v, "mV")) {
+        *mul = v[0] == 'm' ? 0.001 : 1;
+        str_copy(shown, n, "V");
+        return SENS_VOLT;
+    }
+    return SENS_OTHER;
+}
+
+void sensors_files(sensors_t *S, const fsdef_t *d, int n)
+{
+    int k = S->n;
+    while (k > 0 && S->s[k - 1].file) /* again (the config was read again): replace them */
+        k--;
+    S->n = k;
+    for (int i = 0; i < n && S->n < MAX_SENSORS; i++) {
+        sensor_t *t = &S->s[S->n];
+        memset(t, 0, sizeof *t);
+        double mul, add;
+        t->type = unit_kind(d[i].unit, &mul, &add, t->unit, sizeof t->unit);
+        t->file = 1;
+        t->chip_idx = 1000 + i;
+        t->crit = -1;
+        str_copy(t->chip, sizeof t->chip, "file");
+        str_copy(t->label, sizeof t->label, d[i].name[0] ? d[i].name : "value");
+        str_copy(t->path, sizeof t->path, d[i].path);
+        str_copy(t->fkey, sizeof t->fkey, d[i].key);
+        double sc = d[i].scale ? d[i].scale : 1;
+        t->fscale = sc * mul;
+        t->fadd = add;
+        t->ftotal = d[i].total && t->type == SENS_POWER;
+        sfmt(t->id, sizeof t->id, "file/%s", t->label);
+        S->n++;
+    }
+}
+
+/* The number in a file: the first one, or the first one after the key
+ * (`"apower": 23.4`, `charge=87`). Only regular files are read (a FIFO or a
+ * device could block); 4 KB at most. 1 = got one. */
+static int file_value(sensor_t *t)
+{
+    int fd = open(t->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    struct stat st;
+    char b[4096];
+    ssize_t n = -1;
+    if (!fstat(fd, &st) && S_ISREG(st.st_mode))
+        n = read(fd, b, sizeof b - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    b[n] = '\0';
+    double mt = (double)st.st_mtime;
+    /* sysfs and procfs files keep the time they were made: only real files can be old */
+    t->fstale = strncmp(t->path, "/sys/", 5) && strncmp(t->path, "/proc/", 6) && mt > 0 && (double)time(NULL) - mt > 900;
+    t->fmtime = mt;
+    const char *p = b;
+    if (t->fkey[0]) {
+        size_t kl = strlen(t->fkey);
+        const char *q = b;
+        for (p = NULL; (q = strstr(q, t->fkey)) != NULL; q += kl) {
+            int start = q == b || !(isalnum((unsigned char)q[-1]) || q[-1] == '_');
+            int end = !(isalnum((unsigned char)q[kl]) || q[kl] == '_');
+            if (start && end) {
+                p = q + kl;
+                break;
+            }
+        }
+        if (!p)
+            return 0;
+    }
+    for (; *p; p++) { /* the first number from here */
+        if (isdigit((unsigned char)*p) || ((*p == '-' || *p == '+' || *p == '.') && isdigit((unsigned char)p[1])) ||
+            ((*p == '-' || *p == '+') && p[1] == '.' && isdigit((unsigned char)p[2])))
+            break;
+        if (t->fkey[0] && *p != ' ' && *p != '\t' && *p != '"' && *p != '\'' && *p != ':' && *p != '=' && *p != '\n' &&
+            *p != '\r')
+            return 0; /* the key is followed by something else than a number */
+    }
+    if (!*p)
+        return 0;
+    char *e;
+    double v = strtod(p, &e);
+    if (e == p || !isfinite(v))
+        return 0;
+    if (t->fstale)
+        return 0; /* known, but old: not used for anything */
+    t->value = v * t->fscale + t->fadd;
+    if (t->value > t->peak || !t->t_first)
+        t->peak = t->value;
+    if (!t->t_first)
+        t->t_first = now_sec();
+    return 1;
+}
+
+const char *sensor_unit(const sensor_t *t)
+{
+    static const char *const unit[] = { "C", "RPM", "W", "V", "" };
+    return t->file ? t->unit : unit[t->type >= 0 && t->type <= SENS_OTHER ? t->type : SENS_OTHER];
 }
 
 /* Intel coretemp exposes one "Core N" sensor per physical core; the n-th
@@ -374,6 +516,8 @@ int sensor_bad(const sensor_t *t)
         }
     } else if (t->type == SENS_FAN) {
         hi = 0; /* fans: only a minimum */
+    } else if (t->type == SENS_OTHER) {
+        /* your own values: either side */
     } else {
         lo = 0; /* temperatures, power: only a maximum */
     }

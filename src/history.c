@@ -496,7 +496,7 @@ static void sample_day(sys_t *s, double dt)
     if (!smart_temp)
         for (int i = 0; i < s->sens.n; i++) {
             const sensor_t *t = &s->sens.s[i];
-            if (t->type != SENS_TEMP || !t->ok)
+            if (t->type != SENS_TEMP || !t->ok || t->file)
                 continue;
             if ((!strncmp(t->chip, "nvme", 4) && !strcmp(t->label, "Composite")) || !strncmp(t->chip, "drivetemp", 9))
                 nan_max(&d->drive_temp_max, t->value);

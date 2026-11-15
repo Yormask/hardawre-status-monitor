@@ -44,9 +44,11 @@
 #include <unistd.h>
 
 /* nl80211 values: a stable kernel interface, so its header isn't needed to build */
-enum { WF_CMD_GET_INTERFACE = 5, WF_CMD_GET_STATION = 17 };
-enum { WF_ATTR_IFINDEX = 3, WF_ATTR_STA_INFO = 21, WF_ATTR_WIPHY_FREQ = 38, WF_ATTR_CHANNEL_WIDTH = 159,
-       WF_ATTR_CENTER_FREQ1 = 160, WF_ATTR_MAX = 161 };
+enum { WF_CMD_GET_INTERFACE = 5, WF_CMD_GET_STATION = 17, WF_CMD_GET_SCAN = 32 };
+enum { WF_ATTR_IFINDEX = 3, WF_ATTR_MAC = 6, WF_ATTR_STA_INFO = 21, WF_ATTR_WIPHY_FREQ = 38, WF_ATTR_BSS = 47,
+       WF_ATTR_CHANNEL_WIDTH = 159, WF_ATTR_CENTER_FREQ1 = 160, WF_ATTR_MAX = 161 };
+enum { WF_BSS_BSSID = 1, WF_BSS_FREQUENCY = 2, WF_BSS_SIGNAL_MBM = 7, WF_BSS_STATUS = 9, WF_BSS_SEEN_MS_AGO = 10,
+       WF_BSS_MAX = 11 };
 enum { WF_STA_SIGNAL = 7, WF_STA_TX_BITRATE = 8, WF_STA_TX_PACKETS = 10, WF_STA_TX_RETRIES = 11,
        WF_STA_TX_FAILED = 12, WF_STA_RX_BITRATE = 14, WF_STA_CONNECTED_TIME = 16, WF_STA_BEACON_LOSS = 18,
        WF_STA_MAX = 19 };
@@ -67,7 +69,11 @@ _Static_assert(SAME(NL80211_CMD_GET_INTERFACE, WF_CMD_GET_INTERFACE) && SAME(NL8
                    SAME(NL80211_STA_INFO_BEACON_LOSS, WF_STA_BEACON_LOSS) && SAME(NL80211_STA_INFO_RX_BITRATE, WF_STA_RX_BITRATE) &&
                    SAME(NL80211_RATE_INFO_BITRATE32, WF_RATE_BITRATE32) && SAME(NL80211_RATE_INFO_VHT_MCS, WF_RATE_VHT_MCS) &&
                    SAME(NL80211_RATE_INFO_HE_MCS, WF_RATE_HE_MCS) && SAME(NL80211_RATE_INFO_EHT_MCS, WF_RATE_EHT_MCS) &&
-                   SAME(NL80211_CHAN_WIDTH_160, WF_W160) && SAME(NL80211_CHAN_WIDTH_320, WF_W320),
+                   SAME(NL80211_CHAN_WIDTH_160, WF_W160) && SAME(NL80211_CHAN_WIDTH_320, WF_W320) &&
+                   SAME(NL80211_CMD_GET_SCAN, WF_CMD_GET_SCAN) && SAME(NL80211_ATTR_MAC, WF_ATTR_MAC) &&
+                   SAME(NL80211_ATTR_BSS, WF_ATTR_BSS) && SAME(NL80211_BSS_FREQUENCY, WF_BSS_FREQUENCY) &&
+                   SAME(NL80211_BSS_SIGNAL_MBM, WF_BSS_SIGNAL_MBM) && SAME(NL80211_BSS_STATUS, WF_BSS_STATUS) &&
+                   SAME(NL80211_BSS_SEEN_MS_AGO, WF_BSS_SEEN_MS_AGO),
                "nl80211 values");
 #undef SAME
 #endif
@@ -293,6 +299,8 @@ static void station_cb(const struct nlmsghdr *h, void *ctx)
     span_t si[WF_STA_MAX];
     attrs(a[WF_ATTR_STA_INFO].p, a[WF_ATTR_STA_INFO].len, si, WF_STA_MAX);
     w->sta = 1;
+    if (a[WF_ATTR_MAC].len >= 6)
+        memcpy(w->bssid, a[WF_ATTR_MAC].p, 6);
     if (si[WF_STA_SIGNAL].len >= 1)
         w->signal = (int8_t)si[WF_STA_SIGNAL].p[0];
     int gen = 0;
@@ -311,6 +319,86 @@ static void station_cb(const struct nlmsghdr *h, void *ctx)
         w->connected_s = u32(si[WF_STA_CONNECTED_TIME]);
     if (si[WF_STA_BEACON_LOSS].len >= 4)
         w->beacon_loss = u32(si[WF_STA_BEACON_LOSS]);
+}
+
+/* one network of the last scan */
+typedef struct {
+    unsigned char bssid[6];
+    int freq, dbm, mine;
+    unsigned seen_ms;
+} bss_t;
+typedef struct {
+    bss_t b[160];
+    int n;
+} scan_t;
+
+static void scan_cb(const struct nlmsghdr *h, void *ctx)
+{
+    scan_t *sc = ctx;
+    int len;
+    const unsigned char *p = payload(h, &len);
+    static span_t a[WF_ATTR_MAX];
+    attrs(p, len, a, WF_ATTR_MAX);
+    if (!a[WF_ATTR_BSS].len || sc->n >= (int)(sizeof sc->b / sizeof sc->b[0]))
+        return;
+    span_t b[WF_BSS_MAX];
+    attrs(a[WF_ATTR_BSS].p, a[WF_ATTR_BSS].len, b, WF_BSS_MAX);
+    if (b[WF_BSS_BSSID].len < 6 || b[WF_BSS_FREQUENCY].len < 4)
+        return;
+    bss_t *x = &sc->b[sc->n++];
+    memcpy(x->bssid, b[WF_BSS_BSSID].p, 6);
+    x->freq = (int)u32(b[WF_BSS_FREQUENCY]);
+    x->dbm = b[WF_BSS_SIGNAL_MBM].len >= 4 ? (int)(int32_t)u32(b[WF_BSS_SIGNAL_MBM]) / 100 : 0;
+    x->mine = b[WF_BSS_STATUS].len >= 4; /* authenticated or associated: the one it's on */
+    x->seen_ms = b[WF_BSS_SEEN_MS_AGO].len >= 4 ? u32(b[WF_BSS_SEEN_MS_AGO]) : 0;
+}
+
+static int same_ap(const unsigned char *a, const unsigned char *b)
+{
+    /* one router's networks (guest, the other band) differ in the last byte
+     * or two; the second bit of the first byte marks "made up" addresses */
+    return (a[0] | 2) == (b[0] | 2) && !memcmp(a + 1, b + 1, 4);
+}
+
+/* the band a frequency is in: 1 = 2.4, 2 = 5, 3 = 6, 4 = 60 GHz, 0 = none */
+static int band_id(int mhz)
+{
+    return mhz <= 0 ? 0 : mhz < 3000 ? 1 : mhz < 5925 ? 2 : mhz < 7200 ? 3 : mhz >= 57000 ? 4 : 0;
+}
+
+/* how crowded its channel is, out of the last scan's networks */
+static void crowding(wifi_t *w, const scan_t *sc)
+{
+    w->crowd_ok = 0;
+    w->crowd_same = w->crowd_near = w->crowd_strong = w->crowd_band = 0;
+    memset(w->ch24, 0, sizeof w->ch24);
+    int lo = w->freq - 10, hi = w->freq + 10; /* the span it uses */
+    if (w->width >= 40 && w->center) {
+        lo = w->center - w->width / 2;
+        hi = w->center + w->width / 2;
+    }
+    int band = band_id(w->freq);
+    unsigned newest = ~0u;
+    for (int i = 0; i < sc->n; i++) {
+        const bss_t *x = &sc->b[i];
+        if (x->seen_ms < newest)
+            newest = x->seen_ms;
+        if (x->mine || same_ap(x->bssid, w->bssid) || x->seen_ms > 300000 || band_id(x->freq) != band)
+            continue;
+        w->crowd_band++;
+        int same = x->freq == w->freq;
+        int near = !same && (w->freq < 3000 ? abs(x->freq - w->freq) <= 15 : x->freq > lo && x->freq < hi);
+        w->crowd_same += same;
+        w->crowd_near += near;
+        if ((same || near) && x->dbm && x->dbm >= -70)
+            w->crowd_strong++;
+        static const int ch[3] = { 2412, 2437, 2462 };
+        for (int k = 0; k < 3; k++)
+            if (x->freq < 3000 && abs(x->freq - ch[k]) <= 10)
+                w->ch24[k]++;
+    }
+    w->crowd_age = newest == ~0u ? -1 : newest / 1000.0;
+    w->crowd_ok = sc->n > 0;
 }
 
 static int fake_read(const char *dir, const char *ifname, const char *what, int dump, msg_fn fn, void *ctx)
@@ -363,6 +451,7 @@ void wifi_sample(netif_t *f, double mono)
     wifi_t *w = &f->wifi;
     wifi_t was = *w;
     const char *fake = secure_getenv("HSM_WIFI_FAKE");
+    unsigned idx = 0;
     w->ok = w->sta = 0;
     w->freq = w->center = w->width = w->gen = w->signal = 0;
     w->tx_mbps = w->rx_mbps = -1;
@@ -373,7 +462,7 @@ void wifi_sample(netif_t *f, double mono)
             return;
         fake_read(fake, f->name, "station", 1, station_cb, w);
     } else {
-        unsigned idx = if_nametoindex(f->name);
+        idx = if_nametoindex(f->name);
         if (!idx || !ready())
             return;
         int e = ask(g_fam, WF_CMD_GET_INTERFACE, 0, WF_ATTR_IFINDEX, &idx, 4, iface_cb, w);
@@ -388,10 +477,22 @@ void wifi_sample(netif_t *f, double mono)
             return;
         ask(g_fam, WF_CMD_GET_STATION, NLM_F_DUMP, WF_ATTR_IFINDEX, &idx, 4, station_cb, w);
     }
-    if (!w->freq || !w->sta) /* not connected */
+    if (!w->freq || !w->sta) { /* not connected */
+        w->crowd_ok = 0;
         return;
+    }
     w->ok = 1;
     w->channel = wifi_channel(w->freq);
+    if (!w->crowd_t || mono - w->crowd_t >= 30 || w->freq != was.freq) { /* the neighbours, from the last scan */
+        static scan_t sc;
+        sc.n = 0;
+        w->crowd_t = mono;
+        if (fake ? fake_read(fake, f->name, "scan", 1, scan_cb, &sc) == 0
+                 : ask(g_fam, WF_CMD_GET_SCAN, NLM_F_DUMP, WF_ATTR_IFINDEX, &idx, 4, scan_cb, &sc) == 0)
+            crowding(w, &sc);
+        else
+            w->crowd_ok = 0;
+    }
     /* the share of frames sent again, over the last 10 s or so */
     if (!w->win_t || w->tx_pkts < w->win_pkts || mono - w->win_t >= RETRY_EVERY) {
         if (w->win_t && w->tx_pkts >= w->win_pkts + 50 && w->tx_retries >= w->win_retries)

@@ -36,6 +36,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ATA_EVERY 60.0 /* seconds between reads */
@@ -79,34 +80,43 @@ static int sense_count(const unsigned char *s, int len)
 }
 
 /* One ATA command through SG_IO. buf != NULL reads one 512-byte sector.
- * Returns 0, or an errno (EOPNOTSUPP when the drive refused the command). */
-static int ata_cmd_lba(int fd, unsigned char cmd, unsigned char feature, unsigned char lba_low, unsigned char *buf,
-                       int *count_out)
+ * Returns 0, or an errno (EOPNOTSUPP when the drive refused the command).
+ * cdb12: the 12-byte form, which some older USB adapters understand instead. */
+static int ata_cmd_cdb(int fd, unsigned char cmd, unsigned char feature, unsigned char lba_low, unsigned char *buf,
+                       int *count_out, int cdb12)
 {
     unsigned char cdb[16], sense[64];
     memset(cdb, 0, sizeof cdb);
     memset(sense, 0, sizeof sense);
-    cdb[0] = 0x85; /* ATA PASS-THROUGH (16) */
-    if (buf) {
-        cdb[1] = 4 << 1;  /* protocol: PIO data-in */
-        cdb[2] = 0x0e;    /* from the device, length in sectors, given in the count field */
+    unsigned char proto = buf ? 4 << 1 : 3 << 1;  /* PIO data-in / non-data */
+    unsigned char flags = buf ? 0x0e : 0x20;      /* from the device, length in sectors / CK_COND: the registers back */
+    unsigned char mid = cmd == 0xB0 ? 0x4f : 0, high = cmd == 0xB0 ? 0xc2 : 0; /* SMART: the "key" */
+    if (cdb12) {
+        cdb[0] = 0xA1; /* ATA PASS-THROUGH (12) */
+        cdb[1] = proto;
+        cdb[2] = flags;
+        cdb[3] = feature;
+        cdb[4] = buf ? 1 : 0;
+        cdb[5] = lba_low;
+        cdb[6] = mid;
+        cdb[7] = high;
+        cdb[9] = cmd;
     } else {
-        cdb[1] = 3 << 1;  /* protocol: non-data */
-        cdb[2] = 0x20;    /* CK_COND: return the registers, to read the answer */
+        cdb[0] = 0x85; /* ATA PASS-THROUGH (16) */
+        cdb[1] = proto;
+        cdb[2] = flags;
+        cdb[4] = feature;
+        cdb[6] = buf ? 1 : 0;
+        cdb[8] = lba_low; /* SMART READ LOG: the log; EXECUTE OFF-LINE: the test */
+        cdb[10] = mid;
+        cdb[12] = high;
+        cdb[14] = cmd;
     }
-    cdb[4] = feature;
-    cdb[6] = buf ? 1 : 0;
-    cdb[8] = lba_low; /* SMART READ LOG: the log; EXECUTE OFF-LINE: the test */
-    if (cmd == 0xB0) {    /* SMART: the "key" in LBA mid / high */
-        cdb[10] = 0x4f;
-        cdb[12] = 0xc2;
-    }
-    cdb[14] = cmd;
 
     sg_io_hdr_t io;
     memset(&io, 0, sizeof io);
     io.interface_id = 'S';
-    io.cmd_len = sizeof cdb;
+    io.cmd_len = cdb12 ? 12 : 16;
     io.cmdp = cdb;
     io.mx_sb_len = sizeof sense;
     io.sbp = sense;
@@ -129,6 +139,46 @@ static int ata_cmd_lba(int fd, unsigned char cmd, unsigned char feature, unsigne
     return key == 5 ? EOPNOTSUPP : EIO; /* 5 = illegal request: not supported */
 }
 
+/* the 16-byte form; a drive that refused it (an older USB adapter) is asked
+ * in the 12-byte form from then on, remembered by its device number */
+static struct {
+    dev_t dev;
+    int on;
+} g_cdb12[8];
+
+static int *cdb12_of(int fd)
+{
+    static int none;
+    struct stat st;
+    none = 0;
+    if (fstat(fd, &st) || !S_ISBLK(st.st_mode))
+        return &none;
+    int free_i = -1;
+    for (int i = 0; i < 8; i++) {
+        if (g_cdb12[i].dev == st.st_rdev)
+            return &g_cdb12[i].on;
+        if (!g_cdb12[i].dev && free_i < 0)
+            free_i = i;
+    }
+    if (free_i < 0)
+        free_i = (int)(st.st_rdev % 8);
+    g_cdb12[free_i].dev = st.st_rdev;
+    g_cdb12[free_i].on = 0;
+    return &g_cdb12[free_i].on;
+}
+
+static int ata_cmd_lba(int fd, unsigned char cmd, unsigned char feature, unsigned char lba_low, unsigned char *buf,
+                       int *count_out)
+{
+    int *c12 = cdb12_of(fd);
+    int r = ata_cmd_cdb(fd, cmd, feature, lba_low, buf, count_out, *c12);
+    if (r && !*c12 && ata_cmd_cdb(fd, cmd, feature, lba_low, buf, count_out, 1) == 0) {
+        *c12 = 1;
+        return 0;
+    }
+    return r;
+}
+
 static int ata_cmd(int fd, unsigned char cmd, unsigned char feature, unsigned char *buf, int *count_out)
 {
     return ata_cmd_lba(fd, cmd, feature, 0, buf, count_out);
@@ -143,7 +193,65 @@ int ata_smart(int fd, unsigned char feature, unsigned char lba_low, unsigned cha
 
 /* ------------------------------------------------------------- discovery */
 
-void ata_find(health_t *h)
+/* a disk in a USB enclosure (its device path goes through a USB port), and
+ * whether the adapter is one of the NVMe ones (they need the maker's own
+ * commands: JMicron JMS583, Realtek RTL9210, ASMedia ASM2362) */
+static int usb_disk(const char *base, const char *name, int *nvme)
+{
+    char p[PATHBUF], rp[PATHBUF];
+    sfmt(p, sizeof p, "%s/%s/device", base, name);
+    *nvme = 0;
+    char *real = realpath(p, NULL); /* (a buffer of our own would have to be PATH_MAX long) */
+    if (!real)
+        return 0;
+    str_copy(rp, sizeof rp, real);
+    free(real);
+    if (!strstr(rp, "/usb"))
+        return 0;
+    /* up the tree to the USB device: its idVendor / idProduct */
+    for (char *q = rp + strlen(rp); q > rp; q--) {
+        if (*q != '/')
+            continue;
+        *q = '\0';
+        unsigned vid, pid;
+        char f[PATHBUF];
+        sfmt(f, sizeof f, "%s/idVendor", rp);
+        if (read_hex(f, &vid))
+            continue;
+        sfmt(f, sizeof f, "%s/idProduct", rp);
+        if (read_hex(f, &pid))
+            break;
+        static const unsigned nv[][2] = { { 0x152d, 0x0583 }, { 0x0bda, 0x9210 }, { 0x174c, 0x2362 } };
+        for (size_t i = 0; i < sizeof nv / sizeof nv[0]; i++)
+            *nvme |= vid == nv[i][0] && pid == nv[i][1];
+        break;
+    }
+    return 1;
+}
+
+static void add_drive(health_t *h, const char *base, const char *name, int usb, int nvme)
+{
+    char p[PATHBUF];
+    sata_t *s = &h->sata[h->nsata++];
+    memset(s, 0, sizeof *s);
+    str_copy(s->name, sizeof s->name, name);
+    sfmt(p, sizeof p, "%s/%s/device/model", base, name);
+    if (read_line(p, s->model, sizeof s->model))
+        s->model[0] = '\0';
+    long long rot = 0;
+    sfmt(p, sizeof p, "%s/%s/queue/rotational", base, name);
+    s->rotational = !read_ll(p, &rot) && rot;
+    s->temp_c = s->wear = -1;
+    s->hours = s->cycles = s->realloc = s->pending = s->uncorrect = s->crc = s->unsafe = -1;
+    s->usb = usb;
+    s->nvme_bridge = nvme;
+    s->state = usb ? -4 : 0;
+}
+
+/* sdX disks: SATA ones (libata says "ATA" as the vendor), and with usb set
+ * the ones in USB enclosures (not sticks: those say they are removable, and
+ * have nothing to report). RAID controllers are left out. */
+static void find_disks(health_t *h, int usb)
 {
     char base[PATHBUF];
     sfmt(base, sizeof base, "%s/block", g_sysfs);
@@ -155,27 +263,44 @@ void ata_find(health_t *h)
         if (strncmp(e->d_name, "sd", 2) || !e->d_name[2] || strlen(e->d_name) > 6)
             continue;
         char p[PATHBUF], v[32];
-        /* libata drives say "ATA" here; USB enclosures and RAID controllers don't */
-        sfmt(p, sizeof p, "%s/%s/device/vendor", base, e->d_name);
-        if (read_line(p, v, sizeof v) || strcmp(v, "ATA"))
-            continue;
         long long rem = 0;
         sfmt(p, sizeof p, "%s/%s/removable", base, e->d_name);
         if (!read_ll(p, &rem) && rem)
             continue;
-        sata_t *s = &h->sata[h->nsata++];
-        memset(s, 0, sizeof *s);
-        str_copy(s->name, sizeof s->name, e->d_name);
-        sfmt(p, sizeof p, "%s/%s/device/model", base, e->d_name);
-        if (read_line(p, s->model, sizeof s->model))
-            s->model[0] = '\0';
-        long long rot = 0;
-        sfmt(p, sizeof p, "%s/%s/queue/rotational", base, e->d_name);
-        s->rotational = !read_ll(p, &rot) && rot;
-        s->temp_c = s->wear = -1;
-        s->hours = s->cycles = s->realloc = s->pending = s->uncorrect = s->crc = s->unsafe = -1;
+        int nv = 0, in_usb = usb_disk(base, e->d_name, &nv);
+        sfmt(p, sizeof p, "%s/%s/device/vendor", base, e->d_name);
+        int ata = !read_line(p, v, sizeof v) && !strcmp(v, "ATA");
+        if (usb ? !in_usb : !ata || in_usb)
+            continue;
+        int known = 0;
+        for (int i = 0; i < h->nsata; i++)
+            known |= !strcmp(h->sata[i].name, e->d_name);
+        if (!known)
+            add_drive(h, base, e->d_name, in_usb, nv);
     }
     closedir(d);
+}
+
+void ata_find(health_t *h)
+{
+    find_disks(h, 0);
+    find_disks(h, 1);
+}
+
+/* USB drives come and go: drop the ones gone, add new ones (not read until you ask) */
+void ata_usb_scan(health_t *h)
+{
+    char p[PATHBUF];
+    for (int i = 0; i < h->nsata;) {
+        sfmt(p, sizeof p, "%s/block/%s", g_sysfs, h->sata[i].name);
+        if (h->sata[i].usb && !path_exists(p)) {
+            memmove(&h->sata[i], &h->sata[i + 1], (size_t)(h->nsata - i - 1) * sizeof h->sata[0]);
+            h->nsata--;
+        } else {
+            i++;
+        }
+    }
+    find_disks(h, 1);
 }
 
 /* ------------------------------------------------------------- attributes */
@@ -318,6 +443,7 @@ static void read_drive(health_t *h, sata_t *s)
             s->state = -2;
         return;
     }
+    s->read_at = (double)time(NULL);
     int was = s->state, was_failing = s->failing;
     long long realloc = s->realloc, pending = s->pending, unc = s->uncorrect, crc = s->crc;
     parse(s, data, have_thr ? thr : NULL);
@@ -344,7 +470,23 @@ static void read_drive(health_t *h, sata_t *s)
 void ata_sample(health_t *h)
 {
     for (int i = 0; i < h->nsata; i++)
-        read_drive(h, &h->sata[i]);
+        if (!h->sata[i].usb) /* USB drives only when you ask */
+            read_drive(h, &h->sata[i]);
+}
+
+int ata_usb_read(health_t *h, const char *name)
+{
+    for (int i = 0; i < h->nsata; i++) {
+        sata_t *s = &h->sata[i];
+        if (strcmp(s->name, name))
+            continue;
+        int was = s->state;
+        read_drive(h, s);
+        if (s->state == -2 && was == -4)
+            return EOPNOTSUPP;
+        return s->state == 1 ? 0 : s->state == -1 ? EACCES : EIO;
+    }
+    return ENOENT;
 }
 
 /* "wear 3% · 4120 h · 36 °C · no errors"; level 0 fine, 1 warning, 2 bad */
@@ -355,8 +497,16 @@ void sata_summary(const sata_t *s, char *out, size_t n, int *level, const char *
     switch (s->state) {
     case 0: str_copy(out, n, "reading..."); return;
     case -1: str_copy(out, n, "needs root (sudo hsm)"); return;
-    case -2: str_copy(out, n, "no SMART data from this drive"); return;
+    case -2:
+        str_copy(out, n, s->nvme_bridge ? "an NVMe drive in a USB adapter: its health needs the adapter maker's own commands"
+                         : s->usb       ? "the USB adapter doesn't pass the drive's health on"
+                                        : "no SMART data from this drive");
+        return;
     case -3: str_copy(out, n, "asleep (not woken up to check)"); return;
+    case -4:
+        str_copy(out, n, s->nvme_bridge ? "an NVMe drive in a USB adapter: its health needs the adapter maker's own commands"
+                                        : "in a USB enclosure: read only when you ask (D, then r)");
+        return;
     }
     size_t l;
 #define ADD(...) (l = strlen(out), sfmt(out + l, n - l, __VA_ARGS__))

@@ -55,6 +55,15 @@ typedef struct {
     double mhz_hw[MAX_CPUS];
     int core_id[MAX_CPUS], pkg_id[MAX_CPUS];
     unsigned char topo_done[MAX_CPUS];
+    /* kinds of cores (Intel P-cores and E-cores, ARM big and LITTLE ones);
+     * nctype 0 = all alike */
+    int nctype;
+    struct {
+        char name[24];  /* "P-core", "E-core", "LP E-core", "Cortex-A76" */
+        char letter;    /* on the core rows: 'P', 'E', 'L' */
+        int cores, threads;
+    } ctype[4];
+    signed char core_type[MAX_CPUS]; /* per kernel CPU number: index into ctype, -1 = unknown */
     double total, user, sys, iowait, steal;
     double mhz_avg, mhz_max;
     double temp_c; /* package temperature, -1 = unknown */
@@ -82,6 +91,7 @@ typedef struct {
 } cpu_t;
 
 void cpu_init(cpu_t *c);
+void cpu_types_text(const cpu_t *c, char *out, size_t n); /* "6P+8E", "" = all cores alike */
 void cpu_sample(cpu_t *c, double dt);
 void cpu_power_sample(cpu_t *c); /* governor, turbo...: slow-changing, every few seconds */
 
@@ -168,6 +178,16 @@ typedef struct {
     unsigned long long win_pkts, win_retries;
     int band_told;             /* the frequency the last band event was about */
     double band_since;         /* on another band since (monotonic), 0 = no */
+    /* how crowded its channel is: the other networks the last scan found
+     * (the kernel keeps them; hsm starts no scan of its own) */
+    unsigned char bssid[6];    /* the access point it's connected to */
+    int crowd_ok;              /* known */
+    int crowd_same, crowd_near; /* other networks on its channel / overlapping it (2.4 GHz neighbours, or inside its width) */
+    int crowd_strong;          /* ... of those, strong ones (-70 dBm or more): these slow it down most */
+    int crowd_band;            /* every other network seen on this band */
+    int ch24[3];               /* 2.4 GHz: networks on or next to channels 1, 6 and 11 */
+    double crowd_age;          /* seconds since the scan */
+    double crowd_t;            /* asked at (monotonic), every 30 s */
 } wifi_t;
 
 typedef struct {
@@ -188,7 +208,7 @@ typedef struct {
 
 /* network quality: the router and one internet address pinged every 2 s
  * (netcheck.c, off unless switched on) */
-enum { NQ_ROUTER, NQ_NET, NQ_COUNT };
+enum { NQ_ROUTER, NQ_NET, NQ_DNS, NQ_COUNT }; /* NQ_DNS: a name looked up at the DNS server, every 10 s */
 enum { NQ_FINE, NQ_LOSS, NQ_SLOW };   /* trouble right now */
 typedef struct {
     char addr[48];                    /* what is pinged, "" = nothing (no router) */
@@ -237,6 +257,8 @@ typedef struct {
     int nfds;                   /* open files, -1 = unknown (other user's process) */
     double gpu;                 /* GPU busy %, -1 = not using a GPU / unknown */
     unsigned long long gpu_mem; /* GPU memory in bytes */
+    double net_rx, net_tx;      /* TCP bytes/s in and out (netproc.c), -1 = unknown (another user's) */
+    int nlisten;                /* ports it listens on */
 
     /* private: open-file and GPU client tracking */
     double fd_t, drm_t;
@@ -259,7 +281,19 @@ typedef struct {
     double gcap[8];    /* engine capacity (parallel units) */
     pid_t slow_pid;    /* the process that took longest to read this time, and how long */
     double slow_s;
+    double net_want_until; /* network use per process is read until then (the process list asks) */
+    int net_ok;            /* ... and it could be */
 } procs_t;
+
+/* netproc.c: network use per process (TCP), and the ports they listen on */
+typedef struct {
+    unsigned inode;
+    pid_t pid;
+    int udp, port, v6;
+    int local; /* only this machine can reach it (127.0.0.1, ::1) */
+} netport_t;
+void netproc_sample(procs_t *ps, double dt);
+int netproc_ports(pid_t pid, netport_t *out, int max);
 
 void procs_init(procs_t *ps);
 void procs_sample(procs_t *ps, double dt, unsigned long long memtotal);
@@ -267,11 +301,30 @@ void procs_free(procs_t *ps);
 const char *proc_cmdline(proc_t *p);
 int proc_send_signal(pid_t pid, unsigned long long start, int sig); /* 0 or errno */
 int proc_renice(pid_t pid, unsigned long long start, int nice);    /* every thread; 0 or errno */
+/* which CPUs it may run on: set[i] for CPU i; returns how many, or -errno */
+int proc_affinity_get(pid_t pid, unsigned char *set, int max);
+int proc_affinity_set(pid_t pid, unsigned long long start, const unsigned char *set, int max); /* every thread */
+/* disk priority (ionice): IOP_* class, level 0 (first) to 7 (last) */
+enum { IOP_NONE, IOP_RT, IOP_BE, IOP_IDLE };
+int proc_ioprio_get(pid_t pid, int *cls, int *level);
+int proc_ioprio_set(pid_t pid, unsigned long long start, int cls, int level); /* every thread; 0 or errno */
 const char *uid_name(uid_t uid);
 
 /* ------------------------------------------------------ Sensors (hwmon) */
-enum { SENS_TEMP, SENS_FAN, SENS_POWER, SENS_VOLT };
+enum { SENS_TEMP, SENS_FAN, SENS_POWER, SENS_VOLT, SENS_OTHER };
 #define MAX_SENSORS 256
+
+/* your own value, read from a file: a smart plug's wall power, a UPS, a
+ * room thermometer ("file_sensor = ..." lines in the config file) */
+#define MAX_FSENS 16
+typedef struct {
+    char path[PATHBUF];
+    char name[48];
+    char unit[12];   /* as written: "W", "C", "%", "ppm"; it decides the kind of sensor */
+    char key[32];    /* the number after this word (JSON, "key=value"); "" = the first number */
+    double scale;    /* multiplied by this, 0 = 1 */
+    int total;       /* the whole machine's power (a smart plug only it is on): the power total */
+} fsdef_t;
 
 typedef struct {
     int type, chip_idx, ok;
@@ -294,6 +347,14 @@ typedef struct {
      * firmware fills in (ACPI's 27.8 °C), or an input with nothing on it */
     double vmin, vmax, t_first;
     int still;
+    /* your own value from a file (fsdef_t): */
+    int file;           /* 1 = it is one */
+    char unit[12];      /* its unit, as shown ("°C" ones are kept in °C) */
+    char fkey[32];
+    double fscale, fadd; /* value = number * fscale + fadd (°F, kW, mV...) */
+    int ftotal;         /* the machine's whole power */
+    int fstale;         /* the file hasn't changed for 15 minutes: the value is old */
+    double fmtime;      /* the file's last change (wall) */
 } sensor_t;
 
 typedef struct {
@@ -314,6 +375,8 @@ typedef struct {
     int hide;
 } srule_t;
 void sensors_apply(sensors_t *S, const srule_t *r, int n);
+void sensors_files(sensors_t *S, const fsdef_t *d, int n); /* your own values, after the hwmon ones */
+const char *sensor_unit(const sensor_t *t); /* "C", "RPM", "W", "V", or a file sensor's own */
 const char *sensor_label(const sensor_t *t);
 int sensor_plausible(const sensor_t *t); /* 0: a temperature nothing reaches (an input with nothing on it) */ /* your name, or the chip's label */
 int sensor_bad(const sensor_t *t);           /* past your limits (voltages: or the chip's) */
@@ -346,7 +409,19 @@ typedef struct {
     double inch;      /* diagonal, from the EDID's size; 0 = unknown */
     int builtin;      /* the laptop's own panel (eDP, LVDS, DSI) */
     int on;           /* in use (connected, and something draws on it) */
+    /* what it runs at (DRM, read-only; never asked of a GPU that is powered off) */
+    int mode_w, mode_h; /* now, 0 = unknown */
+    double hz;          /* refresh rate now, 0 = unknown */
+    double max_hz;      /* the most the connection offers at that size */
+    int vrr_cap, vrr_on; /* variable refresh (FreeSync / G-Sync / Adaptive-Sync): it can / on now; -1 unknown */
+    int nown;           /* the monitor's own timings (its EDID): what it can do, whatever the connection allows */
+    struct {
+        unsigned short w, h;
+        float hz;
+    } own[16];
+    double mon_hz;      /* the most of those at the size it runs at, 0 = unknown */
 } screen_t;
+enum { SCR_FINE, SCR_SETTING, SCR_LINK }; /* screen_slow(): fine / a faster rate is a setting away / the connection holds it back */
 
 typedef struct {
     char name[96], vendor[8], driver[16], card[16], pci[24], note[80];
@@ -354,7 +429,9 @@ typedef struct {
     int nscr;                   /* screens connected to its ports */
     screen_t scr[MAX_SCREENS];
     double scr_t;               /* read at (monotonic): every 5 s */
+    double drm_t;               /* refresh rates read at (monotonic) */
     char scr_told[128];         /* health: the screens already told about ("HDMI-A-1,DP-1,") */
+    char hz_told[128];          /* health: screens told to run below their refresh rate ("DP-2@60,") */
     int scr_primed;
     double util;                /* busiest engine %, -1 = unknown */
     double mem_used, mem_total; /* bytes, -1 = unknown            */
@@ -373,12 +450,16 @@ typedef struct {
     int reasons_ok;        /* the driver says why the clock is held back */
     unsigned long long reasons; /* NVML clock event reasons now */
     int slow_now;          /* held back now: GS_HEAT | GS_POWER */
+    int slow_hw;           /* ... and the hardware stepped in (a thermal or power brake, PROCHOT) */
+    int sys_bits;          /* AMD / Intel: GS_* as their driver reported it this sample */
     double slow_since;     /* monotonic: held back without a break since, 0 = not now */
     double busy_s, heat_s, pwr_s, held_s; /* since start: seconds busy, and held back by heat / power / either while busy */
     double slow_ev_t;      /* when the last "slowing down" event was raised */
     double enc_pct, dec_pct;          /* video encoder / decoder busy, -1 = unknown (NVIDIA, while awake) */
     int pcie_gen, pcie_width;         /* the PCIe link now, 0 = unknown (NVIDIA, while awake) */
     int pcie_gen_max, pcie_width_max; /* the best this card and its slot can do, 0 = unknown */
+    int pcie_slow_n, pcie_told;       /* health: under load at a slower link than it can do (checks in a row), told */
+    int lk_gen, lk_width;             /* private: the link read from sysfs every 5 s (not NVIDIA) */
 
     /* private */
     char dev[PATHBUF], hwmon[PATHBUF], drm[PATHBUF];
@@ -409,6 +490,8 @@ typedef struct {
 void gpus_init(gpus_t *g);
 void gpus_sample(gpus_t *g, double dt);
 const char *gpu_screen_holds(const gpu_t *g, char *out, size_t n); /* a screen keeping a dGPU awake: "HDMI-A-1 (DELL U2720Q)" */
+int screen_slow(const screen_t *s, double *can); /* an outside screen well below the refresh rate it can do: SCR_* */
+void gpu_screens_wanted(void);                   /* the Hardware view shows them: read refresh rates every 5 s, not 60 */
 void gpus_close(gpus_t *g);
 void gpus_proc_sample(gpus_t *g, procs_t *ps); /* NVIDIA: per-process GPU use through NVML */
 int pci_lookup_name(unsigned vendor, unsigned device, char *out, size_t n); /* from pci.ids */
@@ -450,6 +533,20 @@ typedef struct {
     double t;                        /* when they were read (monotonic) */
 } cpulim_t;
 
+/* the battery of a wireless mouse, keyboard, headset or game controller
+ * (power_supply entries with scope "Device") */
+#define MAX_DEVBAT 8
+typedef struct {
+    char id[48];      /* "hidpp_battery_0", "ps-controller-battery-..." */
+    char name[64];    /* the device: "G502 LIGHTSPEED", "Wireless Controller" */
+    char path[PATHBUF];
+    double capacity;  /* %, -1 = it only says roughly (level) */
+    char level[16];   /* "Full", "High", "Normal", "Low", "Critical", "" */
+    char status[16];  /* "Charging", "Discharging", "Full", ... */
+    int low;          /* low now (health / alerts) */
+} devbat_t;
+const char *devbat_text(const devbat_t *b, char *out, size_t n); /* "45%", "Low", "80%, charging" */
+
 typedef struct {
     int nrapl;
     rapl_t z[MAX_RAPL];
@@ -465,12 +562,38 @@ typedef struct {
      * firmware: it then reads far less than the CPU package inside it */
     int psys_low, psys_bad;
     cpulim_t lim;  /* the CPU's power limits */
+    /* a USB-C charger: what it offers (its PD source capabilities) and what
+     * the laptop agreed on (the contract); -1 = unknown */
+    double chg_offer_w;       /* the most it offers */
+    char chg_volts[32];       /* its fixed voltages: "5/9/15/20 V" */
+    double chg_w, chg_v, chg_a; /* the contract: W, V, A */
+    int drain_told;           /* health: "drains while plugged in" told for this plug-in */
+    double drain_since;       /* ... draining since (monotonic) */
+    int draining;             /* ... for 30 s or more now */
+    double drain_w;           /* ... by this much */
+    int ndev;
+    devbat_t dev[MAX_DEVBAT]; /* wireless devices' batteries: they come and go */
+    double dev_t;             /* looked for at (monotonic), every 10 s */
     char slow[40]; /* the part that took longest to read this time, for slow-reading events */
     double slow_s;
 } power_t;
+int charger_weak(const power_t *p);  /* a laptop on a USB-C charger that gives less than 25 W */
 
 void power_init(power_t *p);
 void power_sample(power_t *p, double dt);
+
+/* ---------------------------------------------------------------- PCIe */
+/* the link a PCI device runs at, against what it and its slot can do */
+typedef struct {
+    int gen, width;           /* now: PCIe generation, lanes */
+    int dev_gen, dev_width;   /* the most the device can do */
+    int slot_gen, slot_width; /* the most the slot (the port above it) can do, 0 = unknown */
+    int best_gen, best_width; /* the most both can do */
+    int below;                /* slower than both allow: a riser, a bad contact, a BIOS setting */
+    int slot_less;            /* the slot can't do what the device can (by design: a chipset slot) */
+} pcilink_t;
+int pcie_link(const char *dev, pcilink_t *l); /* dev: its sysfs folder; 0 = known */
+const char *pcie_text(const pcilink_t *l, char *out, size_t n); /* "PCIe 3.0 x2: the slot's most (...)" */
 
 /* --------------------------------------------------------------- Health */
 #define MAX_PKGS 8
@@ -526,6 +649,8 @@ typedef struct {
     int heat_open, heat_hard;                /* slowing down now (or lately); it got to the hard kind */
     double heat_from, heat_t, heat_max_c;    /* wall clock: first and last time seen; hottest meanwhile */
     unsigned long long heat_n0[2], heat_s0[2]; /* the counters when it began */
+    pcilink_t link;          /* its PCIe link (no root needed) */
+    int link_ok, link_low, link_told; /* known; slower than it could be (reads in a row); told */
 } nvme_t;
 
 #define MAX_SATA 8
@@ -533,8 +658,13 @@ typedef struct {
 /* a SATA SSD or hard disk, from its SMART attributes */
 typedef struct {
     char name[16], model[48];
-    int state;        /* 1 read, 0 not yet, -1 needs root, -2 no SMART data, -3 asleep, not woken */
+    int state;        /* 1 read, 0 not yet, -1 needs root, -2 no SMART data, -3 asleep, not woken,
+                       * -4 a USB drive not read yet (only when you ask: D, then r) */
     int rotational;   /* a hard disk */
+    int usb;          /* in a USB enclosure: read only when you ask */
+    int ask;          /* ... and you asked: read it at the next chance */
+    int nvme_bridge;  /* an NVMe drive in a USB adapter: its health needs the maker's own commands */
+    double read_at;   /* wall clock of the last good read */
     int asleep;       /* spun down at the last check (the figures are from before) */
     int failing;      /* an attribute is at or below the maker's limit */
     char fail_attr[28];
@@ -662,6 +792,8 @@ int runaway_count(void);       /* called out and still busy */
 /* ata.c: SATA drives */
 void ata_find(health_t *h);
 void ata_sample(health_t *h);
+void ata_usb_scan(health_t *h);            /* USB drives plugged in or out */
+int ata_usb_read(health_t *h, const char *name); /* read a USB drive's health now (you asked); 0 or errno */
 
 /* selftest.c: a drive's own tests and error log */
 #define MAX_STEST 21
@@ -688,6 +820,7 @@ typedef struct {
     int err_bad;             /* ... was a real problem (media error), not a refused command */
     long long err_hours;     /* when (power-on hours), -1 unknown */
     double read_t;
+    int usb;                 /* in a USB enclosure: read only when you ask (r) */
     int follow;              /* hsm started a test: report when it ends */
     double follow_t;
     int sim_type;            /* test hook: a pretend test */
@@ -732,6 +865,18 @@ void svcs_free(svcs_t *v);
 const char *svc_kind_name(int kind);
 
 /* --------------------------------------------------------- Whole system */
+/* a memory module, from the SMBIOS tables (root only) */
+#define MAX_RAM 16
+typedef struct {
+    char slot[32], bank[32];  /* where: "ChannelA-DIMM0", "BANK 0" */
+    char type[8];             /* "DDR4", "DDR5", "LPDDR5"... */
+    char maker[32], part[32];
+    unsigned long mb;
+    int speed, conf;          /* MT/s: the most it can do, what it runs at; 0 = unknown */
+    int form;                 /* 1 DIMM, 2 SO-DIMM, 3 soldered, 0 unknown */
+    char channel;             /* 'A', 'B'...; 0 = can't tell */
+} ramdev_t;
+
 /* the machine, as its firmware describes it (/sys/class/dmi/id, readable by
  * everyone; serial numbers are root-only and left out) */
 typedef struct {
@@ -741,8 +886,35 @@ typedef struct {
     char bios_vendor[64], bios_version[64];
     int bios_date;                        /* YYYYMMDD, 0 = unknown */
     int chassis;                          /* SMBIOS chassis type: 3 desktop, 10 notebook, 35 mini PC...; 0 = unknown */
+    int ram_state;                        /* memory modules: 1 read, -1 needs root, 0 not reported */
+    int nram, ram_slots;                  /* modules in, slots there are */
+    int ram_channels;                     /* channels in use: 1 = single channel; 0 = can't tell */
+    int ram_soldered;                     /* soldered memory (laptops): nothing to move */
+    ramdev_t ram[MAX_RAM];
 } machine_t;
+void smbios_memory(machine_t *m); /* the memory modules (root) */
 int machine_desktop(const machine_t *m); /* a desktop's chassis (or a tower, mini PC, all-in-one) */
+
+/* ------------------------------------------- what keeps a drive busy */
+typedef struct {
+    char mount[128], dev[96], type[16];
+    int usb;                 /* on a USB drive */
+    int nproc, more;         /* processes using it: listed / past the list */
+    int swap, loops, nested; /* swap files on it, loop devices from files on it, file systems mounted inside it */
+    pid_t lastp;             /* private */
+} drvfs_t;
+typedef struct {
+    pid_t pid;
+    uid_t uid;
+    char comm[24];
+    int fs;                  /* the drvfs_t it is about */
+    int cwd, root, exe;      /* its working folder / root / program is there */
+    int nfiles, maps;        /* files it has open there / mapped in (libraries) */
+    char file[160];          /* the first of them */
+} drvuse_t;
+/* who uses each file system (on request: it reads every process's files);
+ * returns how many drvuse_t; *denied = processes that couldn't be checked */
+int busy_scan(drvfs_t *fs, int nfs, drvuse_t *out, int max, int *denied);
 
 /* ------------------------------------------------------------------ USB */
 #define MAX_USB 40

@@ -33,7 +33,7 @@
 
 /* ============================================================ Processes */
 
-enum { K_PID, K_USER, K_PRI, K_NI, K_THR, K_S, K_CPU, K_MEM, K_VIRT, K_RSS, K_RD, K_WR, K_GPU, K_FDS, K_TIME, K_CMD };
+enum { K_PID, K_USER, K_PRI, K_NI, K_THR, K_S, K_CPU, K_MEM, K_VIRT, K_RSS, K_RD, K_WR, K_NET, K_GPU, K_FDS, K_TIME, K_CMD };
 static const struct {
     const char *h;
     int w, right, sort;
@@ -42,7 +42,7 @@ static const struct {
     [K_NI] = { "NI", 3, 1, -1 },           [K_THR] = { "THR", 4, 1, -1 },      [K_S] = { "S", 1, 0, -1 },
     [K_CPU] = { "CPU%", 5, 1, SORT_CPU },  [K_MEM] = { "MEM%", 5, 1, SORT_MEM }, [K_VIRT] = { "VIRT", 6, 1, -1 },
     [K_RSS] = { "RSS", 6, 1, SORT_MEM },   [K_RD] = { "READ/s", 8, 1, SORT_IO }, [K_WR] = { "WRITE/s", 8, 1, SORT_IO },
-    [K_GPU] = { "GPU%", 5, 1, SORT_GPU },  [K_FDS] = { "FILES", 5, 1, SORT_FILES },
+    [K_GPU] = { "GPU%", 5, 1, SORT_GPU },  [K_FDS] = { "FILES", 5, 1, SORT_FILES }, [K_NET] = { "NET/s", 7, 1, SORT_NET },
     [K_TIME] = { "TIME+", 9, 1, SORT_TIME }, [K_CMD] = { "COMMAND", 0, 0, SORT_NAME },
 };
 
@@ -67,6 +67,7 @@ static int cmp_proc(const void *a, const void *b)
     case SORT_TIME: r = cmp_dbl_desc((double)p->ticks, (double)q->ticks); break;
     case SORT_GPU: r = cmp_dbl_desc(p->gpu, q->gpu); break;
     case SORT_FILES: r = cmp_dbl_desc(p->nfds, q->nfds); break;
+    case SORT_NET: r = cmp_dbl_desc(p->net_rx + p->net_tx, q->net_rx + q->net_tx); break;
     }
     if (!r && g_sort != SORT_MEM)
         r = cmp_dbl_desc((double)p->rss, (double)q->rss);
@@ -363,6 +364,18 @@ static void cell_text(proc_t *p, int k, long hz, char *o, size_t n, attr_t *a)
             *a = p->gpu < 0.05 ? A_GRAY : p->gpu >= 85 ? CP(C_CRIT) | A_BOLD : p->gpu >= 50 ? CP(C_WARN) | A_BOLD : A_BOLD;
         }
         break;
+    case K_NET: /* TCP in + out */
+        if (p->net_rx < 0) {
+            str_copy(o, n, p->kthread ? "" : "-");
+            *a = A_GRAY;
+        } else if (p->net_rx + p->net_tx < 1) {
+            str_copy(o, n, "0");
+            *a = A_GRAY;
+        } else {
+            fmt_rate(p->net_rx + p->net_tx, o, n);
+            *a = (p->net_rx >= p->net_tx ? CP(C_IN) : CP(C_OUT)) | A_BOLD;
+        }
+        break;
     case K_FDS: /* thousands of open files usually means a leak */
         if (p->nfds < 0) {
             str_copy(o, n, p->kthread ? "" : "-");
@@ -537,17 +550,18 @@ void draw_procs(sys_t *s, ui_state_t *u, int y, int x, int h, int w, int full)
     static int gpu_seen; /* once a GPU client showed up, keep the column */
     gpu_seen |= ps->gpu_any;
     if (full) {
-        static const int fc[] = { K_PID, K_USER, K_PRI, K_NI, K_THR, K_S, K_CPU, K_MEM, K_VIRT, K_RSS, K_RD, K_WR, K_GPU, K_FDS, K_TIME, K_CMD };
+        static const int fc[] = { K_PID, K_USER, K_PRI, K_NI, K_THR, K_S, K_CPU, K_MEM, K_VIRT, K_RSS, K_RD, K_WR, K_NET, K_GPU, K_FDS, K_TIME, K_CMD };
         for (size_t i = 0; i < sizeof fc / sizeof fc[0]; i++)
-            if (fc[i] != K_GPU || gpu_seen)
+            if ((fc[i] != K_GPU || gpu_seen) && (fc[i] != K_NET || ps->net_ok))
                 cols[nc++] = fc[i];
     } else {
-        static const int dc[] = { K_PID, K_USER, K_S, K_CPU, K_MEM, K_RSS, K_RD, K_WR, K_GPU, K_TIME, K_CMD };
+        static const int dc[] = { K_PID, K_USER, K_S, K_CPU, K_MEM, K_RSS, K_RD, K_WR, K_NET, K_GPU, K_TIME, K_CMD };
         for (size_t i = 0; i < sizeof dc / sizeof dc[0]; i++)
-            if (dc[i] != K_GPU || gpu_seen)
+            if ((dc[i] != K_GPU || gpu_seen) && (dc[i] != K_NET || ps->net_ok))
                 cols[nc++] = dc[i];
     }
-    static const int drop[] = { K_PRI, K_VIRT, K_FDS, K_NI, K_TIME, K_THR, K_GPU, K_WR, K_RD, K_USER };
+    ps->net_want_until = now_sec() + 3; /* the NET column: keep reading it while the list is on screen */
+    static const int drop[] = { K_PRI, K_VIRT, K_FDS, K_NI, K_TIME, K_THR, K_NET, K_GPU, K_WR, K_RD, K_USER };
     for (size_t d = 0; d < sizeof drop / sizeof drop[0]; d++) {
         int used = 0;
         for (int i = 0; i < nc; i++)

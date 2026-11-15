@@ -22,6 +22,7 @@
 #define _GNU_SOURCE
 #include "util.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -157,6 +158,29 @@ int read_hex(const char *path, unsigned *out)
 int path_exists(const char *path)
 {
     return access(path, F_OK) == 0;
+}
+
+int cpulist_parse(const char *s, unsigned char *set, int max)
+{
+    int n = 0;
+    memset(set, 0, (size_t)max);
+    while (*s) {
+        while (*s == ',' || *s == ' ' || *s == '\n')
+            s++;
+        if (!isdigit((unsigned char)*s))
+            break;
+        char *e;
+        long a = strtol(s, &e, 10), b = a;
+        if (*e == '-')
+            b = strtol(e + 1, &e, 10);
+        for (long i = a; i <= b && i < max; i++)
+            if (i >= 0 && !set[i]) {
+                set[i] = 1;
+                n++;
+            }
+        s = e;
+    }
+    return n;
 }
 
 char *next_line(char **cursor)

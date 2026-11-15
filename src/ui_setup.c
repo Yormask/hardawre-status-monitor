@@ -32,17 +32,18 @@
 
 enum {
     OPT_PROCS, OPT_BARS, OPT_GRAPHS, OPT_LEFTW, OPT_COLORS, OPT_SINGLE, OPT_HIGHLIGHT, OPT_SELTEXT,
-    OPT_TITLES, OPT_BACKGROUND, OPT_CORE_BAR, OPT_CORE_VALUES,
-    OPT_NOTIFY, OPT_A_TEMP, OPT_A_THROTTLE, OPT_A_GTEMP, OPT_A_GSLOW, OPT_A_DISK, OPT_A_MEM, OPT_A_FULL, OPT_A_PROBLEMS,
+    OPT_TITLES, OPT_BACKGROUND, OPT_CBLIND, OPT_CORE_BAR, OPT_CORE_VALUES,
+    OPT_NOTIFY, OPT_A_TEMP, OPT_A_THROTTLE, OPT_A_GTEMP, OPT_A_GSLOW, OPT_A_DISK, OPT_A_MEM, OPT_A_FULL, OPT_A_DEVBAT,
+    OPT_A_PROBLEMS,
     OPT_KEEP, OPT_REC, OPT_REC_MIN,
     OPT_INTERVAL, OPT_KTHREADS, OPT_MOUSE, OPT_NETCHECK, OPT_COUNT
 };
 static const char *const OPT_LABEL[OPT_COUNT] = {
     "Process list", "Bar style",   "Graphs",      "Left column width", "Bars & values",  "  Colour",
-    "Highlight",    "Selected text", "Titles",    "Background",
+    "Highlight",    "Selected text", "Titles",    "Background", "Colour-blind safe",
     "Bars show",    "Other values",
     "Alert by",     "CPU hotter than", "CPU throttling", "GPU hotter than", "GPU slowing", "Disk slower than",
-    "Memory left below", "Disk fuller than", "Problems",
+    "Memory left below", "Disk fuller than", "Device battery at", "Problems",
     "Delete logs after", "Flight recorder", "  Keeps the last",
     "Refresh interval",  "Kernel threads", "Mouse", "Network check",
 };
@@ -56,6 +57,7 @@ static const int A_TEMPS[] = { 0, 70, 75, 80, 85, 90, 95, 100 };
 static const int A_DISKS[] = { 0, 100, 200, 500, 1000, 2000, 5000 };
 static const int A_MEMS[] = { 0, 2, 5, 10, 15, 20 };
 static const int A_FULLS[] = { 0, 80, 85, 90, 95, 98 };
+static const int A_DEVBATS[] = { 0, 5, 10, 15, 20, 25, 30 };
 static const int REC_MINS[] = { 2, 5, 10, 30 };
 #define NLEFTW ((int)(sizeof LEFTW / sizeof LEFTW[0]))
 #define NSTEPS ((int)(sizeof STEPS / sizeof STEPS[0]))
@@ -111,6 +113,7 @@ static int build_rows(const ui_state_t *u, row_t *r)
     ROW(K_OPT, OPT_SELTEXT);
     ROW(K_OPT, OPT_TITLES);
     ROW(K_OPT, OPT_BACKGROUND);
+    ROW(K_OPT, OPT_CBLIND);
     BLANK();
     HEAD("CPU cores");
     ROW(K_OPT, OPT_CORE_BAR);
@@ -125,6 +128,7 @@ static int build_rows(const ui_state_t *u, row_t *r)
     ROW(K_OPT, OPT_A_DISK);
     ROW(K_OPT, OPT_A_MEM);
     ROW(K_OPT, OPT_A_FULL);
+    ROW(K_OPT, OPT_A_DEVBAT);
     ROW(K_OPT, OPT_A_PROBLEMS);
     ROW(K_ACT, ACT_TEST_ALERT);
     BLANK();
@@ -226,6 +230,7 @@ static void opt_value(const ui_state_t *u, int o, char *out, size_t n)
     case OPT_TITLES: str_copy(out, n, l->title_color ? TXT_NAME[l->title_color] : "Automatic (cyan)"); break;
     case OPT_CORE_BAR: str_copy(out, n, CORE_NAME[l->core_bar]); break;
     case OPT_CORE_VALUES: str_copy(out, n, l->core_values ? "Shown" : "Hidden"); break;
+    case OPT_CBLIND: str_copy(out, n, l->colorblind ? "On" : "Off"); break;
     case OPT_NOTIFY: str_copy(out, n, NOTIFY_NAME[u->alert_notify]); break;
     case OPT_A_TEMP: off_or(out, n, u->alert_cpu_temp, U ? "%d °C" : "%d C"); break;
     case OPT_A_THROTTLE: str_copy(out, n, u->alert_throttle ? "Alert" : "Off"); break;
@@ -234,6 +239,7 @@ static void opt_value(const ui_state_t *u, int o, char *out, size_t n)
     case OPT_A_DISK: off_or(out, n, u->alert_disk_ms, "%d ms"); break;
     case OPT_A_MEM: off_or(out, n, u->alert_mem_pct, "%d%%"); break;
     case OPT_A_FULL: off_or(out, n, u->alert_disk_full, "%d%%"); break;
+    case OPT_A_DEVBAT: off_or(out, n, u->alert_devbat, "%d%%"); break;
     case OPT_A_PROBLEMS: str_copy(out, n, u->alert_problems ? "Alert" : "Off"); break;
     case OPT_KEEP: keep_text(u->log_keep_days, out, n); break;
     case OPT_REC: str_copy(out, n, u->rec_on ? "On" : "Off"); break;
@@ -285,6 +291,7 @@ static void opt_change(ui_state_t *u, int o, int dir)
     }
     case OPT_CORE_BAR: l->core_bar = cyc(l->core_bar, dir, CORE_COUNT); break;
     case OPT_CORE_VALUES: l->core_values ^= 1; break;
+    case OPT_CBLIND: l->colorblind ^= 1; break;
     case OPT_NOTIFY: u->alert_notify = cyc(u->alert_notify, dir, ALERT_COUNT); break;
     case OPT_A_TEMP: u->alert_cpu_temp = step_list(A_TEMPS, COUNT(A_TEMPS), u->alert_cpu_temp, dir); break;
     case OPT_A_THROTTLE: u->alert_throttle ^= 1; break;
@@ -293,6 +300,7 @@ static void opt_change(ui_state_t *u, int o, int dir)
     case OPT_A_DISK: u->alert_disk_ms = step_list(A_DISKS, COUNT(A_DISKS), u->alert_disk_ms, dir); break;
     case OPT_A_MEM: u->alert_mem_pct = step_list(A_MEMS, COUNT(A_MEMS), u->alert_mem_pct, dir); break;
     case OPT_A_FULL: u->alert_disk_full = step_list(A_FULLS, COUNT(A_FULLS), u->alert_disk_full, dir); break;
+    case OPT_A_DEVBAT: u->alert_devbat = step_list(A_DEVBATS, COUNT(A_DEVBATS), u->alert_devbat, dir); break;
     case OPT_A_PROBLEMS: u->alert_problems ^= 1; break;
     case OPT_KEEP:
         u->log_keep_days = step_list(KEEP_DAYS, NKEEP, u->log_keep_days, dir);
@@ -501,6 +509,12 @@ static void option_row(ui_state_t *u, int o, int y, int x, int w, int sel, int i
         put(y, xx, sw, CP(C_SEL) | A_BOLD, " %-*s", sw - 1, "selected row");
     } else if (o == OPT_TITLES) {
         put(y, xx, room, CP(C_TITLE) | A_BOLD, "Dashboard panels  Sensors");
+    } else if (o == OPT_CBLIND) { /* the three levels, as they look now */
+        int x2 = xx;
+        x2 += put(y, x2, room, CP(C_OK) | A_BOLD, "fine ");
+        x2 += put(y, x2, xx + room - x2, CP(C_WARN) | A_BOLD, "high ");
+        x2 += put(y, x2, xx + room - x2, CP(C_CRIT) | A_BOLD, "too high ");
+        put(y, x2, xx + room - x2, A_GRAY, "%s", u->lay.colorblind ? "(blue, yellow, red)" : "(green next to red)");
     } else if (o == OPT_BACKGROUND && u->lay.background == 0) {
         put(y, xx, room, A_GRAY, "same as your terminal");
     } else if (o == OPT_GRAPHS) {
@@ -524,6 +538,7 @@ static void option_row(ui_state_t *u, int o, int y, int x, int w, int sel, int i
         case OPT_A_DISK: hint = "per request, for 10 s"; break;
         case OPT_A_MEM: hint = "of memory available"; break;
         case OPT_A_FULL: hint = "space or inodes used"; break;
+        case OPT_A_DEVBAT: hint = "wireless mouse, keyboard, headset, controller"; break;
         case OPT_A_PROBLEMS: hint = "freezes, kernel errors, OOM, bad drives"; break;
         case OPT_CORE_VALUES: hint = u->lay.core_values ? "the other two, as numbers" : "only the bar's own value"; break;
         case OPT_KEEP: hint = u->log_keep_days ? "only hsm's own CSV files" : "logs are kept"; break;

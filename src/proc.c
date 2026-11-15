@@ -27,12 +27,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pwd.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #define PF_KTHREAD 0x00200000u
@@ -522,6 +524,113 @@ int proc_renice(pid_t pid, unsigned long long start, int nice)
     else if (!done && !err)
         done = 1;
     return done ? 0 : err ? err : ESRCH;
+}
+
+/* every thread of a process, as renice and taskset -a do: fn(tid) returns 0
+ * or errno. 0 when at least one thread took it. */
+static int each_thread(pid_t pid, int (*fn)(pid_t tid, const void *arg), const void *arg)
+{
+    char path[PATHBUF];
+    sfmt(path, sizeof path, "%s/%d/task", g_procfs, (int)pid);
+    DIR *d = opendir(path);
+    int done = 0, err = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL) {
+        char *end;
+        long tid = strtol(e->d_name, &end, 10);
+        if (*end || tid <= 0)
+            continue;
+        int r = fn((pid_t)tid, arg);
+        if (!r)
+            done++;
+        else if (r != ESRCH)
+            err = r;
+    }
+    if (d)
+        closedir(d);
+    if (!done && !err && !d) /* no task list to read */
+        return fn(pid, arg);
+    return done && !err ? 0 : err ? err : done ? 0 : ESRCH;
+}
+
+/* ------------------------------------------- which CPUs it may run on */
+
+int proc_affinity_get(pid_t pid, unsigned char *set, int max)
+{
+    cpu_set_t cs;
+    CPU_ZERO(&cs);
+    if (sched_getaffinity(pid, sizeof cs, &cs))
+        return -errno;
+    int n = 0;
+    for (int i = 0; i < max; i++) {
+        set[i] = i < CPU_SETSIZE && CPU_ISSET(i, &cs);
+        n += set[i];
+    }
+    return n;
+}
+
+static int aff_one(pid_t tid, const void *arg)
+{
+    return sched_setaffinity(tid, sizeof(cpu_set_t), (const cpu_set_t *)arg) ? errno : 0;
+}
+
+int proc_affinity_set(pid_t pid, unsigned long long start, const unsigned char *set, int max)
+{
+    int r = same_process(pid, start);
+    if (r)
+        return r;
+    cpu_set_t cs;
+    CPU_ZERO(&cs);
+    int n = 0;
+    for (int i = 0; i < max && i < CPU_SETSIZE; i++)
+        if (set[i]) {
+            CPU_SET(i, &cs);
+            n++;
+        }
+    return n ? each_thread(pid, aff_one, &cs) : EINVAL;
+}
+
+/* ------------------------------------------------------- disk priority */
+/* ioprio: the class in the top bits, the level (0 first ... 7 last) below.
+ * Class "none" means best effort at a level that follows the nice value. */
+enum { IOP_WHO_PROCESS = 1, IOP_SHIFT = 13 };
+
+int proc_ioprio_get(pid_t pid, int *cls, int *level)
+{
+#ifdef SYS_ioprio_get
+    long v = syscall(SYS_ioprio_get, IOP_WHO_PROCESS, (int)pid);
+    if (v < 0)
+        return errno;
+    *cls = (int)(v >> IOP_SHIFT) & 7;
+    *level = (int)(v & 7);
+    return 0;
+#else
+    (void)pid, (void)cls, (void)level;
+    return ENOSYS;
+#endif
+}
+
+#ifdef SYS_ioprio_set
+static int iop_one(pid_t tid, const void *arg)
+{
+    return syscall(SYS_ioprio_set, IOP_WHO_PROCESS, (int)tid, *(const int *)arg) ? errno : 0;
+}
+#endif
+
+int proc_ioprio_set(pid_t pid, unsigned long long start, int cls, int level)
+{
+#ifdef SYS_ioprio_set
+    int r = same_process(pid, start);
+    if (r)
+        return r;
+    if (cls < IOP_NONE || cls > IOP_IDLE || level < 0 || level > 7)
+        return EINVAL;
+    int v = cls << IOP_SHIFT | (cls == IOP_IDLE || cls == IOP_NONE ? 0 : level);
+    return each_thread(pid, iop_one, &v);
+#else
+    (void)pid, (void)start, (void)cls, (void)level;
+    return ENOSYS;
+#endif
 }
 
 const char *proc_cmdline(proc_t *p)

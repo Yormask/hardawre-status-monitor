@@ -35,7 +35,7 @@ static layout_t g_default_lay;
 const layout_t *g_lay = &g_default_lay;
 static int g_colors;
 
-const char *const SORT_NAMES[] = { "CPU%", "MEM%", "DISK I/O", "PID", "NAME", "TIME", "GPU%", "FILES" };
+const char *const SORT_NAMES[] = { "CPU%", "MEM%", "DISK I/O", "PID", "NAME", "TIME", "GPU%", "FILES", "NETWORK" };
 const char *const VIEW_NAMES[] = { "Dashboard", "Processes", "Hardware", "Setup",
                                    "Logging",   "Services",  "Events",   "History" };
 
@@ -44,6 +44,15 @@ static const char *const HB[8] = { "", "▏", "▎", "▍", "▌", "▋", "▊",
 
 
 /* ================================================================ setup */
+
+/* the drawing settings, without a screen (hsm --report) */
+void ui_headless(const layout_t *l, int utf8)
+{
+    U = utf8;
+    SEP = U ? " · " : " | ";
+    DEG = U ? "°C" : "C";
+    g_lay = l;
+}
 
 int ui_init(int utf8)
 {
@@ -156,8 +165,39 @@ void hit_reset(void)
     g_nhits = 0;
 }
 
+/* capture mode: put() records its text instead of drawing it (the Hardware
+ * view's search runs the whole view once this way, below the screen) */
+#define CAP_SEGS 6000
+#define CAP_POOL (512 * 1024)
+static struct {
+    int on, y0, nseg, used;
+    capseg_t seg[CAP_SEGS];
+    char pool[CAP_POOL];
+} g_cap;
+
+void cap_begin(int y0)
+{
+    g_cap.on = 1;
+    g_cap.y0 = y0;
+    g_cap.nseg = g_cap.used = 0;
+}
+
+int cap_end(const capseg_t **segs)
+{
+    g_cap.on = 0;
+    *segs = g_cap.seg;
+    return g_cap.nseg;
+}
+
+int cap_on(void)
+{
+    return g_cap.on;
+}
+
 void hit_add(int y, int x, int h, int w, int kind, int a, int b)
 {
+    if (g_cap.on)
+        return;
     if (g_nhits >= MAX_HITS || h <= 0 || w <= 0)
         return;
     g_hits[g_nhits++] = (hit_t){ y, x, h, w, kind, a, b };
@@ -252,9 +292,13 @@ static void init_colors(const layout_t *l)
     short tt = TXT_COLOR[CLAMP(l->title_color, 0, TXT_COUNT - 1)];
     text_pair(C_TITLE, tt < 0 ? COLOR_CYAN : tt);
     init_pair(C_BORDER, border, g_bg);
-    text_pair(C_OK, COLOR_GREEN);
+    /* colour-blind safe: nothing green next to red (the most common colour
+     * blindness can't tell them apart): blue for fine, yellow, then a bright red */
+    short good = l->colorblind ? (COLORS >= 16 ? 12 : COLOR_BLUE) : COLOR_GREEN;
+    short bad = l->colorblind && COLORS >= 16 ? 9 : COLOR_RED;
+    text_pair(C_OK, good);
     text_pair(C_WARN, COLOR_YELLOW);
-    text_pair(C_CRIT, COLOR_RED);
+    text_pair(C_CRIT, bad);
     init_pair(C_GRAY, gray, g_bg);
     block_pair(C_HDR, hl, st);
     block_pair(C_THEAD, COLOR_GREEN, -1);
@@ -262,15 +306,15 @@ static void init_colors(const layout_t *l)
     text_pair(C_ACC, COLOR_MAGENTA);
     text_pair(C_INFO, COLOR_CYAN);
     block_pair(C_KEY, hl, st);
-    text_pair(C_IN, COLOR_CYAN);
-    text_pair(C_OUT, COLOR_MAGENTA);
-    text_pair(C_BLO, COLOR_GREEN);
+    text_pair(C_IN, l->colorblind ? good : COLOR_CYAN); /* blue and yellow: apart for every kind of colour blindness */
+    text_pair(C_OUT, l->colorblind ? COLOR_YELLOW : COLOR_MAGENTA);
+    text_pair(C_BLO, good);
     text_pair(C_BMID, COLOR_YELLOW);
-    text_pair(C_BHI, COLOR_RED);
+    text_pair(C_BHI, bad);
     init_pair(C_TRACK, gray, g_bg);
-    text_pair(C_GLO, COLOR_GREEN);
+    text_pair(C_GLO, good);
     text_pair(C_GMID, COLOR_YELLOW);
-    text_pair(C_GHI, COLOR_RED);
+    text_pair(C_GHI, bad);
     text_pair(C_SINGLE, SINGLE_COLOR[CLAMP(l->single_color, 0, SINGLE_COUNT - 1)]);
     init_pair(C_BASE, g_fg, g_bg);
     bkgd(COLOR_PAIR(C_BASE) | ' '); /* plain text and empty space take the background */
@@ -279,10 +323,10 @@ static void init_colors(const layout_t *l)
 /* (re)build the colour pairs when the colour settings change */
 void colors_sync(const layout_t *l)
 {
-    static int last[5] = { -1 };
+    static int last[6] = { -1 };
     if (!g_colors)
         return;
-    int key[5] = { l->single_color, l->highlight, l->background, l->sel_text, l->title_color };
+    int key[6] = { l->single_color, l->highlight, l->background, l->sel_text, l->title_color, l->colorblind };
     if (!memcmp(key, last, sizeof key))
         return;
     memcpy(last, key, sizeof key);
@@ -389,6 +433,28 @@ static attr_t legible(attr_t a)
 
 int put(int y, int x, int maxw, attr_t a, const char *fmt, ...)
 {
+    if (g_cap.on) { /* record, don't draw: the width it would have taken */
+        if (maxw <= 0 || y < g_cap.y0 || x < 0 || x >= COLS)
+            return 0;
+        if (x + maxw > COLS)
+            maxw = COLS - x;
+        char buf[1024];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof buf, fmt, ap);
+        va_end(ap);
+        buf[utf8_bytes_for_cols(buf, maxw)] = '\0';
+        size_t l = strlen(buf);
+        if (g_cap.nseg < CAP_SEGS && g_cap.used + (int)l + 1 <= CAP_POOL) {
+            capseg_t *sg = &g_cap.seg[g_cap.nseg++];
+            sg->line = y - g_cap.y0;
+            sg->x = x;
+            sg->text = g_cap.pool + g_cap.used;
+            memcpy(g_cap.pool + g_cap.used, buf, l + 1);
+            g_cap.used += (int)l + 1;
+        }
+        return utf8_cols(buf);
+    }
     if (maxw <= 0 || y < 0 || y >= LINES || x < 0 || x >= COLS)
         return 0;
     a = legible(a);
