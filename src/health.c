@@ -154,6 +154,14 @@ int health_alert(const health_t *h, char *out, size_t n)
         what[k++] = "drive warning";
         lvl = 2;
     }
+    if (h->arr.nbad > 0) { /* a degraded or failed array, a pool not ONLINE */
+        what[k++] = "RAID degraded";
+        lvl = 2;
+    }
+    if (h->ecc.ok && h->ecc.ue > 0) { /* ECC found data it couldn't fix since boot */
+        what[k++] = "memory errors";
+        lvl = 2;
+    }
     if (h->ro_last > 0 && now - h->ro_last < 10) {
         what[k++] = "disk read-only";
         lvl = 2;
@@ -291,7 +299,10 @@ void health_blame(const procs_t *ps, int what, char *out, size_t n)
     }
 }
 
-static void throttle_sample(health_t *h, const cpu_t *c, const procs_t *ps, double dt, double now)
+/* quiet: the computer has just woken up. Waking, the CPU can report
+ * throttling it didn't do (at 50 °C, say): the counters move on, nothing
+ * is told, and the jump doesn't count as throttling since hsm started. */
+static void throttle_sample(health_t *h, const cpu_t *c, const procs_t *ps, double dt, double now, int quiet)
 {
     if (!c->ncpu)
         return;
@@ -303,7 +314,8 @@ static void throttle_sample(health_t *h, const cpu_t *c, const procs_t *ps, doub
     }
     if (!h->thr_ok)
         return;
-    int first = !h->thr_start && !h->thr_count && !h->core_count; /* baseline on the first read */
+    int first = !h->thr_primed; /* baseline on the first read */
+    unsigned long long before = h->thr_count + h->core_count;
 
     /* packages */
     for (int i = 0; i < c->ncpu; i++) {
@@ -327,7 +339,7 @@ static void throttle_sample(health_t *h, const cpu_t *c, const procs_t *ps, doub
         thr_read(t->cpu, "package_throttle_count", &n);
         int has_ms = thr_read(t->cpu, "package_throttle_total_time_ms", &m) == 0;
         t->pct = 0;
-        if (t->p_count != (unsigned long long)-1 && dt > 0) {
+        if (t->p_count != (unsigned long long)-1 && dt > 0 && !quiet) {
             if (n > t->p_count)
                 events++;
             if (has_ms && m >= t->p_ms)
@@ -359,7 +371,7 @@ static void throttle_sample(health_t *h, const cpu_t *c, const procs_t *ps, doub
         if (thr_read(id, "core_throttle_count", &n))
             continue;
         int has_ms = thr_read(id, "core_throttle_total_time_ms", &m) == 0;
-        if (!first && dt > 0) {
+        if (!first && dt > 0 && !quiet) {
             if (n > h->core_cnt[id])
                 events++;
             if (has_ms && m >= h->core_ms[id])
@@ -375,6 +387,10 @@ static void throttle_sample(health_t *h, const cpu_t *c, const procs_t *ps, doub
     h->thr_pct = worst;
     if (first)
         h->thr_start = cnt + ccnt;
+    else if (quiet && cnt + ccnt > before)
+        h->thr_start += cnt + ccnt - before;
+    h->thr_start = MIN(h->thr_start, cnt + ccnt); /* counters that started over */
+    h->thr_primed = 1;
     if (events) {
         h->thr_last = now;
         if (now - h->thr_ev_t >= 60) {
@@ -581,21 +597,28 @@ static void nvme_links(health_t *h)
 }
 
 /* A graphics card under load on a slower link than it and its slot can do
- * (idle ones slow the link down to save power: that's normal) */
-static void gpu_links(health_t *h, gpus_t *gs)
+ * (idle ones slow the link down to save power: that's normal). A laptop has
+ * no slot: the lanes to its GPU are wired on the board, often 8 of the 16
+ * the chip and the processor could do, so only a lower PCIe generation
+ * counts there. */
+static void gpu_links(health_t *h, gpus_t *gs, int laptop)
 {
     for (int i = 0; i < gs->n; i++) {
         gpu_t *g = &gs->g[i];
         int low = g->util >= 50 && g->pcie_gen > 0 && g->pcie_gen_max > 0 &&
-                  (g->pcie_gen < g->pcie_gen_max || g->pcie_width < g->pcie_width_max);
+                  (g->pcie_gen < g->pcie_gen_max || (!laptop && g->pcie_width < g->pcie_width_max));
         g->pcie_slow_n = low ? g->pcie_slow_n + 1 : 0;
         if (g->pcie_slow_n >= 10 && !g->pcie_told) {
             g->pcie_told = 1;
             char gn[16];
             sfmt(gn, sizeof gn, gs->n > 1 ? "GPU%d" : "The GPU", i);
-            health_event(h, EV_WARN, "gpu", "%s runs at PCIe %d.0 x%d under load, though it and its slot can do %d.0 x%d: "
-                         "a riser cable, the slot or a BIOS setting", gn, g->pcie_gen, g->pcie_width, g->pcie_gen_max,
-                         g->pcie_width_max);
+            if (laptop)
+                health_event(h, EV_WARN, "gpu", "%s runs at PCIe %d.0 under load, though it and the laptop can do %d.0: "
+                             "a BIOS setting or the graphics driver", gn, g->pcie_gen, g->pcie_gen_max);
+            else
+                health_event(h, EV_WARN, "gpu", "%s runs at PCIe %d.0 x%d under load, though it and its slot can do "
+                             "%d.0 x%d: a riser cable, the slot or a BIOS setting", gn, g->pcie_gen, g->pcie_width,
+                             g->pcie_gen_max, g->pcie_width_max);
         }
     }
 }
@@ -937,6 +960,12 @@ int event_explain(const char *cat, const char *text, char *out, size_t n)
     }
     if (strstr(text, "nder-voltage")) {
         str_copy(out, n, "The power supply delivered too little voltage: use a stronger power supply.");
+        return 1;
+    }
+    if (!strcmp(cat, "slow") && strstr(text, "the screens of")) {
+        str_copy(out, n, "hsm reads everything in turn, so its screen waits for a slow reading. The graphics driver "
+                         "answers about the screens only between its own checks of them, which the desktop starts when "
+                         "a game starts or quits, or a screen comes or goes. Harmless.");
         return 1;
     }
     if (!strcmp(cat, "slow")) {
@@ -1415,6 +1444,174 @@ static void temp_events(health_t *h, sensors_t *S, const procs_t *ps, double now
  * event when one has been held back for a while (heat or its power limit is
  * normal for a laptop GPU under load: information; the hardware stepping in
  * is a warning) */
+/* a wired port linked slower than both ends can do (a damaged cable), or at
+ * half duplex: once per link-up and speed */
+static void eth_events(health_t *h, net_t *nt)
+{
+    for (int i = 0; i < nt->n; i++) {
+        netif_t *f = &nt->i[i];
+        int key = !f->eth_slow ? 0 : f->eth_slow == ETH_HALF ? -2 : f->speed;
+        if (key && key != f->eth_told) {
+            char now[16], mx[16];
+            eth_speed(f->speed, now, sizeof now);
+            /* what both can do: the slower end's most */
+            eth_speed(f->eth_slow == ETH_CABLE ? MIN(f->eth_max, f->eth_peer) : f->eth_max, mx, sizeof mx);
+            if (f->eth_slow == ETH_CABLE)
+                health_event(h, EV_WARN, "net", "%s linked at %s, though both ends can do %s: a damaged cable, or one "
+                             "with only 2 of its 4 pairs; try another cable", f->name, now, mx);
+            else if (f->eth_slow == ETH_SLOWER)
+                health_event(h, EV_WARN, "net", "%s linked at %s, though it can do %s: the cable, or the other end only "
+                             "does %s", f->name, now, mx, now);
+            else
+                health_event(h, EV_WARN, "net", "%s runs at half duplex (%s): the other end doesn't negotiate (set both "
+                             "to auto), or a bad cable; it loses packets under load", f->name, now);
+        }
+        f->eth_told = key;
+    }
+}
+
+/* ECC memory: errors it fixed, and ones it couldn't */
+static void ecc_events(health_t *h)
+{
+    ecc_t *e = &h->ecc;
+    if (!e->ok)
+        return;
+    if (e->primed && (e->ce > e->ce_seen || e->ue > e->ue_seen)) {
+        char where[64] = ""; /* the module whose count went up, when it's one */
+        int nmod = 0;
+        for (int i = 0; i < e->ndimm && e->nseen == e->ndimm; i++)
+            if (e->dimm[i].ce > e->dce_seen[i] || e->dimm[i].ue > e->due_seen[i]) {
+                if (!nmod++)
+                    sfmt(where, sizeof where, " on %s", e->dimm[i].label);
+            }
+        if (nmod != 1)
+            where[0] = '\0';
+        if (e->ue > e->ue_seen)
+            health_event(h, EV_ERR, "memory", "Memory: %lld uncorrected error%s%s: ECC couldn't fix the data; replace the module",
+                         e->ue - e->ue_seen, e->ue - e->ue_seen == 1 ? "" : "s", where);
+        if (e->ce > e->ce_seen)
+            health_event(h, EV_WARN, "memory", "Memory: %lld corrected error%s%s (%lld since boot): ECC fixed them, but a "
+                         "module that keeps making them is wearing out", e->ce - e->ce_seen,
+                         e->ce - e->ce_seen == 1 ? "" : "s", where, e->ce);
+    }
+    e->ce_seen = e->ce;
+    e->ue_seen = e->ue;
+    e->nseen = e->ndimm;
+    for (int i = 0; i < e->ndimm; i++) {
+        e->dce_seen[i] = e->dimm[i].ce;
+        e->due_seen[i] = e->dimm[i].ue;
+    }
+    e->primed = 1;
+}
+
+/* RAID arrays and pools: degraded, back, rebuilds and checks, new btrfs errors */
+static void array_events(health_t *h, double now)
+{
+    for (int i = 0; i < h->arr.n; i++) {
+        array_t *a = &h->arr.a[i];
+        char lv[32], why[48], who[96];
+        array_level(a, lv, sizeof lv);
+        int bad = array_problem(a, why, sizeof why) == 2;
+        if (a->kind == ARR_BTRFS)
+            sfmt(who, sizeof who, "btrfs %s", a->name);
+        else if (a->kind == ARR_ZFS)
+            sfmt(who, sizeof who, "ZFS pool %s", a->name);
+        else
+            sfmt(who, sizeof who, "%s (%s)", a->name, lv);
+        if (bad && !a->told_bad) {
+            char failed[96] = "";
+            int work = 0;
+            for (int k = 0; k < a->nmem; k++) {
+                const member_t *m = &a->mem[k];
+                if (m->bad && strlen(failed) + strlen(m->name) + 2 < sizeof failed)
+                    sfmt(failed + strlen(failed), sizeof failed - strlen(failed), "%s%s", failed[0] ? ", " : "", m->name);
+                work += !m->bad && !m->spare;
+            }
+            const char *at = a->primed ? "" : " (found at start)";
+            if (a->kind == ARR_ZFS)
+                health_event(h, EV_ERR, "disk", "%s is %s%s: 'zpool status -v %s' says which disk", who, a->state, at, a->name);
+            else if (a->kind == ARR_BTRFS)
+                health_event(h, EV_ERR, "disk", "%s is missing a device%s%s%s: replace it ('btrfs replace')", who,
+                             failed[0] ? " (" : "", failed, failed[0] ? ")" : "");
+            else if (a->degraded > 0)
+                health_event(h, EV_ERR, "disk", "%s is degraded%s: %d of %d disks work%s%s%s; replace the disk and let it rebuild",
+                             who, at, work, a->ndisks, failed[0] ? " (" : "", failed, failed[0] ? " failed)" : "");
+            else
+                health_event(h, EV_ERR, "disk", "%s has %s%s", who, why, at);
+            a->told_bad = 1;
+        } else if (!bad && a->told_bad) {
+            a->told_bad = 0;
+            if (a->kind == ARR_ZFS)
+                health_event(h, EV_INFO, "disk", "%s is ONLINE again", who);
+            else if (a->kind == ARR_BTRFS)
+                health_event(h, EV_INFO, "disk", "%s has all its devices again", who);
+            else
+                health_event(h, EV_INFO, "disk", "%s is whole again: all %d disks in sync", who, a->ndisks);
+        }
+        if (a->kind == ARR_MD) { /* rebuilds, resyncs and checks starting and ending */
+            int run = a->sync[0] && strcmp(a->sync, "idle") && strcmp(a->sync, "frozen");
+            int was = a->told_sync[0] && strcmp(a->told_sync, "idle") && strcmp(a->told_sync, "frozen");
+            if (run && (!was || strcmp(a->sync, a->told_sync))) {
+                a->sync_from = a->primed ? now : 0; /* running already when hsm started: how long is unknown */
+                char onto[48] = "";
+                for (int k = 0; k < a->nmem; k++)
+                    if (a->mem[k].spare && !a->mem[k].bad && !onto[0])
+                        sfmt(onto, sizeof onto, " onto %s", a->mem[k].name);
+                if (!a->primed)
+                    ; /* already running when hsm started: the Health panel shows it */
+                else if (!strcmp(a->sync, "recover"))
+                    health_event(h, EV_INFO, "disk", "%s: rebuilding%s", who, onto);
+                else if (!strcmp(a->sync, "resync"))
+                    health_event(h, EV_INFO, "disk", "%s: resyncing (after an unclean shutdown, or a new array)", who);
+                else if (!strcmp(a->sync, "check") || !strcmp(a->sync, "repair"))
+                    health_event(h, EV_INFO, "disk", "%s: %s started (reads all the copies and compares them)", who, a->sync);
+                else
+                    health_event(h, EV_INFO, "disk", "%s: %s started", who, a->sync);
+            } else if (!run && was && a->primed) {
+                char took[32] = "";
+                if (a->sync_from > 0)
+                    fmt_duration(now - a->sync_from, took, sizeof took);
+                const char *what = !strcmp(a->told_sync, "recover") ? "rebuild" : a->told_sync;
+                if ((!strcmp(a->told_sync, "check") || !strcmp(a->told_sync, "repair")) && a->mismatch > 0)
+                    health_event(h, EV_WARN, "disk", "%s: %s finished%s%s: %lld sectors differ between the copies", who, what,
+                                 took[0] ? " in " : "", took, a->mismatch);
+                else
+                    health_event(h, EV_INFO, "disk", "%s: %s finished%s%s", who, what, took[0] ? " in " : "", took);
+                a->sync_from = 0;
+            }
+            str_copy(a->told_sync, sizeof a->told_sync, a->sync[0] ? a->sync : "idle");
+        }
+        if (a->kind == ARR_BTRFS) { /* error counters that went up (they count since the file system was made) */
+            for (int k = 0; k < a->nmem; k++) {
+                const member_t *m = &a->mem[k];
+                int j = 0;
+                while (j < a->nprev && a->prev[j].id != m->id)
+                    j++;
+                if (j < a->nprev && a->primed) {
+                    static const char *const K[BE_N] = { "write", "read", "flush", "corruption", "generation" };
+                    char grew[96] = "";
+                    for (int x = 0; x < BE_N; x++)
+                        if (m->err[x] > a->prev[j].err[x])
+                            sfmt(grew + strlen(grew), sizeof grew - strlen(grew), "%s%lld %s", grew[0] ? ", " : "",
+                                 m->err[x] - a->prev[j].err[x], K[x]);
+                    if (grew[0])
+                        health_event(h, EV_ERR, "disk", "%s: new errors on %s: %s%s", who, m->name, grew,
+                                     m->err[BE_CORRUPT] > a->prev[j].err[BE_CORRUPT]
+                                         ? " (data that fails its checksum; a scrub repairs it from a second copy)"
+                                         : "");
+                }
+                if (j == a->nprev && j < MAX_MEMBERS)
+                    a->nprev++;
+                if (j < MAX_MEMBERS) {
+                    a->prev[j].id = m->id;
+                    memcpy(a->prev[j].err, m->err, sizeof m->err);
+                }
+            }
+        }
+        a->primed = 1;
+    }
+}
+
 /* the battery running down although the charger is plugged in: the charger
  * gives less than the laptop uses (a phone charger, a weak cable) */
 static void drain_events(health_t *h, power_t *p, double mono)
@@ -1679,7 +1876,8 @@ void health_sample(sys_t *s)
     for (int i = 0; i < 3; i++)
         psi_sample(&h->psi[i], psi_name[i], dt);
 
-    throttle_sample(h, &s->cpu, &s->procs, dt, now);
+    /* the sample that spans a suspend, and a few seconds after it */
+    throttle_sample(h, &s->cpu, &s->procs, dt, now, s->woke_t > 0 && mono - s->woke_t < 5.0);
 
     if (s->mem.oom_ok) {
         if (!h->primed)
@@ -1708,6 +1906,7 @@ void health_sample(sys_t *s)
     fan_events(h, &s->sens, now, mono);
     limit_events(h, &s->sens, now, mono);
     link_events(h, &s->net, now);
+    eth_events(h, &s->net);
     netq_events(h, &s->net, now);
     for (int i = 0; i < s->gpus.n; i++) { /* a screen on the GPU that could sleep: it can't any more */
         gpu_t *g = &s->gpus.g[i];
@@ -1759,6 +1958,12 @@ void health_sample(sys_t *s)
             h->files = a;
             h->files_max = m;
         }
+        t0 = now_sec();
+        arrays_sample(&h->arr);
+        array_events(h, now);
+        slow_part(h, t0, "the RAID arrays");
+        ecc_sample(&h->ecc);
+        ecc_events(h);
         if (h->governor[0] && s->cpu.governor[0] && strcmp(h->governor, s->cpu.governor))
             health_event(h, EV_INFO, "cpu", "CPU governor changed from %s to %s", h->governor, s->cpu.governor);
         str_copy(h->governor, sizeof h->governor, s->cpu.governor);
@@ -1768,7 +1973,7 @@ void health_sample(sys_t *s)
         link_t = mono;
         nvme_links(h);
     }
-    gpu_links(h, &s->gpus);
+    gpu_links(h, &s->gpus, machine_laptop(&s->mach, &s->power));
     if (h->nnvme && mono >= h->next_nvme) {
         h->next_nvme = mono + NVME_EVERY;
         t0 = now_sec();

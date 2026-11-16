@@ -229,8 +229,8 @@ void fs_sample(disks_t *ds)
     ds->nfs = 0;
     char *cur = buf, *line;
     while ((line = next_line(&cur)) != NULL && ds->nfs < MAX_FS) {
-        char dev[96], mnt[256], type[16];
-        if (sscanf(line, "%95s %255s %15s", dev, mnt, type) != 3 || !fs_type_ok(type))
+        char dev[96], mnt[256], type[16], opts[512] = "";
+        if (sscanf(line, "%95s %255s %15s %511s", dev, mnt, type, opts) < 3 || !fs_type_ok(type))
             continue;
         int dup = 0;
         for (int i = 0; i < ds->nfs; i++)
@@ -252,5 +252,9 @@ void fs_sample(disks_t *ds)
         f->files = sv.f_files; /* 0 on btrfs, vfat...: no fixed number of files */
         f->ffree = sv.f_ffree <= sv.f_files ? sv.f_ffree : sv.f_files;
         f->readonly = (sv.f_flag & ST_RDONLY) != 0;
+        f->discard = 0; /* "discard", "discard=async" (btrfs), not "nodiscard" */
+        for (const char *o = opts; (o = strstr(o, "discard")) != NULL; o += 7)
+            if (o == opts || o[-1] == ',')
+                f->discard = 1;
     }
 }

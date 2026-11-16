@@ -81,6 +81,16 @@ int machine_desktop(const machine_t *m)
     return 0;
 }
 
+int machine_laptop(const machine_t *m, const power_t *p)
+{
+    /* portable, laptop, notebook, hand held, sub notebook, tablet, convertible, detachable */
+    static const int lap[] = { 8, 9, 10, 11, 14, 30, 31, 32 };
+    for (size_t i = 0; i < sizeof lap / sizeof lap[0]; i++)
+        if (m->chassis == lap[i])
+            return 1;
+    return m->chassis <= 2 && p->nbat > 0; /* a chassis the firmware doesn't name: a battery inside says it */
+}
+
 static void read_machine(machine_t *m)
 {
     char name[96], ver[64], fam[96], bn[64], bv[64], date[24];
@@ -270,6 +280,12 @@ void sys_sample(sys_t *s)
     double dt = s->samples ? t - s->t_last : 0;
     s->t_last = t;
     s->dt = dt;
+    s->slept = freeze_slept();
+    if (s->slept > 0) {
+        s->woke_t = t;
+        s->sleeps++;
+        s->asleep += s->slept;
+    }
 
     char worst[96] = "", what[96];
     double wd = 0, t0 = now_sec();
@@ -323,10 +339,15 @@ void sys_sample(sys_t *s)
     if (t >= s->next_slow) { /* things that change slowly */
         t0 = now_sec();
         fs_sample(&s->disks);
+        trim_sample(&s->disks);
         timed(worst, sizeof worst, &wd, t0, "the file systems");
         t0 = now_sec();
         net_addrs(&s->net);
+        eth_links(&s->net);
         cpu_power_sample(&s->cpu);
+        cpu_details(&s->cpu);
+        firmware_sample(&s->fw, &s->cpu);
+        pci_sample(&s->pcibus);
         timed(worst, sizeof worst, &wd, t0, "the network addresses and CPU settings");
         s->next_slow = t + 5.0;
     }

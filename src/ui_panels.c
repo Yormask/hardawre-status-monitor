@@ -816,8 +816,9 @@ static void panel_net(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         }
         if (f->addr[0] && xm - xx >= (int)strlen(f->addr) + 2)
             put(iy + r, xx, xm - xx, A_GRAY, "  %s", f->addr);
-        else if (f->speed > 0 && xm - xx >= 10)
-            put(iy + r, xx, xm - xx, A_GRAY, "  %dM", f->speed);
+        else if (f->speed > 0 && xm - xx >= 10) /* a wired link slower than it should be: yellow */
+            put(iy + r, xx, xm - xx, f->eth_slow ? CP(C_WARN) | A_BOLD : A_GRAY, "  %dM%s", f->speed,
+                f->eth_slow == ETH_HALF ? " half" : "");
     }
     if (s->net.q.on && r < ih)
         net_ping_row(&s->net.q, iy + r++, ix, iw);
@@ -1297,6 +1298,32 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         else
             kv(iy + r, &kx, km, A_GRAY, "Drives", "%s", root ? "needs root" : "n/a");
     }
+    { /* RAID arrays and pools: the worst one, and how many more */
+        const arrays_t *A = &s->health.arr;
+        int worst = -1, wl = 0, more = 0;
+        char why[48];
+        for (int i = 0; i < A->n; i++) {
+            int l = array_problem(&A->a[i], why, sizeof why);
+            if (l && l > wl) {
+                more += worst >= 0;
+                worst = i;
+                wl = l;
+            } else if (l) {
+                more++;
+            }
+        }
+        if (worst >= 0) {
+            array_problem(&A->a[worst], why, sizeof why);
+            kv(iy + r, &kx, km, wl == 2 ? CP(C_CRIT) | A_BOLD : CP(C_WARN), A->a[worst].kind == ARR_ZFS ? "ZFS"
+                                                                             : A->a[worst].kind == ARR_BTRFS ? "btrfs"
+                                                                                                             : "RAID",
+               "%s %s%s", A->a[worst].name, why, more ? " +more" : "");
+        }
+    }
+    if (s->health.ecc.ue > 0) /* memory errors ECC couldn't fix */
+        kv(iy + r, &kx, km, CP(C_CRIT) | A_BOLD, "ECC", "%lld uncorrected", s->health.ecc.ue);
+    else if (s->health.ecc.ce > 0)
+        kv(iy + r, &kx, km, CP(C_WARN), "ECC", "%lld corrected", s->health.ecc.ce);
     for (int g = 0, told = 0; g < s->gpus.n && !told; g++) /* a 144 Hz monitor at 60 Hz */
         for (int k = 0; k < s->gpus.g[g].nscr && !told; k++) {
             const screen_t *sc = &s->gpus.g[g].scr[k];
@@ -1312,8 +1339,33 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         kv(iy + r, &kx, km, CP(C_WARN) | A_BOLD, "Charger", "battery drains %.0f W", s->power.drain_w);
     else if (charger_weak(&s->power))
         kv(iy + r, &kx, km, CP(C_WARN), "Charger", "%.0f W, weak", s->power.chg_w);
+    for (int i = 0, told = 0; i < s->net.n && !told; i++) /* a gigabit port linked at 100 Mb/s */
+        if (s->net.i[i].eth_slow) {
+            const netif_t *f = &s->net.i[i];
+            if (f->eth_slow == ETH_HALF)
+                kv(iy + r, &kx, km, CP(C_WARN) | A_BOLD, "LAN", "%s half duplex", f->name);
+            else if (f->eth_slow == ETH_CABLE)
+                kv(iy + r, &kx, km, CP(C_WARN) | A_BOLD, "LAN", "%s %dM (cable)", f->name, f->speed);
+            else /* the other end doesn't say what it can do: the port's most */
+                kv(iy + r, &kx, km, CP(C_WARN) | A_BOLD, "LAN", "%s %dM of %g%s", f->name, f->speed,
+                   f->eth_max >= 1000 ? f->eth_max / 1000.0 : f->eth_max, f->eth_max >= 1000 ? "G" : "M");
+            told = 1;
+        }
     if (s->mach.ram_channels == 1) /* half the memory bandwidth */
         kv(iy + r, &kx, km, CP(C_WARN), "RAM", "single channel");
+    { /* an SSD that never gets trimmed slows down as it fills */
+        int first = -1, more = 0;
+        for (int i = 0; i < s->disks.nfs; i++) {
+            const fs_t *f = &s->disks.fs[i];
+            if (f->trim == TRIM_NONE || (f->trim == TRIM_BLOCKED && strstr(f->trim_why, "encryption"))) {
+                more += first >= 0;
+                if (first < 0)
+                    first = i;
+            }
+        }
+        if (first >= 0)
+            kv(iy + r, &kx, km, CP(C_WARN), "TRIM", "off: %s%s", s->disks.fs[first].mount, more ? " +more" : "");
+    }
     for (int i = 0; i < s->usb.n && s->usb.nslow; i++) { /* a USB 3 drive held to USB 2 speed: slow copies */
         const usbdev_t *d = &s->usb.d[i];
         if (d->slow && (!strcmp(d->kind, "storage") || !strcmp(d->kind, "network") || !strcmp(d->kind, "Wi-Fi"))) {
@@ -1322,6 +1374,12 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
             break;
         }
     }
+    for (int i = 0; i < s->pcibus.n && s->pcibus.nodrv; i++) /* a card reader or Wi-Fi card that can't work */
+        if (s->pcibus.d[i].needs) {
+            kv(iy + r, &kx, km, CP(C_WARN) | A_BOLD, "PCI", "%s: no driver%s", s->pcibus.d[i].kind,
+               s->pcibus.nodrv > 1 ? " +more" : "");
+            break;
+        }
     if (H->kmsg == 1) {
         if (H->kmsg_err)
             kv(iy + r, &kx, km, CP(C_WARN), "Kernel", "%u error%s since boot", H->kmsg_err, H->kmsg_err == 1 ? "" : "s");

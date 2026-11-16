@@ -327,6 +327,8 @@ int main(int argc, char **argv)
         g_procfs = e;
     if ((e = secure_getenv("HSM_DEVFS")) && *e)
         g_devfs = e;
+    if ((e = secure_getenv("HSM_ROOT")) && *e)
+        g_rootfs = e;
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);

@@ -106,6 +106,17 @@ static void two(const char *name, const char *k1, const char *v1, const char *k2
     val(x);
 }
 
+static void three(const char *name, const char *k1, const char *v1, const char *k2, const char *v2, const char *k3,
+                  const char *v3, double x)
+{
+    fprintf(M, "hsm_%s{", name);
+    lab(k1, v1, 1);
+    lab(k2, v2, 1);
+    lab(k3, v3, 0);
+    fputc('}', M);
+    val(x);
+}
+
 static double nn(double v) /* negative = unknown */
 {
     return v < 0 ? NAN : v;
@@ -128,6 +139,49 @@ void metrics_write(FILE *f, sys_t *s)
         lab("model", mc->model, 1);
         lab("bios_version", mc->bios_version, 1);
         lab("bios_date", d, 0);
+        fputc('}', M);
+        val(1);
+    }
+    { /* the CPU: an info metric too */
+        const cpu_t *c = &s->cpu;
+        help("cpu_info", "gauge", "the CPU, its microcode, instruction set level and SMT");
+        fputs("hsm_cpu_info{", M);
+        lab("model", c->model, 1);
+        lab("microcode", c->ucode, 1);
+        lab("isa_level", c->isa, 1);
+        lab("smt", c->smt, 0);
+        fputc('}', M);
+        val(1);
+    }
+    if (s->pcibus.ok) { /* PCI devices people use with no driver */
+        const pcibus_t *pb = &s->pcibus;
+        help("pci_devices", "gauge", "PCI devices");
+        plain("pci_devices", pb->n);
+        help("pci_devices_without_driver", "gauge", "PCI devices people use (not bridges) with no driver");
+        plain("pci_devices_without_driver", pb->nodrv);
+        if (pb->nodrv) {
+            help("pci_device_without_driver", "gauge", "1 for each such device");
+            for (int i = 0; i < pb->n; i++)
+                if (pb->d[i].needs) {
+                    fputs("hsm_pci_device_without_driver{", M);
+                    lab("slot", pb->d[i].slot, 1);
+                    lab("kind", pb->d[i].kind, 1);
+                    lab("name", pb->d[i].name, 0);
+                    fputc('}', M);
+                    val(1);
+                }
+        }
+    }
+    if (s->fw.done) { /* the firmware: an info metric */
+        const firmware_t *fw = &s->fw;
+        static const char *const vs[] = { "", "on", "no_kvm", "off", "maybe_off", "none", "vm" };
+        help("firmware_info", "gauge", "boot mode, Secure Boot, TPM, virtualisation (VT-x / AMD-V) and the IOMMU");
+        fputs("hsm_firmware_info{", M);
+        lab("boot", fw->uefi == 1 ? "uefi" : fw->uefi == 0 ? "bios" : "", 1);
+        lab("secure_boot", fw->secure_boot == 1 ? "on" : fw->secure_boot == 0 ? "off" : "", 1);
+        lab("tpm", fw->tpm == 20 ? "2.0" : fw->tpm == 12 ? "1.2" : fw->tpm ? "unknown" : "none", 1);
+        lab("virtualization", vs[CLAMP(fw->virt_state, 0, 6)], 1);
+        lab("iommu", fw->iommu > 0 ? "on" : "off", 0);
         fputc('}', M);
         val(1);
     }
@@ -345,6 +399,19 @@ void metrics_write(FILE *f, sys_t *s)
         help("filesystem_readonly", "gauge", "1 when mounted (or turned) read-only");
         for (int i = 0; i < s->disks.nfs; i++)
             one("filesystem_readonly", "mount", s->disks.fs[i].mount, s->disks.fs[i].readonly);
+        int ssd = 0;
+        for (int i = 0; i < s->disks.nfs; i++)
+            ssd += s->disks.fs[i].trim != TRIM_NA;
+        if (ssd) { /* SSDs: 1 when nothing trims it (or something stops it) */
+            static const char *const T[] = { "", "discard", "weekly", "none", "blocked" };
+            help("filesystem_untrimmed", "gauge", "1 when an SSD's file system never gets trimmed");
+            for (int i = 0; i < s->disks.nfs; i++) {
+                const fs_t *fs = &s->disks.fs[i];
+                if (fs->trim != TRIM_NA)
+                    two("filesystem_untrimmed", "mount", fs->mount, "trim", T[CLAMP(fs->trim, 0, 4)],
+                        fs->trim == TRIM_NONE || fs->trim == TRIM_BLOCKED);
+            }
+        }
     }
 
     /* network */
@@ -498,6 +565,51 @@ void metrics_write(FILE *f, sys_t *s)
             help("drive_heat_slowed_seconds_total", "counter", "seconds the drive ran slowed down from heat, in its life");
         two("drive_heat_slowed_seconds_total", "drive", v->name, "kind", "light", (double)v->heat_s[0]);
         two("drive_heat_slowed_seconds_total", "drive", v->name, "kind", "hard", (double)v->heat_s[1]);
+    }
+    any = 0; /* wired links slower than they should be */
+    for (int i = 0; i < s->net.n; i++) {
+        const netif_t *ni = &s->net.i[i];
+        if (!ni->eth_ok)
+            continue;
+        if (!any++)
+            help("net_link_problem", "gauge", "a wired link slower than it should be: 1 the cable (both ends can do more), "
+                 "2 slower than the port can do, 3 half duplex; 0 fine");
+        one("net_link_problem", "iface", ni->name, ni->eth_slow);
+    }
+    if (h->ecc.ok) { /* ECC memory errors, counted by EDAC */
+        help("memory_errors_total", "counter", "memory errors ECC found since boot: corrected (fixed) and uncorrected");
+        one("memory_errors_total", "kind", "corrected", (double)h->ecc.ce);
+        one("memory_errors_total", "kind", "uncorrected", (double)h->ecc.ue);
+    }
+    if (h->arr.n) { /* software RAID arrays, ZFS pools, btrfs file systems */
+        help("raid_degraded", "gauge", "disks missing or failed in an array (md, btrfs); 1 for a ZFS pool that isn't ONLINE");
+        for (int i = 0; i < h->arr.n; i++) {
+            const array_t *a = &h->arr.a[i];
+            two("raid_degraded", "array", a->name, "type", a->kind == ARR_MD ? "md" : a->kind == ARR_ZFS ? "zfs" : "btrfs",
+                a->degraded);
+        }
+        any = 0;
+        for (int i = 0; i < h->arr.n; i++) {
+            const array_t *a = &h->arr.a[i];
+            if (a->kind != ARR_MD || a->sync_pct < 0)
+                continue;
+            if (!any++)
+                help("raid_sync_ratio", "gauge", "how far a rebuild, resync or check of an md array has come (0-1)");
+            two("raid_sync_ratio", "array", a->name, "action", a->sync, a->sync_pct / 100.0);
+        }
+        any = 0;
+        for (int i = 0; i < h->arr.n; i++) {
+            const array_t *a = &h->arr.a[i];
+            if (a->kind != ARR_BTRFS)
+                continue;
+            if (!any++)
+                help("btrfs_device_errors_total", "counter", "a btrfs device's error counters, since the file system was made");
+            static const char *const K[BE_N] = { "write", "read", "flush", "corruption", "generation" };
+            for (int k = 0; k < a->nmem; k++)
+                for (int x = 0; x < BE_N; x++)
+                    three("btrfs_device_errors_total", "fs", a->name, "device", a->mem[k].name, "kind", K[x],
+                          (double)a->mem[k].err[x]);
+        }
     }
     any = 0; /* the PCIe link (no root needed) */
     for (int i = 0; i < h->nnvme; i++) {

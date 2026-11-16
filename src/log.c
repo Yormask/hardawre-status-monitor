@@ -54,7 +54,7 @@ enum {
     CH_SATA_WEAR, CH_SATA_REALLOC, CH_SATA_PENDING, CH_SATA_CRC,
     CH_DISK_RLAT, CH_DISK_WLAT, CH_NET_ERR, CH_NET_SIGNAL, CH_NET_LINK, CH_NET_FREQ, CH_WAKEUPS, CH_CSTATE, CH_FREEZE,
     CH_GPU_SLOW_HEAT, CH_GPU_SLOW_POWER, CH_CPU_PL, CH_GPU_ENC, CH_GPU_DEC, CH_GPU_PCIE_GEN, CH_GPU_PCIE_W,
-    CH_PING, CH_PING_LOSS,
+    CH_PING, CH_PING_LOSS, CH_ECC, CH_RAID,
     CH_EVENTS /* stays last */
 };
 
@@ -160,6 +160,12 @@ void log_build_channels(sys_t *s, const char *skip)
     if (H->aer_ok)
         add("Health", CH_PCIE, 0, "", "count", "PCIe errors since boot", "health.pcie");
     add("Health", CH_FREEZE, 0, "", "s", "System frozen (total)", "health.frozen");
+    if (s->health.ecc.ok) { /* ECC memory errors (EDAC) */
+        add("Health", CH_ECC, 0, "", "count", "Memory errors fixed by ECC since boot", "health.ecc_corrected");
+        add("Health", CH_ECC, 1, "", "count", "Memory errors ECC couldn't fix", "health.ecc_uncorrected");
+    }
+    if (s->health.arr.n) /* RAID arrays, pools: how many are degraded or failed */
+        add("Health", CH_RAID, 0, "", "count", "RAID arrays and pools degraded", "health.raid_degraded");
     for (int i = 0; i < H->nnvme; i++) {
         const char *n = H->nvme[i].name;
         if (H->nvme[i].state < 0) /* can't be read (needs root): no empty columns */
@@ -429,6 +435,8 @@ double log_chan_value(const sys_t *s, const chan_t *c)
         return p->ok ? (c->a & 1 ? p->full : p->some) : NAN;
     }
     case CH_OOM: return s->mem.oom_ok ? (double)s->mem.oom_kill : NAN;
+    case CH_ECC: return s->health.ecc.ok ? (double)(c->a ? s->health.ecc.ue : s->health.ecc.ce) : NAN;
+    case CH_RAID: return (double)s->health.arr.nbad;
     case CH_PCIE:
         return s->health.aer_ok ? (double)(s->health.pci_cor + s->health.pci_nonfatal + s->health.pci_fatal) : NAN;
     case CH_NVME_USED:

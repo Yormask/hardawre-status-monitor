@@ -52,9 +52,10 @@ static int g_started;
  * freeze 4 s after the start and a one-hour suspend after 8 s */
 static struct {
     double at, dur;
-    int kind, done;
+    int kind, done, slept; /* done: the thread told it; slept: freeze_slept counted it */
 } g_sim[8];
 static int g_nsim;
+static double g_m0; /* when the watch started (monotonic): the simulation's clock */
 
 static void sim_parse(void)
 {
@@ -105,7 +106,7 @@ static void *watchdog(void *arg)
     sigset_t all;
     sigfillset(&all);
     pthread_sigmask(SIG_BLOCK, &all, NULL); /* every signal goes to the main thread */
-    double m = clk(CLOCK_MONOTONIC), b = clk(CLOCK_BOOTTIME), m0 = m;
+    double m = clk(CLOCK_MONOTONIC), b = clk(CLOCK_BOOTTIME), m0 = g_m0;
     const struct timespec tick = { 0, (long)(TICK * 1e9) };
     for (;;) {
         nanosleep(&tick, NULL);
@@ -145,6 +146,7 @@ void freeze_start(void)
 {
     if (g_started)
         return;
+    g_m0 = clk(CLOCK_MONOTONIC);
     sim_parse();
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -158,6 +160,25 @@ void freeze_start(void)
     if (pthread_create(&g_thr, &at, watchdog, NULL) == 0)
         g_started = 1;
     pthread_attr_destroy(&at);
+}
+
+/* The main loop's own check, with the same two clocks: the thread above may
+ * tell of a suspend a moment after the first sample that spans it, and that
+ * sample has to know (counters that jump while the computer sleeps and
+ * wakes, rows from before it). Main thread only. */
+double freeze_slept(void)
+{
+    static double off = -1;
+    double m = clk(CLOCK_MONOTONIC), now = clk(CLOCK_BOOTTIME) - m, s = 0;
+    if (off >= 0 && now - off > SLEEP_MIN)
+        s = now - off;
+    off = now;
+    for (int i = 0; i < g_nsim; i++)
+        if (g_started && g_sim[i].kind == FZ_SUSPEND && !g_sim[i].slept && m - g_m0 >= g_sim[i].at) {
+            g_sim[i].slept = 1;
+            s += g_sim[i].dur;
+        }
+    return s;
 }
 
 int freeze_take(fz_t *out)

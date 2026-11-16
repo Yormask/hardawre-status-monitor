@@ -95,6 +95,41 @@ static void lc_kv(lc_t *c, const char *k, attr_t va, const char *fmt, ...)
     put(y, c->x + kw, c->w - kw, va, "%s", b);
 }
 
+/* lc_kv, wrapped at spaces to the column's width */
+static void lc_kvw(lc_t *c, const char *k, attr_t va, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static void lc_kvw(lc_t *c, const char *k, attr_t va, const char *fmt, ...)
+{
+    char b[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    int vw = c->w - MIN(16, c->w / 3);
+    const char *p = b;
+    for (int first = 1; *p; first = 0) {
+        size_t cut = 0, sp = 0;
+        int cols = 0;
+        for (size_t i = 0; p[i]; i++) {
+            if (((unsigned char)p[i] & 0xC0) == 0x80) /* the rest of a UTF-8 character */
+                continue;
+            if (++cols > vw)
+                break;
+            if (p[i] == ' ')
+                sp = i;
+            cut = i + 1;
+            while (((unsigned char)p[cut] & 0xC0) == 0x80)
+                cut++;
+        }
+        size_t take = !p[cut] || !sp ? cut : sp;
+        lc_kv(c, first ? k : "", va, "%.*s", (int)take, p);
+        p += take;
+        while (*p == ' ')
+            p++;
+        if (!take)
+            break;
+    }
+}
+
 static void hw_sensors(sys_t *s, lc_t *c)
 {
     sensors_t *S = &s->sens;
@@ -266,6 +301,15 @@ static void hw_health(sys_t *s, lc_t *c)
                   H->pci[i].nonfatal, H->pci[i].fatal);
     } else {
         lc_kv(c, "PCIe errors", A_GRAY, "%s", "not reported (no AER on this machine)");
+    }
+    if (s->pcibus.ok && s->pcibus.n) { /* a device people use with no driver can't work */
+        const pcibus_t *pb = &s->pcibus;
+        if (!pb->nodrv)
+            lc_kv(c, "PCI drivers", A_NORMAL, "every device in use has one");
+        for (int i = 0, k = 0; i < pb->n; i++)
+            if (pb->d[i].needs)
+                lc_kv(c, k++ ? "" : "PCI drivers", CP(C_WARN) | A_BOLD, "%s %s has none: %s", pb->d[i].kind,
+                      pb->d[i].slot + (strncmp(pb->d[i].slot, "0000:", 5) ? 0 : 5), pb->d[i].name);
     }
     if (H->files_max) {
         fmt_si((double)H->files, a, sizeof a);
@@ -534,13 +578,16 @@ static void hw_gpus(sys_t *s, lc_t *c)
         if (g->enc_pct >= 0 || g->dec_pct >= 0)
             lc_kv(c, "  Video", A_BOLD, "encoding %.0f%%, decoding %.0f%%", MAX(g->enc_pct, 0), MAX(g->dec_pct, 0));
         if (g->pcie_gen > 0 && g->pcie_width > 0) {
-            int below = (g->pcie_gen_max > g->pcie_gen) || (g->pcie_width_max > g->pcie_width);
+            /* a laptop's lanes to its GPU are wired on the board: fewer than the chip could take is how it's built */
+            int lap = machine_laptop(&s->mach, &s->power);
+            int wmax = lap ? g->pcie_width : MAX(g->pcie_width_max, g->pcie_width);
+            int below = g->pcie_gen_max > g->pcie_gen || wmax > g->pcie_width;
             if (below)
                 lc_kv(c, "  PCIe link", A_BOLD, "%d.0 x%d now, up to %d.0 x%d%s", g->pcie_gen, g->pcie_width,
-                      MAX(g->pcie_gen_max, g->pcie_gen), MAX(g->pcie_width_max, g->pcie_width),
-                      g->util < 30 ? "  (slower while idle, to save power)" : "");
+                      MAX(g->pcie_gen_max, g->pcie_gen), wmax, g->util < 30 ? "  (slower while idle, to save power)" : "");
             else
-                lc_kv(c, "  PCIe link", A_BOLD, "%d.0 x%d (its best)", g->pcie_gen, g->pcie_width);
+                lc_kv(c, "  PCIe link", A_BOLD, "%d.0 x%d (its best%s)", g->pcie_gen, g->pcie_width,
+                      lap && g->pcie_width_max > g->pcie_width ? " in this laptop" : "");
         }
         if (g->util_est)
             lc_kv(c, "  Note", A_GRAY, "%s", "load estimated from RC6 sleep time; run as root for exact per-engine load");
@@ -792,6 +839,22 @@ static void hw_system(sys_t *s, lc_t *c)
                   mc->bios_vendor, mc->bios_vendor[0] ? ")" : "");
         }
     }
+    { /* what the firmware switched on */
+        const firmware_t *f = &s->fw;
+        char t[256];
+        boot_text(f, t, sizeof t);
+        if (t[0])
+            lc_kvw(c, "Firmware", A_NORMAL, "%s", t);
+        if (f->done && (f->tpm || f->uefi == 1))
+            lc_kv(c, "TPM", A_NORMAL, "%s", f->tpm == 20 ? "2.0" : f->tpm == 12 ? "1.2" : f->tpm ? "yes (version unknown)" : "none found");
+        virt_text(f, t, sizeof t);
+        if (t[0])
+            lc_kvw(c, "Virtualisation", f->virt_state == VIRT_OFF || f->virt_state == VIRT_NOKVM ||
+                                            f->virt_state == VIRT_MAYBE_OFF ? CP(C_WARN) : A_NORMAL, "%s", t);
+        iommu_text(f, t, sizeof t);
+        if (t[0])
+            lc_kv(c, "IOMMU", A_NORMAL, "%s", t);
+    }
     lc_kv(c, "OS", A_NORMAL, "%s", s->os);
     lc_kv(c, "Kernel", A_NORMAL, "%s (%s)", s->kernel, s->arch);
     fmt_duration(cv->uptime, a, sizeof a);
@@ -819,6 +882,33 @@ static void hw_system(sys_t *s, lc_t *c)
         const char *what = named ? cv->ctype[t].letter == 'E' ? ", efficient" : ", fast" : "";
         lc_kv(c, t ? "" : "Kinds of cores", A_NORMAL, "%c: %d %s%s%s%s, CPUs %s", cv->ctype[t].letter,
               cv->ctype[t].cores, nm, plural ? "s" : "", th, what, cpus);
+    }
+    { /* the CPU in detail: what it is, what it can do */
+        char t[256];
+        if (cv->ucode[0] || cv->family >= 0) {
+            t[0] = '\0';
+            if (cv->family >= 0)
+                sfmt(t, sizeof t, "  (family %d, model %d, stepping %d)", cv->family, cv->model_no, cv->stepping);
+            lc_kv(c, "Microcode", A_NORMAL, "%s%s", cv->ucode[0] ? cv->ucode : "?", t);
+        }
+        if (cv->isa[0] || cv->feats[0])
+            lc_kvw(c, "Instructions", A_NORMAL, "%s%s%s", cv->isa, cv->isa[0] && cv->feats[0] ? ": " : "", cv->feats);
+        smt_text(cv, t, sizeof t);
+        if (t[0])
+            lc_kv(c, "SMT", A_NORMAL, "%s", t);
+        clock_text(cv, 0, t, sizeof t);
+        if (t[0])
+            lc_kvw(c, "Base clock", A_NORMAL, "%s", t);
+        clock_text(cv, 1, t, sizeof t);
+        if (t[0]) /* turbo on x86; on ARM simply the most it runs at */
+            lc_kvw(c, cv->vendor_id[0] ? "Boost clock" : "Max clock", A_NORMAL, "up to %s%s", t,
+                  cv->turbo == 0 ? " (turbo is off)" : "");
+        char cl[16][96];
+        int ncl = cache_lines(cv, cl, 16);
+        for (int k = 0; k < ncl; k++)
+            lc_kv(c, k ? "" : "Caches", A_NORMAL, "%s", cl[k]);
+        if (cv->numa > 1)
+            lc_kv(c, "NUMA", A_NORMAL, "%d nodes", cv->numa);
     }
     lc_kv(c, "Usage", A_NORMAL, "%.1f%%  (user %.1f%%, system %.1f%%, iowait %.1f%%, steal %.1f%%)", cv->total,
           cv->user, cv->sys, cv->iowait, cv->steal);
@@ -884,6 +974,25 @@ static void hw_system(sys_t *s, lc_t *c)
     fmt_bytes((double)m->total, a, sizeof a);
     lc_kv(c, "Total", A_BOLD, "%s", a);
     hw_ram(&s->mach, c);
+    { /* ECC: on or off, and the errors it found since boot */
+        const ecc_t *e = &s->health.ecc;
+        char why[96];
+        int st = ecc_state(e, &s->mach, why, sizeof why);
+        if (st >= 0)
+            lc_kv(c, "ECC", st ? A_BOLD : A_NORMAL, "%s", why);
+        if (e->ok) {
+            lc_kv(c, "", e->ue ? CP(C_CRIT) | A_BOLD : e->ce ? CP(C_WARN) | A_BOLD : CP(C_OK), "%lld corrected, %lld uncorrected since boot",
+                  e->ce, e->ue);
+            for (int i = 0; i < e->ndimm; i++)
+                if (e->dimm[i].ce || e->dimm[i].ue)
+                    lc_kv(c, "", e->dimm[i].ue ? CP(C_CRIT) : CP(C_WARN), "  %s: %lld corrected, %lld uncorrected",
+                          e->dimm[i].label, e->dimm[i].ce, e->dimm[i].ue);
+            if (e->ue)
+                lc_kv(c, "", A_GRAY, "%s", "uncorrected: the data was damaged; replace the module");
+            else if (e->ce)
+                lc_kv(c, "", A_GRAY, "%s", "ECC fixed them; a module that keeps making them is wearing out");
+        }
+    }
     fmt_bytes((double)m->used, a, sizeof a);
     lc_kv(c, "Used", A_BOLD, "%s (%.1f%%)", a, m->total ? 100.0 * (double)m->used / (double)m->total : 0);
     fmt_bytes((double)m->avail, a, sizeof a);
@@ -932,6 +1041,80 @@ static void hw_system(sys_t *s, lc_t *c)
     }
 }
 
+/* software RAID arrays, ZFS pools, btrfs file systems */
+static void hw_arrays(sys_t *s, lc_t *c)
+{
+    const arrays_t *A = &s->health.arr;
+    if (!A->n)
+        return;
+    lc_title(c, "RAID and pools");
+    for (int i = 0; i < A->n; i++) {
+        const array_t *a = &A->a[i];
+        char lv[32], why[48], mem[200] = "";
+        array_level(a, lv, sizeof lv);
+        int l = array_problem(a, why, sizeof why);
+        attr_t at = l == 2 ? CP(C_CRIT) | A_BOLD : l == 1 ? CP(C_WARN) | A_BOLD : A_BOLD;
+        int work = 0, failed = 0;
+        for (int k = 0; k < a->nmem; k++) {
+            const member_t *m = &a->mem[k];
+            work += !m->bad && !m->spare;
+            failed += m->bad;
+            if (strlen(mem) + strlen(m->name) + 12 < sizeof mem)
+                sfmt(mem + strlen(mem), sizeof mem - strlen(mem), "%s%s%s", mem[0] ? "  " : "", m->name,
+                     m->bad ? (a->kind == ARR_BTRFS ? " (missing)" : " (failed)") : m->spare ? " (spare)" : "");
+        }
+        if (a->kind == ARR_MD) {
+            lc_kv(c, a->name, at, "%s, %d of %d disks in sync%s%s", lv, work, a->ndisks, a->state[0] ? ", " : "",
+                  a->state);
+            if (mem[0])
+                lc_kv(c, "", failed ? CP(C_CRIT) : A_NORMAL, "  %s", mem);
+            if (a->sync_pct >= 0) {
+                char left[24] = "", sp[24] = "";
+                if (a->sync_left_s >= 0)
+                    fmt_duration(a->sync_left_s, left, sizeof left);
+                if (a->sync_kbs > 0)
+                    fmt_rate(a->sync_kbs * 1024.0, sp, sizeof sp);
+                const char *what = !strcmp(a->sync, "recover") ? "rebuilding" : !strcmp(a->sync, "resync") ? "resyncing"
+                                   : !strcmp(a->sync, "check")    ? "checking"
+                                   : !strcmp(a->sync, "repair")   ? "repairing"
+                                                                  : a->sync;
+                lc_kv(c, "", strcmp(a->sync, "check") ? CP(C_WARN) : A_NORMAL, "  %s %.1f%%%s%s%s%s%s", what, a->sync_pct,
+                      left[0] ? ", " : "", left, left[0] ? " left" : "", sp[0] ? " at " : "", sp);
+            }
+            if (a->degraded > 0)
+                lc_kv(c, "", CP(C_CRIT), "  %s", "degraded: replace the failed disk and let it rebuild");
+            else if (!strcmp(a->state, "inactive"))
+                lc_kv(c, "", CP(C_CRIT), "  %s", "not running: too few of its disks were found");
+            else if (!strcmp(a->state, "broken"))
+                lc_kv(c, "", CP(C_CRIT), "  %s", "failed: a disk it can't do without is missing");
+            if (a->mismatch > 0 && a->sync_pct < 0)
+                lc_kv(c, "", CP(C_WARN), "  the last check found %lld sectors that differ", a->mismatch);
+        } else if (a->kind == ARR_ZFS) {
+            lc_kv(c, a->name, at, "ZFS pool, %s", a->state);
+            if (a->degraded)
+                lc_kv(c, "", CP(C_CRIT), "  'zpool status -v %s' says which disk", a->name);
+        } else {
+            lc_kv(c, a->name, at, "btrfs, data %s, metadata %s", a->level[0] ? a->level : "?", a->meta[0] ? a->meta : "?");
+            if (mem[0])
+                lc_kv(c, "", failed ? CP(C_CRIT) : A_NORMAL, "  %s", mem);
+            if (a->errs > 0) {
+                static const char *const K[BE_N] = { "write", "read", "flush", "corruption", "generation" };
+                for (int k = 0; k < a->nmem; k++) {
+                    char e[96] = "";
+                    for (int x = 0; x < BE_N; x++)
+                        if (a->mem[k].err[x] > 0)
+                            sfmt(e + strlen(e), sizeof e - strlen(e), "%s%lld %s", e[0] ? ", " : "", a->mem[k].err[x], K[x]);
+                    if (e[0])
+                        lc_kv(c, "", CP(C_WARN), "  %s: %s", a->mem[k].name, e);
+                }
+                lc_kv(c, "", A_GRAY, "  %s", "counted since it was made ('btrfs device stats -z' resets them)");
+            } else if (a->nmem) {
+                lc_kv(c, "", A_GRAY, "  %s", "no errors");
+            }
+        }
+    }
+}
+
 static void hw_storage(sys_t *s, lc_t *c)
 {
     disks_t *D = &s->disks;
@@ -954,6 +1137,7 @@ static void hw_storage(sys_t *s, lc_t *c)
         fmt_bytes((double)k->wr_total, b, sizeof b);
         lc_text(c, A_GRAY, "  since boot   read %s  written %s", a, b);
     }
+    hw_arrays(s, c);
     lc_title(c, "Filesystems");
     if (!D->nfs)
         lc_text(c, A_GRAY, "No local filesystems found");
@@ -970,6 +1154,12 @@ static void hw_storage(sys_t *s, lc_t *c)
         int lw = MIN(18, c->w / 3);
         put(y, c->x, lw - 1, A_BOLD, "%s", f->mount);
         meter(y, c->x + lw, c->w - lw, "", 0, pct, v, 18, 0);
+        if (f->trim != TRIM_NA) { /* on an SSD: how it gets trimmed */
+            char t[128];
+            int warn;
+            trim_text(f, t, sizeof t, &warn);
+            lc_text(c, warn ? CP(C_WARN) : A_GRAY, "  TRIM %s", t);
+        }
     }
 }
 
@@ -992,6 +1182,24 @@ static void hw_network(sys_t *s, lc_t *c)
         fmt_bytes((double)f->rx_total, ta, sizeof ta);
         fmt_bytes((double)f->tx_total, tb, sizeof tb);
         lc_text(c, A_GRAY, "  %s %s  %s %s   total rx %s  tx %s", U ? "↓" : "in", a, U ? "↑" : "out", b, ta, tb);
+        if (f->eth_ok && f->eth_tp && f->speed > 0) { /* the wired link: what it got, what the ends can do */
+            char now[16], mx[16], pr[16];
+            eth_speed(f->speed, now, sizeof now);
+            eth_speed(f->eth_max, mx, sizeof mx);
+            eth_speed(f->eth_peer, pr, sizeof pr);
+            char more[64] = "";
+            if (f->eth_max > 0)
+                sfmt(more, sizeof more, "; the port can do %s%s%s", mx, f->eth_peer ? ", the other end " : "",
+                     f->eth_peer ? pr : "");
+            lc_text(c, f->eth_slow ? CP(C_WARN) | A_BOLD : A_NORMAL, "  link %s, %s duplex%s", now,
+                    f->eth_duplex == 1 ? "full" : f->eth_duplex == 0 ? "half" : "?", more);
+            if (f->eth_slow == ETH_CABLE)
+                lc_text(c, CP(C_WARN), "  %s", "both ends can do more: a damaged cable, or one with 2 of its 4 pairs");
+            else if (f->eth_slow == ETH_SLOWER)
+                lc_text(c, CP(C_WARN), "  %s", "the cable, or the other end can't do more (it doesn't say)");
+            else if (f->eth_slow == ETH_HALF)
+                lc_text(c, CP(C_WARN), "  %s", "half duplex: the other end doesn't negotiate (set both to auto), or the cable");
+        }
         attr_t sa = f->signal_dbm >= -67 ? CP(C_OK) : f->signal_dbm >= -75 ? CP(C_WARN) : CP(C_CRIT);
         if (f->wifi.ok) {
             const wifi_t *wf = &f->wifi;
@@ -1134,6 +1342,48 @@ static void hw_usb(sys_t *s, lc_t *c)
     }
 }
 
+/* the PCI devices and their drivers, as lspci -k; bridges and chipset parts counted */
+static void hw_pci(sys_t *s, lc_t *c)
+{
+    const pcibus_t *b = &s->pcibus;
+    if (!b->ok || !b->n)
+        return;
+    lc_title(c, "PCI devices");
+    char drv[MAX_PCI][48];
+    int dw = 9, sw = 7;
+    for (int i = 0; i < b->n; i++) {
+        const pcid_t *d = &b->d[i];
+        if (!d->shown)
+            continue;
+        if (!d->driver[0])
+            sfmt(drv[i], sizeof drv[i], "%s", d->vf ? "-" : "no driver");
+        else if (pci_vm_driver(d->driver)) /* not missing: set aside for a virtual machine */
+            sfmt(drv[i], sizeof drv[i], "%s (for VMs)", d->driver);
+        else
+            sfmt(drv[i], sizeof drv[i], "%s", d->driver);
+        dw = MAX(dw, (int)strlen(drv[i]));
+        if (strncmp(d->slot, "0000:", 5))
+            sw = 12; /* another PCI domain: show it */
+    }
+    dw = MIN(dw, 24);
+    int nw = MAX(c->w - sw - 12 - dw - 3, 12);
+    lc_text(c, A_GRAY, "%-*s %-12s %-*s %s", sw, "Slot", "Kind", nw, "Device", "Driver");
+    for (int i = 0; i < b->n; i++) {
+        const pcid_t *d = &b->d[i];
+        if (!d->shown)
+            continue;
+        lc_text(c, d->needs ? CP(C_WARN) | A_BOLD : A_NORMAL, "%-*s %-12s %-*.*s %s", sw, sw == 7 ? d->slot + 5 : d->slot,
+                d->kind, nw, nw, d->name, drv[i]);
+    }
+    if (b->nodrv) /* what to do about it */
+        lc_text(c, CP(C_WARN), "%s: %s can't work until one is installed", b->nodrv == 1 ? "No driver" : "No drivers",
+                b->nodrv == 1 ? "the device" : "those devices");
+    if (b->hidden == 1)
+        lc_text(c, A_GRAY, "and a bridge or chipset part, not listed");
+    else if (b->hidden)
+        lc_text(c, A_GRAY, "and %d bridges and chipset parts, not listed", b->hidden);
+}
+
 #define HWS_MAX 1024
 static int g_hws_line[HWS_MAX]; /* the lines (from the top of the view) that match */
 
@@ -1148,6 +1398,7 @@ static void hw_all(sys_t *s, int wide, lc_t *L, lc_t *R)
         hw_storage(s, R);
         hw_network(s, R);
         hw_usb(s, R);
+        hw_pci(s, R);
     } else {
         hw_health(s, L);
         hw_system(s, L);
@@ -1157,6 +1408,7 @@ static void hw_all(sys_t *s, int wide, lc_t *L, lc_t *R)
         hw_storage(s, L);
         hw_network(s, L);
         hw_usb(s, L);
+        hw_pci(s, L);
     }
 }
 

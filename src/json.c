@@ -171,6 +171,60 @@ static void cpu(sys_t *s)
         s_("name", c->ctype[t].name);
         integer("cores", c->ctype[t].cores);
         integer("threads", c->ctype[t].threads);
+        pos("base_mhz", c->kbase[t] > 0 ? c->kbase[t] : -1, 0);
+        int bo = cpu_boost_mhz(c, t);
+        pos("boost_mhz", bo > 0 ? bo : -1, 0);
+        close_('}');
+    }
+    close_(']');
+    sn("vendor_id", c->vendor_id);
+    if (c->family >= 0) {
+        integer("family", c->family);
+        integer("model_number", c->model_no);
+        integer("stepping", c->stepping);
+    } else {
+        null_("family");
+        null_("model_number");
+        null_("stepping");
+    }
+    sn("microcode", c->ucode);
+    sn("isa_level", c->isa);
+    open_("features", '['); /* the notable instruction sets: "AVX2", "AES" */
+    for (const char *f = c->feats; *f;) {
+        const char *e = strstr(f, ", ");
+        size_t l = e ? (size_t)(e - f) : strlen(f);
+        char one[32];
+        str_copy(one, MIN(sizeof one, l + 1), f);
+        s_(NULL, one);
+        f += l + (e ? 2 : 0);
+    }
+    close_(']');
+    sn("smt", c->smt); /* on, off, forceoff, notsupported; null = unknown */
+    if (c->smt_active >= 0)
+        boolean("smt_active", c->smt_active);
+    else
+        null_("smt_active");
+    pos("base_mhz", c->base_mhz > 0 ? c->base_mhz : -1, 0);
+    int boost = cpu_boost_mhz(c, -1);
+    pos("boost_mhz", boost > 0 ? boost : -1, 0);
+    if (c->numa > 0)
+        integer("numa_nodes", c->numa);
+    else
+        null_("numa_nodes");
+    open_("caches", '[');
+    for (int k = 0; k < c->ncache; k++) {
+        const cache_t *e = &c->cache[k];
+        open_(NULL, '{');
+        integer("level", e->level);
+        s_("type", e->type == 'd' ? "data" : e->type == 'i' ? "instruction" : "unified");
+        integer("size_kb", e->kb);
+        integer("count", e->n);
+        integer("cores_each", e->share); /* cores that share one */
+        if (e->kind >= 0 && e->kind < c->nctype) {
+            char l[2] = { c->ctype[(int)e->kind].letter, 0 };
+            s_("core_kind", l);
+        } else
+            null_("core_kind");
         close_('}');
     }
     close_(']');
@@ -252,6 +306,8 @@ static void memory(sys_t *s)
             pos("configured_mts", r->conf > 0 ? r->conf : -1, 0);
             sn("maker", r->maker);
             sn("part", r->part);
+            if (r->total_w && r->data_w)
+                boolean("ecc_module", r->total_w > r->data_w);
             close_('}');
         }
         close_(']');
@@ -262,6 +318,35 @@ static void memory(sys_t *s)
             null_("channels");
     } else {
         null_("modules");
+    }
+    { /* ECC: on or off, and the errors since boot */
+        const ecc_t *e = &s->health.ecc;
+        char why[96];
+        int st = ecc_state(e, mc, why, sizeof why);
+        open_("ecc", '{');
+        if (st >= 0)
+            boolean("on", st);
+        else
+            null_("on");
+        sn("mode", e->mode);
+        s_("source", e->ok ? "edac" : st >= 0 ? "firmware" : "none");
+        if (e->ok) {
+            integer("corrected", e->ce);
+            integer("uncorrected", e->ue);
+            open_("modules", '[');
+            for (int i = 0; i < e->ndimm; i++) {
+                open_(NULL, '{');
+                s_("label", e->dimm[i].label);
+                integer("corrected", e->dimm[i].ce);
+                integer("uncorrected", e->dimm[i].ue);
+                close_('}');
+            }
+            close_(']');
+        } else {
+            null_("corrected");
+            null_("uncorrected");
+        }
+        close_('}');
     }
     integer("swap_total_bytes", (long long)m->swap_total);
     integer("swap_used_bytes", (long long)m->swap_used);
@@ -462,6 +547,19 @@ static void storage(sys_t *s)
         integer("total_bytes", (long long)f->total);
         integer("used_bytes", (long long)f->used);
         integer("available_bytes", (long long)f->avail);
+        if (f->trim == TRIM_NA) { /* not on an SSD */
+            null_("trim");
+        } else {
+            static const char *const T[] = { "", "discard", "weekly", "none", "blocked" };
+            open_("trim", '{');
+            s_("how", T[CLAMP(f->trim, 0, 4)]);
+            if (f->trim == TRIM_BLOCKED)
+                s_("blocked_by", strstr(f->trim_why, "encryption") ? "encryption" : strstr(f->trim_why, "USB") ? "usb_adapter" : "drive");
+            else if (f->trim_why[0])
+                s_("timer", f->trim_why);
+            pos("last_run_s_ago", f->trim_ago, 0);
+            close_('}');
+        }
         close_('}');
     }
     close_(']');
@@ -483,6 +581,15 @@ static void network(sys_t *s)
             integer("speed_mbps", f->speed);
         else
             null_("speed_mbps");
+        if (f->eth_ok) { /* a wired port: what it and the other end can do, as negotiated */
+            pos("link_max_mbps", f->eth_max > 0 ? f->eth_max : -1, 0);
+            pos("link_partner_max_mbps", f->eth_peer > 0 ? f->eth_peer : -1, 0);
+            sn("duplex", f->eth_duplex == 1 ? "full" : f->eth_duplex == 0 ? "half" : "");
+            if (f->eth_slow)
+                s_("link_problem", f->eth_slow == ETH_CABLE ? "cable" : f->eth_slow == ETH_HALF ? "half_duplex" : "slower");
+            else
+                null_("link_problem");
+        }
         num("errors_per_s", f->err_rate, 2);
         num("drops_per_s", f->drop_rate, 2);
         if (f->wireless && f->quality >= 0) {
@@ -555,6 +662,34 @@ static void network_check(sys_t *s)
         close_('}');
     }
     close_('}');
+}
+
+static void pci(sys_t *s)
+{
+    const pcibus_t *b = &s->pcibus;
+    if (!b->ok) {
+        null_("pci");
+        return;
+    }
+    open_("pci", '[');
+    for (int i = 0; i < b->n; i++) {
+        const pcid_t *d = &b->d[i];
+        char h[16];
+        open_(NULL, '{');
+        s_("slot", d->slot);
+        sfmt(h, sizeof h, "0x%06x", d->cls);
+        s_("class", h);
+        s_("kind", d->kind);
+        sfmt(h, sizeof h, "%04x:%04x", d->ven, d->dev);
+        s_("id", h);
+        s_("name", d->name);
+        sn("driver", d->driver);
+        boolean("listed", d->shown);       /* false: a bridge or chipset part */
+        boolean("missing_driver", d->needs); /* a device people use, with none */
+        boolean("virtual_function", d->vf);
+        close_('}');
+    }
+    close_(']');
 }
 
 static void usb(sys_t *s)
@@ -743,6 +878,56 @@ static void health(sys_t *s)
         close_('}');
     }
     close_(']');
+    open_("arrays", '['); /* software RAID, ZFS pools, btrfs file systems */
+    for (int i = 0; i < h->arr.n; i++) {
+        const array_t *a = &h->arr.a[i];
+        char why[48];
+        int l = array_problem(a, why, sizeof why);
+        open_(NULL, '{');
+        s_("type", a->kind == ARR_MD ? "md" : a->kind == ARR_ZFS ? "zfs" : "btrfs");
+        s_("name", a->name);
+        if (a->kind == ARR_BTRFS)
+            s_("uuid", a->key);
+        sn("level", a->level);
+        if (a->kind == ARR_BTRFS)
+            sn("metadata", a->meta);
+        sn("state", a->state);
+        s_("health", l == 2 ? "bad" : l == 1 ? "attention" : "ok");
+        sn("problem", why);
+        if (a->kind != ARR_ZFS) {
+            integer("disks", a->ndisks);
+            integer("degraded", a->degraded);
+            open_("members", '[');
+            for (int k = 0; k < a->nmem; k++) {
+                const member_t *m = &a->mem[k];
+                open_(NULL, '{');
+                s_("name", m->name);
+                s_("state", m->bad ? (a->kind == ARR_BTRFS ? "missing" : "failed") : m->spare ? "spare" : "ok");
+                if (a->kind == ARR_BTRFS) {
+                    integer("write_errors", m->err[BE_WRITE]);
+                    integer("read_errors", m->err[BE_READ]);
+                    integer("flush_errors", m->err[BE_FLUSH]);
+                    integer("corruption_errors", m->err[BE_CORRUPT]);
+                    integer("generation_errors", m->err[BE_GEN]);
+                } else {
+                    integer("corrected_read_errors", m->err[BE_READ]);
+                }
+                close_('}');
+            }
+            close_(']');
+        } else {
+            boolean("degraded", a->degraded);
+        }
+        if (a->kind == ARR_MD) {
+            sn("sync", a->sync);
+            pos("sync_pct", a->sync_pct, 1);
+            pos("sync_left_s", a->sync_left_s, 0);
+            pos("sync_bps", a->sync_kbs > 0 ? a->sync_kbs * 1024 : -1, 0);
+            integer("mismatch_sectors", a->mismatch);
+        }
+        close_('}');
+    }
+    close_(']');
     s_("kernel_log", h->kmsg == 1 ? "read" : h->kmsg == -1 ? "needs root" : "n/a");
     open_("events", '[');
     for (int i = h->nev - 1; i >= 0; i--) { /* oldest first */
@@ -902,6 +1087,31 @@ void json_write(FILE *f, sys_t *s, int nproc)
     } else {
         null_("machine");
     }
+    { /* what the firmware switched on */
+        const firmware_t *fw = &s->fw;
+        static const char *const vs[] = { NULL, "on", "no_kvm", "off", "maybe_off", "none", "vm" };
+        open_("firmware", '{');
+        s_("boot", fw->uefi == 1 ? "uefi" : fw->uefi == 0 ? "bios" : NULL);
+        pos("efi_bits", fw->efi_bits > 0 ? fw->efi_bits : -1, 0);
+        if (fw->secure_boot >= 0)
+            boolean("secure_boot", fw->secure_boot);
+        else
+            null_("secure_boot");
+        if (fw->setup_mode >= 0)
+            boolean("setup_mode", fw->setup_mode);
+        else
+            null_("setup_mode");
+        sn("lockdown", fw->lockdown);
+        s_("tpm", fw->tpm == 20 ? "2.0" : fw->tpm == 12 ? "1.2" : fw->tpm ? "unknown" : NULL);
+        s_("virtualization", fw->virt == 'v' ? "vt-x" : fw->virt == 's' ? "amd-v" : fw->virt == 'a' ? "arm" : NULL);
+        s_("virtualization_state", vs[CLAMP(fw->virt_state, 0, 6)]);
+        boolean("kvm", fw->kvm);
+        boolean("virtual_machine", fw->vm);
+        boolean("iommu", fw->iommu > 0);
+        sn("iommu_type", fw->iommu_kind);
+        integer("iommu_groups", fw->iommu_groups);
+        close_('}');
+    }
     cpu(s);
     memory(s);
     gpus(s);
@@ -910,6 +1120,7 @@ void json_write(FILE *f, sys_t *s, int nproc)
     network(s);
     network_check(s);
     usb(s);
+    pci(s);
     sensors(s);
     health(s);
     services(s);

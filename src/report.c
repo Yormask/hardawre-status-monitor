@@ -69,6 +69,13 @@ static void report_health(sys_t *s)
     for (int i = 0; i < h->npci; i++)
         printf("    %s  %s: %llu corrected, %llu non-fatal, %llu fatal\n", h->pci[i].dev, h->pci[i].name, h->pci[i].cor,
                h->pci[i].nonfatal, h->pci[i].fatal);
+    if (s->pcibus.ok && s->pcibus.n) { /* a device people use with no driver */
+        const pcibus_t *pb = &s->pcibus;
+        printf("  PCI drivers %s\n", pb->nodrv ? "missing for:" : "every device in use has one");
+        for (int i = 0; i < pb->n; i++)
+            if (pb->d[i].needs)
+                printf("    %s  %s: %s\n", pb->d[i].slot, pb->d[i].kind, pb->d[i].name);
+    }
     if (h->files_max) {
         fmt_si((double)h->files, a, sizeof a);
         printf("  open files  %s handles in use\n", a);
@@ -100,6 +107,29 @@ static void report_health(sys_t *s)
         printf("  kernel log  %u errors, %u warnings since boot\n", h->kmsg_err, h->kmsg_warn);
     else
         printf("  kernel log  %s\n", h->kmsg == -1 ? "needs root (sudo)" : "not available");
+    for (int i = 0; i < h->arr.n; i++) { /* software RAID arrays, ZFS pools, btrfs file systems */
+        const array_t *ar = &h->arr.a[i];
+        char lv[32], why[48], failed[96] = "";
+        array_level(ar, lv, sizeof lv);
+        int l = array_problem(ar, why, sizeof why), work = 0;
+        for (int k = 0; k < ar->nmem; k++) {
+            work += !ar->mem[k].bad && !ar->mem[k].spare;
+            if (ar->mem[k].bad)
+                sfmt(failed + strlen(failed), sizeof failed - strlen(failed), "%s%s", failed[0] ? ", " : "", ar->mem[k].name);
+        }
+        printf("  %-11s %s", ar->name, lv);
+        if (ar->kind == ARR_ZFS)
+            printf(", %s", ar->state);
+        else if (ar->kind == ARR_MD)
+            printf(", %d of %d disks in sync", work, ar->ndisks);
+        else
+            printf(" (metadata %s), %d device%s", ar->meta[0] ? ar->meta : "?", ar->ndisks, ar->ndisks == 1 ? "" : "s");
+        if (failed[0])
+            printf(", %s %s", failed, ar->kind == ARR_BTRFS ? "missing" : "failed");
+        if (l && ar->kind != ARR_ZFS)
+            printf(": %s", why);
+        printf("\n");
+    }
     int shown = 0;
     for (int i = 0; i < h->nev && shown < 8; i++) {
         const event_t *e = health_event_at(h, i);
@@ -146,11 +176,63 @@ void report_print(sys_t *s, int nproc)
         }
         printf("\n");
     }
+    { /* what the firmware switched on */
+        const firmware_t *f = &s->fw;
+        char t[256];
+        boot_text(f, t, sizeof t);
+        if (t[0] || f->tpm) {
+            printf("firmware %s", t);
+            if (f->tpm || f->uefi == 1)
+                printf("%sTPM %s", t[0] ? " | " : "", f->tpm == 20 ? "2.0" : f->tpm == 12 ? "1.2" : f->tpm ? "(version unknown)" : "none found");
+            printf("\n");
+        }
+        virt_text(f, t, sizeof t);
+        char io[96];
+        iommu_text(f, io, sizeof io);
+        if (t[0] || io[0])
+            printf("virt     %s%s%s%s\n", t, t[0] && io[0] ? " | " : "", io[0] ? "IOMMU " : "", io);
+    }
 
     char kinds[24];
     cpu_types_text(cp, kinds, sizeof kinds);
     printf("\nCPU         %s, %d cores / %d threads%s%s%s\n", cp->model, cp->cores, cp->threads, kinds[0] ? " (" : "",
            kinds, kinds[0] ? ")" : "");
+    { /* what it is and what it can do */
+        char t[256];
+        if (cp->ucode[0] || cp->family >= 0) {
+            printf("  microcode %s", cp->ucode[0] ? cp->ucode : "?");
+            if (cp->family >= 0)
+                printf("  (family %d, model %d, stepping %d)", cp->family, cp->model_no, cp->stepping);
+            printf("\n");
+        }
+        if (cp->isa[0] || cp->feats[0])
+            printf("  isa       %s%s%s\n", cp->isa, cp->isa[0] && cp->feats[0] ? ": " : "", cp->feats);
+        smt_text(cp, t, sizeof t);
+        if (t[0])
+            printf("  smt       %s\n", t);
+        clock_text(cp, 0, t, sizeof t);
+        if (t[0])
+            printf("  base      %s\n", t);
+        clock_text(cp, 1, t, sizeof t);
+        if (t[0])
+            printf("  %-9s up to %s%s\n", cp->vendor_id[0] ? "boost" : "max", t, cp->turbo == 0 ? " (turbo is off)" : "");
+        char cl[16][96];
+        int ncl = cache_lines(cp, cl, 16);
+        for (int k = 0; k < ncl; k++) { /* a level per line: "L2  1.25M per P-core; 2M shared by all 4 E-cores" */
+            const char *x = cl[k];
+            while (*x == ' ')
+                x++;
+            if (cl[k][0] == 'L')
+                printf("%s%s", k ? "\n" : "", k ? "            " : "  cache     ");
+            else
+                printf("; ");
+            printf("%s", cl[k][0] == 'L' ? cl[k] : x);
+        }
+        if (ncl)
+            printf("\n");
+        if (cp->numa > 1)
+            printf("  numa      %d nodes\n", cp->numa);
+    }
     printf("  usage     %.1f%%  (user %.1f%%, system %.1f%%, iowait %.1f%%, steal %.1f%%)\n", cp->total, cp->user,
            cp->sys, cp->iowait, cp->steal);
     if (cp->mhz_avg > 0)
@@ -202,6 +284,15 @@ void report_print(sys_t *s, int nproc)
     fmt_bytes((double)m->avail, c, sizeof c);
     printf("\nMemory      %s / %s used (%.1f%%), %s available\n", a, b,
            m->total ? 100.0 * (double)m->used / (double)m->total : 0, c);
+    {
+        char why[96];
+        if (ecc_state(&s->health.ecc, &s->mach, why, sizeof why) >= 0) {
+            printf("  ECC       %s", why);
+            if (s->health.ecc.ok)
+                printf(", %lld corrected, %lld uncorrected since boot", s->health.ecc.ce, s->health.ecc.ue);
+            printf("\n");
+        }
+    }
     fmt_bytes((double)m->swap_used, a, sizeof a);
     fmt_bytes((double)m->swap_total, b, sizeof b);
     printf("  swap      %s / %s\n", a, b);
@@ -317,6 +408,11 @@ void report_print(sys_t *s, int nproc)
         fmt_bytes((double)f->total, b, sizeof b);
         printf("  fs %-20s %-6s %s / %s (%.0f%%)\n", f->mount, f->type, a, b,
                f->total ? 100.0 * (double)f->used / (double)f->total : 0);
+        if (f->trim != TRIM_NA) {
+            char t[128];
+            int warn;
+            printf("     %-20s TRIM %s\n", "", trim_text(f, t, sizeof t, &warn));
+        }
     }
 
     printf("\nNetwork\n");

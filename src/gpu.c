@@ -191,7 +191,7 @@ static void nvml_sample(gpu_t *g)
 }
 
 /* ------------------------------------------------------ PCI name lookup */
-int pci_lookup_name(unsigned vendor, unsigned device, char *out, size_t n)
+FILE *pci_ids_open(void)
 {
     const char *files[] = { secure_getenv("HSM_PCI_IDS"), "/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
                             "/usr/share/pci.ids", "/usr/local/share/pci.ids" };
@@ -199,6 +199,12 @@ int pci_lookup_name(unsigned vendor, unsigned device, char *out, size_t n)
     for (size_t i = 0; i < sizeof files / sizeof files[0] && !f; i++)
         if (files[i])
             f = fopen(files[i], "re");
+    return f;
+}
+
+int pci_lookup_name(unsigned vendor, unsigned device, char *out, size_t n)
+{
+    FILE *f = pci_ids_open();
     if (!f)
         return -1;
     char line[512];
@@ -1306,6 +1312,16 @@ static void screens_read(gpu_t *g)
         return;
     size_t cl = strlen(card);
     struct dirent *e;
+    /* "status" and "enabled" are read without a lock. A monitor's own data
+     * (its modes, its EDID) waits for the graphics driver's lock, which the
+     * desktop holds while it checks the screens again - for a second or
+     * more when a game starts or quits. So that is read when a screen comes,
+     * goes or is switched on or off, and once a minute (another monitor on
+     * the same port), not every 5 s. */
+    double tn = now_sec();
+    int edid_due = !g->edid_t || tn - g->edid_t >= 60;
+    if (edid_due)
+        g->edid_t = tn;
     while ((e = readdir(d)) != NULL && g->nscr < MAX_SCREENS) {
         if (strncmp(e->d_name, card, cl) || e->d_name[cl] != '-' || strlen(e->d_name + cl + 1) >= sizeof g->scr[0].conn)
             continue;
@@ -1320,6 +1336,19 @@ static void screens_read(gpu_t *g)
         s->builtin = !strncmp(s->conn, "eDP", 3) || !strncmp(s->conn, "LVDS", 4) || !strncmp(s->conn, "DSI", 3);
         sfmt(p, sizeof p, "%s/%s/enabled", base, e->d_name);
         s->on = read_line(p, b, sizeof b) || strcmp(b, "disabled"); /* unknown: say it's in use */
+        const screen_t *o = NULL;
+        for (int j = 0; j < nold && !o; j++)
+            if (!strcmp(old[j].conn, s->conn))
+                o = &old[j];
+        if (o && o->on == s->on && !edid_due) {
+            str_copy(s->monitor, sizeof s->monitor, o->monitor);
+            s->inch = o->inch;
+            s->w = o->w;
+            s->h = o->h;
+            s->nown = o->nown;
+            memcpy(s->own, o->own, sizeof s->own);
+            continue;
+        }
         sfmt(p, sizeof p, "%s/%s/modes", base, e->d_name);
         if (read_line(p, b, sizeof b) == 0 && sscanf(b, "%dx%d", &s->w, &s->h) != 2)
             s->w = s->h = 0;
@@ -1334,7 +1363,6 @@ static void screens_read(gpu_t *g)
      * the Hardware view shows them, at once when a screen comes or goes. Only
      * from a card that lights a screen: one without could go to sleep, and
      * opening it would keep it awake. */
-    double tn = now_sec();
     int changed = g->nscr != nold, lit = 0;
     for (int k = 0; k < g->nscr; k++) {
         const screen_t *o = NULL;
@@ -1451,9 +1479,12 @@ void gpus_sample(gpus_t *gs, double dt)
         } else {
             sysfs_sample(g);
         }
+        double tscr = 0;
         if (!g->scr_t || now - g->scr_t >= 5.0) { /* screens come and go now and then */
             g->scr_t = now;
+            double ts = now_sec();
             screens_read(g);
+            tscr = now_sec() - ts;
             /* a graphics card's PCIe link (NVIDIA's comes from NVML, while it's awake);
              * not while it's powered off: its registers don't answer then */
             char rs[24] = "", f[PATHBUF];
@@ -1476,7 +1507,10 @@ void gpus_sample(gpus_t *gs, double dt)
         double took = now_sec() - t0;
         if (took > gs->slow_s) {
             gs->slow_s = took;
-            str_copy(gs->slow, sizeof gs->slow, g->name);
+            if (tscr > took / 2) /* waiting for the driver while the desktop checks the screens again */
+                sfmt(gs->slow, sizeof gs->slow, "screens of the %s", g->name);
+            else
+                str_copy(gs->slow, sizeof gs->slow, g->name);
         }
         /* how much of its work it did held back, by heat or by a power limit; a
          * GPU whose load isn't known (xe) counts as busy, but not towards the share */

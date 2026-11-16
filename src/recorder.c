@@ -30,7 +30,11 @@
  * A crash or power cut would take the memory with it, so the same rows also
  * go to two small rolling files in the session folder (each covering the
  * recorder's minutes, overwritten in turn). If the session doesn't end
- * normally, the next start turns them into an incident log. */
+ * normally, the next start turns them into an incident log.
+ *
+ * The minutes are real ones: after the computer slept, rows from before
+ * it are only part of the lead-up if they are that recent, and an incident
+ * log ends when the computer goes to sleep. */
 #define _GNU_SOURCE
 #include "log.h"
 #include "watch.h"
@@ -52,7 +56,7 @@
 #define SYNC_EVERY 15.0
 
 typedef struct {
-    double wall;
+    double wall, real;  /* real: monotonic, plus the time the computer slept */
     unsigned long seq; /* events up to this one had happened */
 } rrow_t;
 
@@ -65,6 +69,7 @@ static struct {
     double last, t0;
     unsigned long seen; /* events checked for triggers */
     int primed;
+    unsigned sleeps; /* the computer's sleeps seen */
 
     /* incident log being written */
     FILE *f;
@@ -227,7 +232,7 @@ static int is_trigger(const event_t *e)
            strcmp(e->cat, "leak") && strcmp(e->cat, "runaway");
 }
 
-static void incident_start(const health_t *h, const event_t *e, double mono)
+static void incident_start(const health_t *h, const event_t *e, double mono, double real)
 {
     int today = log_day_key(wall());
     if (today != R.day) {
@@ -255,9 +260,11 @@ static void incident_start(const health_t *h, const event_t *e, double mono)
     sfmt(R.reason, sizeof R.reason, "%s: %s", e->cat, e->text);
     log_put_header(R.f, "time,utc_offset,from_problem_s", 1);
     unsigned long prev = R.n ? R.row[ring_index(0)].seq : h->ev_seq;
-    for (int k = 0; k < R.n; k++) { /* the lead-up */
+    double from = real - R.minutes * 60.0 - 10; /* the ring holds a few rows more */
+    for (int k = 0; k < R.n; k++) { /* the lead-up: the last minutes, not rows from before a long sleep */
         int i = ring_index(k);
-        put_row(R.f, i, R.trig_wall, h, prev);
+        if (R.row[i].real >= from)
+            put_row(R.f, i, R.trig_wall, h, prev);
         prev = R.row[i].seq;
     }
     R.wseq = prev;
@@ -331,6 +338,11 @@ void rec_tick(sys_t *s, const ui_state_t *u)
     }
     if (!g_log.nchan || ring_setup(CLAMP(u->rec_minutes, 1, 60)) != 0)
         return;
+    if (s->sleeps != R.sleeps) { /* the computer slept: what comes after is another story */
+        R.sleeps = s->sleeps;
+        incident_close("");
+        R.ended = 0; /* a problem right after waking gets its own log */
+    }
 
     if (!R.n || mono - R.last >= 0.95) { /* a row a second at most */
         int i = R.head;
@@ -338,6 +350,7 @@ void rec_tick(sys_t *s, const ui_state_t *u)
         for (int c = 0; c < R.nchan; c++)
             v[c] = log_chan_is_events(&g_log.ch[c]) ? NAN : (float)log_chan_value(s, &g_log.ch[c]);
         R.row[i].wall = wall();
+        R.row[i].real = mono + s->asleep;
         R.row[i].seq = h->ev_seq;
         R.head = (R.head + 1) % R.cap;
         if (R.n < R.cap)
@@ -359,7 +372,7 @@ void rec_tick(sys_t *s, const ui_state_t *u)
         if (R.f) /* already recording: keep going a while longer */
             R.until = mono + AFTER;
         else
-            incident_start(h, e, mono);
+            incident_start(h, e, mono, mono + s->asleep);
     }
     R.seen = h->ev_seq;
     if (R.f && (mono >= R.until || mono - R.started >= LONGEST))

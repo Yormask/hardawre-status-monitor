@@ -114,6 +114,7 @@ void smbios_memory(machine_t *m)
 {
     m->nram = m->ram_slots = 0;
     m->ram_state = 0;
+    m->ram_ecc = 0;
     m->ram_channels = 0;
     char p[PATHBUF];
     sfmt(p, sizeof p, "%s/firmware/dmi/tables/DMI", g_sysfs);
@@ -139,6 +140,8 @@ void smbios_memory(machine_t *m)
         nx += 2;
         if (type == 127) /* end of table */
             break;
+        if (type == 16 && len >= 0x0F && s[0x05] == 0x03) /* the system memory's array: its error correction */
+            m->ram_ecc = s[0x06] >= 3 && s[0x06] <= 7 ? s[0x06] : 0;
         if (type == 17 && len >= 0x15) {
             m->ram_slots++;
             unsigned sz = w16(s + 0x0C);
@@ -156,6 +159,9 @@ void smbios_memory(machine_t *m)
                 str_copy(d->type, sizeof d->type, mem_type(s[0x12]));
                 int ff = s[0x0E];
                 d->form = ff == 0x09 ? 1 : ff == 0x0D ? 2 : ff == 0x0B || ff == 0x0F ? 3 : 0; /* DIMM, SO-DIMM, soldered */
+                unsigned tw = w16(s + 0x08), dw = w16(s + 0x0A);
+                d->total_w = tw && tw != 0xFFFF ? (int)tw : 0;
+                d->data_w = dw && dw != 0xFFFF ? (int)dw : 0;
                 if (len >= 0x17) {
                     unsigned v = w16(s + 0x15);
                     d->speed = v == 0xFFFF && len >= 0x58 ? (int)w32(s + 0x54) : v == 0xFFFF ? 0 : (int)v;

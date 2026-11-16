@@ -28,6 +28,7 @@
 
 #include "util.h"
 #include <sys/types.h>
+#include <stdio.h>
 
 /* ------------------------------------------------------------------ CPU */
 #define MAX_CPUS 512
@@ -43,6 +44,15 @@ typedef struct {
     unsigned latency;   /* exit latency in us */
     int disabled;
 } cstate_t;
+
+typedef struct { /* one kind of CPU cache */
+    unsigned char level;
+    char type;        /* 'd' data, 'i' instruction, 'u' both */
+    int kb;           /* size of one */
+    int share;        /* cores that share one */
+    signed char kind; /* kind of core (ctype index), -1 = all alike */
+    int n;            /* how many there are */
+} cache_t;
 
 typedef struct {
     char model[128];
@@ -81,6 +91,23 @@ typedef struct {
     cstate_t idle[MAX_CSTATES];
     double wakeups; /* idle-state entries per second, about the number of wake-ups */
 
+    /* details: read once (SMT every 5 s) */
+    int det_done;
+    char vendor_id[16];       /* GenuineIntel, AuthenticAMD; "" on ARM */
+    int hypervisor;           /* runs in a virtual machine (x86 says so) */
+    int virt;                 /* the CPU can run virtual machines: 'v' VT-x, 's' AMD-V, 0 = no or unknown */
+    int family, model_no, stepping; /* x86 CPUID; -1 = unknown */
+    char ucode[24];           /* microcode revision, "0x2c"; "" = unknown */
+    char isa[16];             /* x86-64-v3; "" on ARM */
+    char feats[200];          /* the notable instruction sets: "AVX2, FMA3, AES, SHA" */
+    char smt[16];             /* on, off, forceoff, notsupported, notimplemented; "" = unknown */
+    int smt_active;           /* a core runs two threads now: 1, 0; -1 = unknown */
+    int base_mhz;             /* the clock it's rated at; 0 = unknown */
+    int kbase[4];             /* the same per kind of core (P-cores 3600, E-cores 2700) */
+    int numa;                 /* NUMA nodes; 0 = unknown */
+    int ncache;
+    cache_t cache[16];
+
     /* private */
     cpu_jiffies_t prev_all, prev[MAX_CPUS];
     unsigned long long prev_ctxt, prev_intr, prev_forks;
@@ -89,6 +116,12 @@ typedef struct {
     double idle_t;
     int idle_primed;
 } cpu_t;
+void cpu_details(cpu_t *c);                      /* caches, instruction sets, microcode, SMT, base clock */
+const char *cache_size(int kb, char *out, size_t n); /* "48K", "1.25M", "32M" */
+int cache_lines(const cpu_t *c, char out[][96], int max); /* "L1  48K data + 32K instructions per P-core" */
+void smt_text(const cpu_t *c, char *out, size_t n);  /* "on: 2 threads per P-core" */
+int cpu_boost_mhz(const cpu_t *c, int kind);         /* most a core of a kind (-1 any) runs at; 0 = unknown */
+void clock_text(const cpu_t *c, int boost, char *out, size_t n); /* "3600 MHz (P-cores), 2700 MHz (E-cores)" */
 
 void cpu_init(cpu_t *c);
 void cpu_types_text(const cpu_t *c, char *out, size_t n); /* "6P+8E", "" = all cores alike */
@@ -142,12 +175,19 @@ typedef struct {
     int primed, seen;
 } disk_t;
 
+enum { TRIM_NA, TRIM_DISCARD, TRIM_TIMER, TRIM_NONE, TRIM_BLOCKED };
 typedef struct {
     char mount[128], dev[96], type[16];
     unsigned long long total, used, avail;
     unsigned long long files, ffree; /* inodes (file slots); files 0 = the file system has no fixed number */
     int readonly;
+    int discard;                     /* mounted with "discard": TRIM on every delete */
+    /* TRIM, for a file system on an SSD: how it's done (TRIM_*), and what to know */
+    int trim;
+    char trim_why[96];               /* blocked: by what; timer: which */
+    double trim_ago;                 /* the timer last ran, seconds ago; -1 = not yet, or unknown */
 } fs_t;
+
 
 typedef struct {
     int n;
@@ -156,6 +196,8 @@ typedef struct {
     fs_t fs[MAX_FS];
     double rd_bps, wr_bps;
 } disks_t;
+void trim_sample(disks_t *ds); /* how each file system on an SSD gets trimmed */
+const char *trim_text(const fs_t *f, char *out, size_t n, int *warn); /* "weekly (fstrim.timer), last 2d 04h ago" */
 
 void disks_sample(disks_t *ds, double dt);
 void fs_sample(disks_t *ds);
@@ -204,7 +246,16 @@ typedef struct {
     double down_t;                    /* health: when the link went down (wall), 0 = it's up */
     int primed, seen;
     wifi_t wifi; /* wireless interfaces */
+    /* a wired port's link, as negotiated (ethtool; no root needed) */
+    int eth_ok;          /* read */
+    int eth_tp;          /* a copper (RJ45) port: where a bad cable shows as a slower link */
+    int eth_max;         /* the most the port can do, Mb/s */
+    int eth_peer;        /* the most the other end says it can do, Mb/s; 0 = it doesn't say */
+    int eth_duplex;      /* 1 full, 0 half, -1 unknown */
+    int eth_slow;        /* ETH_* below */
+    int eth_told;        /* health: the speed already told about (Mb/s, -2 half duplex) */
 } netif_t;
+enum { ETH_OK, ETH_CABLE, ETH_SLOWER, ETH_HALF };
 
 /* network quality: the router and one internet address pinged every 2 s
  * (netcheck.c, off unless switched on) */
@@ -237,6 +288,8 @@ typedef struct {
     double rx_bps, tx_bps;
     netq_t q; /* the network check's figures, copied every sample */
 } net_t;
+void eth_links(net_t *nt);                     /* the wired ports' negotiated links */
+const char *eth_speed(int mbps, char *out, size_t n); /* "100 Mb/s", "2.5 Gb/s" */
 
 void net_sample(net_t *n, double dt);
 void wifi_sample(netif_t *f, double mono);                         /* in net_sample, for a wireless interface */
@@ -429,6 +482,7 @@ typedef struct {
     int nscr;                   /* screens connected to its ports */
     screen_t scr[MAX_SCREENS];
     double scr_t;               /* read at (monotonic): every 5 s */
+    double edid_t;              /* the monitors' own data (EDID, modes) read at (monotonic) */
     double drm_t;               /* refresh rates read at (monotonic) */
     char scr_told[128];         /* health: the screens already told about ("HDMI-A-1,DP-1,") */
     char hz_told[128];          /* health: screens told to run below their refresh rate ("DP-2@60,") */
@@ -483,7 +537,7 @@ typedef struct {
     gpu_t g[MAX_GPUS];
     double nv_keep_until; /* NVML stays attached until then (the GPU didn't sleep when let go) */
     double nv_retry_t;    /* NVML init failed: try again from then */
-    char slow[96];        /* the GPU that took longest to read this time */
+    char slow[112];       /* the GPU that took longest to read this time ("screens of the ..." when its screens did) */
     double slow_s;
 } gpus_t;
 
@@ -495,6 +549,31 @@ void gpu_screens_wanted(void);                   /* the Hardware view shows them
 void gpus_close(gpus_t *g);
 void gpus_proc_sample(gpus_t *g, procs_t *ps); /* NVIDIA: per-process GPU use through NVML */
 int pci_lookup_name(unsigned vendor, unsigned device, char *out, size_t n); /* from pci.ids */
+FILE *pci_ids_open(void);                                                   /* the pci.ids there is, or NULL */
+
+/* the PCI devices and their drivers: a device people use with no driver
+ * (a card reader, a Wi-Fi card) is the first thing to check when it doesn't work */
+#define MAX_PCI 128
+typedef struct {
+    char slot[16];   /* "0000:03:00.0" */
+    unsigned cls;    /* class, subclass, interface: 0x030000 */
+    unsigned ven, dev;
+    char kind[20];   /* "graphics", "Wi-Fi", "card reader" */
+    char name[96];   /* "Realtek RTS5227 PCI Express Card Reader" */
+    char driver[32]; /* "" = none */
+    int shown;       /* a device people use (not a bridge or chipset part) */
+    int needs;       /* one of those, with no driver */
+    int vf;          /* an SR-IOV virtual function (its driver is up to the VM) */
+    int named;       /* private: looked up */
+} pcid_t;
+typedef struct {
+    int ok;          /* /sys/bus/pci is there */
+    int n, nodrv;    /* devices; ones people use with no driver */
+    int hidden;      /* bridges and chipset parts, not listed */
+    pcid_t d[MAX_PCI];
+} pcibus_t;
+void pci_sample(pcibus_t *b); /* what's there, and its driver */
+int pci_vm_driver(const char *drv); /* vfio-pci, pci-stub: kept for virtual machines */
 
 /* ---------------------------------------------------------------- Power */
 #define MAX_RAPL 16
@@ -672,6 +751,80 @@ typedef struct {
     long long hours, cycles, realloc, pending, uncorrect, crc, unsafe; /* -1 = unknown */
 } sata_t;
 
+/* ------------------------------------------- RAID arrays and pools */
+#define MAX_ARRAYS 16
+#define MAX_MEMBERS 16
+enum { ARR_MD = 1, ARR_ZFS, ARR_BTRFS };
+enum { BE_WRITE, BE_READ, BE_FLUSH, BE_CORRUPT, BE_GEN, BE_N }; /* btrfs's error counters */
+
+typedef struct {
+    char name[32];  /* sda1; a btrfs device's name, or "device 2" */
+    int id;         /* md: its slot (-1 spare); btrfs: devid */
+    int bad;        /* md: faulty; btrfs: missing */
+    int spare;      /* md: a spare (or the disk being rebuilt onto) */
+    long long err[BE_N]; /* btrfs: its error counters; md: [BE_READ] read errors it corrected */
+} member_t;
+
+typedef struct {
+    int kind;                  /* ARR_* */
+    char key[48];              /* md0, the pool's name, the btrfs file system's UUID */
+    char name[64];             /* md0, the pool, the btrfs mount point (or label) */
+    char level[24];            /* md: raid1, raid5...; btrfs: the data profile (raid1, single, dup...) */
+    char meta[16];             /* btrfs: the metadata profile */
+    char state[24];            /* md: array_state (clean, active, inactive, broken...); ZFS: ONLINE, DEGRADED... */
+    int ndisks;                /* md: raid_disks; btrfs: devices */
+    int degraded;              /* md: disks missing or failed; btrfs: devices missing; ZFS: not ONLINE */
+    int nmem;
+    member_t mem[MAX_MEMBERS];
+    char sync[16];             /* md: sync_action (idle, resync, recover, check, repair, reshape, frozen) */
+    double sync_pct, sync_kbs; /* how far, how fast (KB/s); -1 = unknown */
+    double sync_left_s;        /* time left at that pace, -1 = unknown */
+    long long mismatch;        /* md: sectors the last check found different between the copies */
+    long long errs;            /* btrfs: all error counters together */
+    int seen;                  /* found at the last scan */
+    /* health's memory */
+    int told_bad;              /* "degraded" told */
+    char told_sync[16];        /* the sync_action last seen ("" = not yet) */
+    double sync_from;          /* when the running sync was first seen (wall) */
+    int primed;
+    struct {
+        int id;
+        long long err[BE_N];
+    } prev[MAX_MEMBERS];       /* btrfs: the counters last seen, for events */
+    int nprev;
+} array_t;
+
+typedef struct {
+    int n;
+    array_t a[MAX_ARRAYS];
+    int nbad;                  /* degraded, failed or not ONLINE now */
+} arrays_t;
+
+void arrays_sample(arrays_t *A);
+/* what's wrong with it, if anything: 2 failed or degraded, 1 a rebuild or
+ * errors to know about, 0 fine; the text says it in a few words */
+int array_problem(const array_t *a, char *out, size_t n);
+const char *array_level(const array_t *a, char *out, size_t n); /* "RAID 5", "ZFS pool", "btrfs, raid1" */
+
+/* ------------------------------------------- ECC memory errors (EDAC) */
+#define MAX_EDAC_DIMMS 32
+typedef struct {
+    int ok;                    /* an EDAC memory controller is registered (the kernel counts the errors) */
+    char mode[16];             /* SECDED, S4ECD4ED... ("" = unknown) */
+    char driver[32];           /* the controller: "F19h", "ie31200"... */
+    long long ce, ue;          /* corrected / uncorrected since boot, all controllers */
+    int ndimm;
+    struct {
+        char label[48];
+        long long ce, ue;
+    } dimm[MAX_EDAC_DIMMS];
+    long long ce_seen, ue_seen; /* health: the counts already told about */
+    long long dce_seen[MAX_EDAC_DIMMS], due_seen[MAX_EDAC_DIMMS];
+    int nseen, primed;
+} ecc_t;
+
+void ecc_sample(ecc_t *e);
+
 /* the batteries at one moment, for what they lost while the computer slept */
 typedef struct {
     int ok;        /* there is a battery and it reported its charge */
@@ -689,7 +842,9 @@ typedef struct {
     unsigned long long thr_count, core_count; /* since boot: package / core throttling events */
     double thr_ms, thr_pct; /* total package throttled time since boot; worst % last sample */
     double thr_last;        /* wall clock of the last throttling seen, 0 = none since start */
-    unsigned long long thr_start; /* thr_count + core_count when hsm started */
+    unsigned long long thr_start; /* thr_count + core_count when hsm started, plus what they jumped
+                                   * by while the computer slept and woke (not throttling) */
+    int thr_primed;               /* the counters were read once */
 
     unsigned long long oom_start; /* oom_kill when hsm started */
     double oom_last;
@@ -703,6 +858,8 @@ typedef struct {
     nvme_t nvme[MAX_NVME];
     int nsata;
     sata_t sata[MAX_SATA];
+    arrays_t arr;              /* software RAID arrays, ZFS pools, btrfs file systems */
+    ecc_t ecc;                 /* memory errors ECC found */
 
     unsigned long long files, files_max; /* open file handles, whole system */
 
@@ -778,6 +935,9 @@ typedef struct {
 } fz_t;
 void freeze_start(void);
 int freeze_take(fz_t *out); /* 1 = got one */
+/* seconds the computer slept since the last call (0 = it didn't), for the
+ * main loop: a sample that spans a suspend knows it at once */
+double freeze_slept(void);
 
 /* leak.c: processes whose memory keeps growing (leak_sample is with sys_t below) */
 #define LEAK_MIN 120 /* minutes of memory history kept per process */
@@ -864,6 +1024,30 @@ void svcs_sample(svcs_t *v); /* only does work while want_until is in the future
 void svcs_free(svcs_t *v);
 const char *svc_kind_name(int kind);
 
+/* the firmware and what it switched on: UEFI and Secure Boot, the TPM, the
+ * CPU's virtualisation (VT-x / AMD-V) and the IOMMU */
+enum { VIRT_UNKNOWN, VIRT_ON, VIRT_NOKVM, VIRT_OFF, VIRT_MAYBE_OFF, VIRT_NONE, VIRT_VM };
+typedef struct {
+    int done;
+    int uefi;            /* 1 UEFI, 0 legacy BIOS, -1 can't tell (ARM boards) */
+    int efi_bits;        /* the firmware's own: 64, 32 (some tablets); 0 = unknown */
+    int secure_boot;     /* 1 on, 0 off, -1 unknown */
+    int setup_mode;      /* 1: no keys enrolled, anything boots; -1 unknown */
+    char lockdown[16];   /* the kernel's lockdown: none, integrity, confidentiality; "" = unknown */
+    int tpm;             /* 20 = TPM 2.0, 12 = TPM 1.2, 1 = one, version unknown, 0 = none found */
+    int virt;            /* 'v' VT-x, 's' AMD-V, 'a' ARM, 0 = none */
+    int virt_state;      /* VIRT_* */
+    int kvm;             /* /dev/kvm is there */
+    int vm;              /* this is a virtual machine */
+    int iommu;           /* IOMMU units on; 0 = off */
+    char iommu_kind[16]; /* "VT-d", "AMD-Vi", "SMMU" */
+    int iommu_groups;
+} firmware_t;
+void firmware_sample(firmware_t *f, const cpu_t *c);  /* once (the KVM part every time) */
+void virt_text(const firmware_t *f, char *out, size_t n); /* "VT-x on, KVM ready" */
+void boot_text(const firmware_t *f, char *out, size_t n); /* "UEFI, Secure Boot on" */
+void iommu_text(const firmware_t *f, char *out, size_t n); /* "on (VT-d), 18 groups" */
+
 /* --------------------------------------------------------- Whole system */
 /* a memory module, from the SMBIOS tables (root only) */
 #define MAX_RAM 16
@@ -875,6 +1059,7 @@ typedef struct {
     int speed, conf;          /* MT/s: the most it can do, what it runs at; 0 = unknown */
     int form;                 /* 1 DIMM, 2 SO-DIMM, 3 soldered, 0 unknown */
     char channel;             /* 'A', 'B'...; 0 = can't tell */
+    int total_w, data_w;      /* bits wide, with and without the check bits (72 / 64: an ECC module); 0 = unknown */
 } ramdev_t;
 
 /* the machine, as its firmware describes it (/sys/class/dmi/id, readable by
@@ -890,10 +1075,16 @@ typedef struct {
     int nram, ram_slots;                  /* modules in, slots there are */
     int ram_channels;                     /* channels in use: 1 = single channel; 0 = can't tell */
     int ram_soldered;                     /* soldered memory (laptops): nothing to move */
+    int ram_ecc;                          /* the board's error correction (SMBIOS type 16): 3 none, 4 parity,
+                                           * 5 single-bit ECC, 6 multi-bit ECC, 7 CRC; 0 = unknown */
     ramdev_t ram[MAX_RAM];
 } machine_t;
+
+/* ECC on, from EDAC or the firmware's tables: 1 on, 0 off, -1 can't tell; why says it in a few words */
+int ecc_state(const ecc_t *e, const machine_t *m, char *why, size_t n);
 void smbios_memory(machine_t *m); /* the memory modules (root) */
 int machine_desktop(const machine_t *m); /* a desktop's chassis (or a tower, mini PC, all-in-one) */
+int machine_laptop(const machine_t *m, const power_t *p); /* a laptop's or a tablet's (or a battery inside) */
 
 /* ------------------------------------------- what keeps a drive busy */
 typedef struct {
@@ -955,8 +1146,15 @@ typedef struct {
 typedef struct {
     char host[64], kernel[64], os[96], arch[24];
     machine_t mach;
+    firmware_t fw;
+    pcibus_t pcibus;
     double t_last, dt;
     unsigned long samples;
+    /* the computer slept since the sample before: for how long (0 = it
+     * didn't), when it woke (monotonic); how many times and how long in
+     * all since hsm started */
+    double slept, woke_t, asleep;
+    unsigned sleeps;
 
     cpu_t cpu;
     mem_t mem;
